@@ -218,6 +218,20 @@ async def lifespan(application: FastAPI):
         "webUiRelease": WEB_UI_RELEASE,
     })
 
+    # Report the datasource submodules at startup. A plugin that fails to import degrades
+    # silently to the exported bundle, and in a container the bundles are not present at
+    # all — so an unreported import failure surfaces much later as a failed agent turn.
+    from . import datasources
+
+    report = await asyncio.to_thread(datasources.available)
+    loaded = sorted(key for key, entry in report.items() if entry["loaded"])
+    missing = {key: entry.get("error", "")[:160] for key, entry in report.items() if not entry["loaded"]}
+    default_log("info" if loaded else "error", "Datasource modules resolved", {
+        "loaded": loaded,
+        "missing": missing,
+        "pluginRoots": [str(root) for root in datasources.plugin_roots()],
+    })
+
     # My Agents is the LLM UI. IRC is optional and the default host is often down;
     # reconnect storms painted the status bar as errors on every send.
     if os.environ.get("SUBJECTIVE_CHAT_IRC") == "1":

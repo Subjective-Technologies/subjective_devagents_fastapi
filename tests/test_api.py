@@ -191,3 +191,44 @@ def test_websocket_sends_config_and_status_then_events(client):
         event = socket.receive_json()
         assert event["type"] == "llm-conversation"
         assert event["conversation"]["target"] == created["conversation"]["target"]
+
+
+def test_history_manifest_with_real_sources_is_parsed(tmp_path, monkeypatch):
+    """Regression: the sidebar listing walks a manifest, and every earlier test ran against
+    an empty archive — so a crash reading a populated manifest reached a deploy. Build one
+    with a session uuid in the path and assert the conversation comes back."""
+    import sys
+
+    sys.path.insert(0, str(SERVICE_ROOT / "src"))
+    from subjective_devagents_fastapi.llm_service import LlmService
+
+    home = tmp_path / "chat-home"
+    context = home / ".subjective_chat_history" / "context"
+    context.mkdir(parents=True)
+    export = context / "2026_04_26_10_38_51_Localchats-abc-context.json"
+    export.write_text(json.dumps({
+        "type": "localchat", "title": "Imported chat", "product": "claude",
+        "messages": [{"role": "user", "text": "hello", "time": 1_760_000_000_000}],
+    }), encoding="utf-8")
+    (context / ".subjective_localchats_manifest.json").write_text(json.dumps({
+        "sources": {
+            "a": {
+                "source_file": "/home/goldenthinker/.claude/projects/2f0f9c2e-1111-2222-3333-444455556666.jsonl",
+                "export_filename": export.name,
+                "title": "Imported chat",
+                "message_count": 1,
+                "last_activity_at": 1_760_000_000_000,
+                "fingerprint": {"product": "claude", "source_user": "goldenthinker", "mtime_ns": 1_760_000_000_000_000_000},
+            }
+        }
+    }), encoding="utf-8")
+
+    monkeypatch.setenv("SUBJECTIVE_CHAT_HOME", str(home))
+    service = LlmService(root=str(tmp_path), app_home=str(home))
+    listed = service.list_conversations(limit=10)
+    assert listed["total"] == 1
+    conversation = listed["conversations"][0]
+    assert conversation["label"] == "Imported chat"
+    assert conversation["provider"] == "claude"
+    # The session uuid must be lifted out of the source path, not dropped or crashed on.
+    assert conversation["sessionId"] == "2f0f9c2e-1111-2222-3333-444455556666"

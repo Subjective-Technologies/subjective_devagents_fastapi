@@ -627,7 +627,8 @@ class LlmService:
                         or (f"{fingerprint.get('product') or 'chat'} conversation" if str(raw_title).strip().startswith("<") else raw_title),
                         "product": fingerprint.get("product") or "unknown",
                         "kind": fingerprint.get("kind") or "chat",
-                        "thread_id": session_match.group(1).lower() if session_match else "",
+                        # group(0): UUID_RE has no capture group, unlike the JS original.
+                        "thread_id": session_match.group(0).lower() if session_match else "",
                         "source_file": source_file,
                         "source_user": fingerprint.get("source_user") or record.get("source_user") or "",
                         "fingerprint": fingerprint,
