@@ -1,0 +1,70 @@
+{
+  "providers": ["codex", "Claude", "anthropic-claude", "google gemini", "CURSOR", "chat_gpt", "", "weird-thing"],
+  "roles": ["assistant", "AGENT", "user", "human", "tool", "tool_output", "output", "", "banana"],
+  "times": [0, null, "", 1700000000, 1700000000000, "2026-04-26T10:38:51Z", "not-a-date"],
+  "exportPaths": [
+    "/x/2026_04_26_10_38_51_Localchats-abc-context.json",
+    "/x/no-timestamp-context.json",
+    ""
+  ],
+  "messages": [
+    "plain message",
+    "  ",
+    "<user_query>real question</user_query>",
+    "<user_query>Briefly inform the user about the task result</user_query>",
+    "<task>\ntitle: Ship the thing\n</task><user_query>Briefly inform the user about the task result</user_query>",
+    "<environment_context>noise</environment_context>after the block",
+    "<git_status>x</git_status>",
+    "<user_query>one</user_query>\n<user_query>two</user_query>"
+  ],
+  "labelPairs": [
+    ["Cursor conversation", "cursor"],
+    ["codex conversation", "codex"],
+    ["A real chat name", "codex"],
+    ["", "codex"],
+    ["gemini conversation", "gemini"]
+  ],
+  "labelTriples": [
+    ["Existing name", "codex conversation", "codex"],
+    ["codex conversation", "Real name", "codex"],
+    ["Existing", "", "codex"],
+    ["", "codex conversation", "codex"]
+  ],
+  "channelInputs": [
+    ["My Chat Name", "abc-123", "codex"],
+    ["!!!", "abc-123", "claude"],
+    ["A very long conversation label that exceeds the slug limit", "id", "cursor"],
+    [null, "id2", "codex"]
+  ],
+  "sourceFiles": [
+    "/home/goldenthinker/.cursor/chats/x#composer:2f0f9c2e-1111-2222-3333-444455556666.json",
+    "/home/alice/.codex/sessions/agent-transcripts/2f0f9c2e-1111-2222-3333-444455556666.jsonl",
+    "/home/bob/.claude/projects/a/b.jsonl",
+    "/var/lib/nothing.json",
+    ""
+  ],
+  "identityItems": [
+    { "sessionId": "ABC-123", "sourceFile": "", "target": "t1" },
+    { "sessionId": "", "sourceFile": "/home/a/2f0f9c2e-1111-2222-3333-444455556666.jsonl", "target": "t2" },
+    { "sessionId": "", "sourceFile": "", "target": "t3" }
+  ],
+  "transcripts": [
+    {
+      "provider": "codex",
+      "sourceUser": "alice",
+      "messages": [
+        { "role": "user", "text": "hello" },
+        { "role": "assistant", "text": "hi there" },
+        { "role": "system", "text": "ignored" },
+        { "role": "user", "text": "" }
+      ]
+    },
+    { "provider": "claude", "messages": [] }
+  ],
+  "tailConversations": [
+    { "target": "t", "messages": [{ "role": "user", "text": "a" }] },
+    { "target": "t", "messageCount": 0, "messages": null }
+  ],
+  "usernames": ["goldenthinker", "_svc", "Bad-Case", "9start", "ok-name", "", "toolongusernametoolongusernametoolongusername"],
+  "passwdText": "root:x:0:0:root:/root:/bin/bash\ngoldenthinker:x:1000:1000:Golden,,,:/home/goldenthinker:/bin/bash\nbob:x:1001:1001::/home/bob:/bin/bash\nsvc:x:1002:1002::/home/svc:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\nalice:x:1003:1003:Alice:/home/alice:/bin/zsh\n"
+}

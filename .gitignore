@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# wrangler's local account/asset cache — contains Cloudflare account identifiers
+.wrangler/
+
+# datasource plugin bytecode from in-process imports
+plugins/**/__pycache__/

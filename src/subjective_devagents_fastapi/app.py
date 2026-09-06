@@ -1,0 +1,745 @@
+"""FastAPI adapter over ChatCore — the backend half of Subjective DevAgents.
+
+Replaces clients/desktop/subjective_devagents/src/webServer.js. Route paths, request
+bodies, response shapes and the WebSocket event stream are identical to that server, so
+the existing browser UI (clients/desktop/subjective_devagents/web + src renderer) runs
+against this unchanged.
+
+Blocking work (CLI subprocesses, pty sessions, history scans) runs in a thread pool via
+asyncio.to_thread so one long agent turn never stalls the event loop.
+
+Run locally:
+
+    uvicorn subjective_devagents_fastapi.app:app --host 0.0.0.0 --port 8787
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import mimetypes
+import os
+import subprocess
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+
+from .chat_core import ChatCore
+from .llm_service import tail_conversation_for_client
+from .system_users import is_valid_username, list_system_users
+
+# Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
+# with the live git SHA so View Source proves which build the browser loaded.
+WEB_UI_RELEASE = "20260906k"
+
+MAX_BODY_BYTES = 32 * 1024 * 1024  # room for a handful of base64 image/file attachments
+
+# Who may embed this app in an iframe. The dashboard's ST_BACKEND -> My Agents page frames
+# it from a different origin, while a zone-wide Cloudflare rule stamps
+# `X-Frame-Options: SAMEORIGIN` onto every HTML response in subjectivetechnologies.com —
+# which alone forbids that. CSP frame-ancestors takes precedence over X-Frame-Options in
+# any browser that supports it, and it is ignored when delivered via <meta http-equiv>,
+# so it has to be this header.
+FRAME_ANCESTORS = (
+    "frame-ancestors 'self' https://dashboard.subjectivetechnologies.com https://dashboard.worktwins.com"
+)
+
+MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+
+
+def default_log(level: str, message: str, details: dict | None = None) -> None:
+    stamp = datetime.now(timezone.utc).isoformat()
+    detail_text = json.dumps(details, default=str) if details else ""
+    print(f"{stamp} [{level}] {message} {detail_text}", flush=True)
+
+
+def _client_root() -> Path:
+    """Where the browser UI files live.
+
+    Defaults to the DevAgents client next to this repo's services/ directory; override
+    with SUBJECTIVE_DEVAGENTS_CLIENT_ROOT when the frontend is deployed elsewhere.
+    """
+    override = os.environ.get("SUBJECTIVE_DEVAGENTS_CLIENT_ROOT")
+    if override:
+        return Path(override).resolve()
+    return (Path(__file__).resolve().parents[3] / ".." / "clients" / "desktop" / "subjective_devagents").resolve()
+
+
+def resolve_deploy_version(root: Path) -> str:
+    sha = "nogit"
+    try:
+        sha = (
+            subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            ).stdout.strip()
+            or "nogit"
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass  # bare checkout / no git — keep fallback
+    dirty = ""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, timeout=2
+        ).stdout.strip()
+        if status:
+            dirty = "-dirty"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return f"{WEB_UI_RELEASE}+{sha}{dirty}"
+
+
+class EventHub:
+    """Fans ChatCore's event stream out to every connected browser tab.
+
+    ChatCore emits from worker threads; each socket owns a bounded queue drained by its
+    own task, so a slow tab can never block an agent turn.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
+        self.queues: set[asyncio.Queue] = set()
+
+    def register(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self.queues.add(queue)
+        return queue
+
+    def unregister(self, queue: asyncio.Queue) -> None:
+        self.queues.discard(queue)
+
+    def publish(self, event: dict) -> None:
+        """Thread-safe: called from ChatCore's threads, not the event loop."""
+        try:
+            self.loop.call_soon_threadsafe(self._publish_now, event)
+        except RuntimeError:
+            pass  # loop already closed during shutdown
+
+    def _publish_now(self, event: dict) -> None:
+        for queue in list(self.queues):
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                self.queues.discard(queue)
+
+
+class AppState:
+    def __init__(self):
+        self.core: ChatCore | None = None
+        self.hub: EventHub | None = None
+        self.client_root: Path = _client_root()
+        self.deploy_version: str = WEB_UI_RELEASE
+        self.history_refreshing = False
+        self._refresh_lock = asyncio.Lock()
+
+    async def refresh_history(self, reason: str) -> dict:
+        """Shared by the startup/interval refresh and the manual refresh API so a button
+        click cannot stack a second LocalChats pipeline on top of an in-flight run."""
+        if self.history_refreshing:
+            return {"ok": True, "deferred": True, "status": "busy"}
+        async with self._refresh_lock:
+            self.history_refreshing = True
+            core = self.core
+            try:
+                started = time.time()
+                result = await asyncio.to_thread(core.llm_service.refresh_history)
+                if result.get("status") == "deferred":
+                    default_log("info", "Local chat history refresh deferred", {"reason": reason})
+                    return {"ok": True, "deferred": True, "status": "deferred"}
+                if not result.get("success"):
+                    default_log("error", "Local chat history pipeline failed", {
+                        "reason": reason, "status": result.get("status"), "error": result.get("error"),
+                        "ms": int((time.time() - started) * 1000),
+                    })
+                    return {"ok": False, "status": result.get("status"), "error": result.get("error") or "History refresh failed."}
+                count = core.llm_service.count_conversations()
+                default_log("info", "Local chat history refreshed", {
+                    "reason": reason, "count": count, "ms": int((time.time() - started) * 1000),
+                })
+                core.broadcast("llm-history-refreshed", {"count": count})
+                return {"ok": True, "count": count}
+            except Exception as error:  # noqa: BLE001
+                default_log("error", "Local chat history pipeline crashed", {"reason": reason, "message": str(error)})
+                return {"ok": False, "error": str(error)}
+            finally:
+                self.history_refreshing = False
+
+
+state = AppState()
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    loop = asyncio.get_running_loop()
+    state.hub = EventHub(loop)
+    state.client_root = _client_root()
+    state.deploy_version = resolve_deploy_version(state.client_root)
+    core = ChatCore(
+        root=str(state.client_root),
+        log=default_log,
+        emit=lambda event: state.hub.publish(event),
+    )
+    core.load_settings()
+    state.core = core
+
+    # Every "Continue as..." session's pty output is broadcast to whichever tab opened its
+    # terminal panel, the moment a login is actually needed.
+    original_emit = core._emit
+
+    def emit(event: dict) -> None:
+        if event.get("type") == "switchuser-terminal-needed":
+            core.attach_su_viewer_broadcast(event.get("username"))
+        original_emit(event)
+
+    core._emit = emit
+
+    default_log("info", "Subjective DevAgents FastAPI starting", {
+        "appHome": core.application_home,
+        "clientRoot": str(state.client_root),
+        "deployVersion": state.deploy_version,
+        "webUiRelease": WEB_UI_RELEASE,
+    })
+
+    # My Agents is the LLM UI. IRC is optional and the default host is often down;
+    # reconnect storms painted the status bar as errors on every send.
+    if os.environ.get("SUBJECTIVE_CHAT_IRC") == "1":
+        await asyncio.to_thread(core.connect_irc)
+    else:
+        default_log("info", "IRC skipped (set SUBJECTIVE_CHAT_IRC=1 to enable)")
+
+    # Serve whatever the manifest already has right away (no blank sidebar), then run the
+    # history pipeline. It is incremental — newest-first, skipping fingerprinted unchanged
+    # files — and re-runs on a timer so chats written while the server is up appear
+    # without a restart.
+    core.broadcast("llm-history-refreshed", {"count": core.llm_service.count_conversations()})
+    refresh_every_ms = int(os.environ.get("SUBJECTIVE_CHAT_HISTORY_REFRESH_MS") or 10 * 60 * 1000)
+
+    async def refresh_loop() -> None:
+        await state.refresh_history("startup")
+        if refresh_every_ms <= 0:
+            return
+        while True:
+            await asyncio.sleep(refresh_every_ms / 1000)
+            await state.refresh_history("interval")
+
+    refresh_task = asyncio.create_task(refresh_loop())
+    try:
+        yield
+    finally:
+        refresh_task.cancel()
+        default_log("info", "Shutting down")
+        await asyncio.to_thread(core.shutdown)
+
+
+app = FastAPI(title="Subjective DevAgents", lifespan=lifespan)
+
+# The UI may be served from this process (default) or hosted separately; allow both.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        origin.strip()
+        for origin in (os.environ.get("SUBJECTIVE_DEVAGENTS_CORS_ORIGINS") or "*").split(",")
+        if origin.strip()
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_version_and_no_store(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-DevAgents-Version", state.deploy_version)
+    if request.url.path.startswith("/api/"):
+        # Without this a plain reload can serve a stale cached GET
+        # /api/llm/conversations (e.g. a chat name from before a rename).
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def core() -> ChatCore:
+    if state.core is None:
+        raise RuntimeError("ChatCore is not initialized.")
+    return state.core
+
+
+# --- API routes (1:1 with webServer.js) ------------------------------------------------
+
+
+@app.get("/api/version")
+async def api_version() -> dict:
+    return {
+        "ok": True,
+        "release": WEB_UI_RELEASE,
+        "version": state.deploy_version,
+        "servedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/config")
+async def api_config() -> dict:
+    return core().public_config()
+
+
+@app.post("/api/save-config")
+async def api_save_config(body: dict = Body(default={})) -> dict:
+    connection = body.get("active") or body or {}
+    await asyncio.to_thread(core().apply_connection_and_reconnect, connection, body.get("saveBookmark") is not False)
+    return {"ok": True, "config": core().public_config()}
+
+
+@app.post("/api/connect")
+async def api_connect() -> dict:
+    await asyncio.to_thread(core().reconnect_now)
+    return {"ok": True}
+
+
+@app.post("/api/disconnect")
+async def api_disconnect() -> dict:
+    await asyncio.to_thread(core().disconnect_irc, True)
+    return {"ok": True}
+
+
+@app.post("/api/send-message")
+async def api_send_message(body: dict = Body(default={})) -> dict:
+    instance = core()
+    target = body.get("target") or instance.config["channel"]
+    clean = " ".join(str(body.get("text") or "").split())
+    if not clean:
+        return {"ok": False}
+    if instance.write_irc(f"PRIVMSG {target} :{clean}"):
+        instance.broadcast("message", {
+            "target": target,
+            "from": instance.current_nick,
+            "text": clean,
+            "mine": True,
+            "time": time.time() * 1000,
+            "private": not str(target).startswith("#"),
+        })
+        return {"ok": True}
+    return {"ok": False}
+
+
+@app.post("/api/execute-command")
+async def api_execute_command(body: dict = Body(default={})) -> dict:
+    instance = core()
+    target = body.get("target") or instance.config["channel"]
+    result = await asyncio.to_thread(instance.execute_slash_command, body.get("command") or "", target)
+    return {"ok": bool(result.get("ok")), "focusTarget": result.get("focusTarget") or ""}
+
+
+@app.get("/api/llm/conversations")
+async def api_llm_conversations(limit: int = Query(default=200), q: str = Query(default="")) -> dict:
+    try:
+        capped = min(500, max(1, int(limit or 200)))
+    except (TypeError, ValueError):
+        capped = 200
+    try:
+        listed = await asyncio.to_thread(core().llm_service.list_conversations, str(q or "").strip(), capped)
+        return {"ok": True, "conversations": listed["conversations"], "total": listed["total"]}
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "error": str(error), "conversations": []}
+
+
+@app.get("/api/llm/conversation")
+async def api_llm_conversation(target: str = Query(default="")) -> dict:
+    instance = core()
+    try:
+        live = await asyncio.to_thread(instance.llm_service.reload_conversation, str(target))
+        conversation = tail_conversation_for_client(
+            live or await asyncio.to_thread(instance.llm_service.find_conversation, str(target), True)
+        )
+        default_log("info" if conversation else "error", "LLM conversation hydrate", {
+            "target": target,
+            "ok": bool(conversation),
+            "provider": (conversation or {}).get("provider") or "",
+            "label": (conversation or {}).get("label") or "",
+            "sessionId": (conversation or {}).get("sessionId") or "",
+            "messageCount": len((conversation or {}).get("messages") or []),
+            "totalMessages": (conversation or {}).get("messageCount") or 0,
+            "truncated": bool((conversation or {}).get("truncated")),
+            "origin": (conversation or {}).get("origin") or "",
+        })
+        return {"ok": True, "conversation": conversation} if conversation else {"ok": False, "error": "Conversation was not found."}
+    except Exception as error:  # noqa: BLE001
+        default_log("error", "LLM conversation hydrate crashed", {"target": target, "message": str(error)})
+        return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/create-conversation")
+async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
+    instance = core()
+    try:
+        conversation = await asyncio.to_thread(
+            instance.llm_service.create_conversation,
+            body.get("provider"),
+            body.get("name") or "",
+            body.get("workspace") or "",
+        )
+        instance.activate_llm_irc_channel(conversation)
+        instance.broadcast("llm-conversation", {"conversation": conversation})
+        return {"ok": True, "conversation": conversation}
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/rename-conversation")
+async def api_llm_rename_conversation(body: dict = Body(default={})) -> dict:
+    instance = core()
+    try:
+        result = await asyncio.to_thread(
+            instance.llm_service.rename_conversation, str(body.get("target") or ""), str(body.get("name") or "")
+        )
+        if result.get("ok") and result.get("conversation"):
+            conversation = result["conversation"]
+            default_log("info", "LLM conversation renamed", {"target": conversation["target"], "label": conversation["label"]})
+            instance.broadcast("llm-conversation-renamed", {"target": conversation["target"], "label": conversation["label"]})
+        return result
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/activate-conversation")
+async def api_llm_activate_conversation(body: dict = Body(default={})) -> dict:
+    instance = core()
+    conversation = await asyncio.to_thread(instance.llm_service.find_conversation, str(body.get("target") or ""))
+    if not conversation:
+        return {"ok": False, "error": "Conversation was not found."}
+    await asyncio.to_thread(instance.llm_service.mark_active, conversation["target"])
+    return instance.activate_llm_irc_channel(conversation)
+
+
+@app.post("/api/llm/refresh-history")
+async def api_llm_refresh_history() -> dict:
+    return await state.refresh_history("manual")
+
+
+@app.post("/api/llm/reload-conversation")
+async def api_llm_reload_conversation(body: dict = Body(default={})) -> dict:
+    instance = core()
+    target = str(body.get("target") or "")
+    try:
+        conversation = tail_conversation_for_client(await asyncio.to_thread(instance.llm_service.reload_conversation, target))
+        default_log("info" if conversation else "error", "LLM conversation live reload", {
+            "target": target, "ok": bool(conversation), "messageCount": len((conversation or {}).get("messages") or []),
+        })
+        if conversation:
+            instance.broadcast("llm-conversation", {"conversation": conversation})
+            return {"ok": True, "conversation": conversation}
+        return {"ok": False, "error": "Conversation was not found."}
+    except Exception as error:  # noqa: BLE001
+        default_log("error", "LLM conversation live reload crashed", {"target": target, "message": str(error)})
+        return {"ok": False, "error": str(error)}
+
+
+@app.get("/api/llm/status")
+async def api_llm_status(provider: str = Query(default="codex")) -> dict:
+    result = await asyncio.to_thread(core().llm_service.status, provider)
+    return {"ok": bool(result.get("success")), **result}
+
+
+@app.get("/api/llm/sessions")
+async def api_llm_sessions(provider: str = Query(default="")) -> dict:
+    listed = await asyncio.to_thread(core().llm_service.list_provider_sessions, provider)
+    return {"ok": True, **listed}
+
+
+@app.post("/api/llm/send-message")
+async def api_llm_send_message(body: dict = Body(default={})) -> dict:
+    instance = core()
+    target = str(body.get("target") or "")
+    text = str(body.get("text") or "").strip()
+    files = body.get("files") or []
+    if not target or not text:
+        return {"ok": False, "status": "invalid_request", "error": "Missing target or text."}
+    conversation = await asyncio.to_thread(instance.llm_service.find_conversation, target)
+    if not conversation:
+        return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+    # Cloudflare (and most reverse proxies) close idle HTTP at ~100s with 524, while
+    # Cursor/Claude/Codex turns are allowed 30 minutes. Accept here and deliver the
+    # assistant reply on the WebSocket (llm-message / llm-busy / system).
+    default_log("info", "LLM send accepted (async)", {
+        "target": target, "provider": conversation["provider"], "promptChars": len(text), "files": len(files),
+    })
+
+    async def run_send() -> None:
+        try:
+            result = await asyncio.to_thread(instance.send_llm_message, target, text, files)
+            default_log("info" if result.get("ok") else "error", "LLM send background finished", {
+                "target": target, "ok": bool(result.get("ok")),
+                "status": result.get("status") or "", "error": result.get("error") or "",
+            })
+        except Exception as error:  # noqa: BLE001
+            default_log("error", "LLM send background crash", {"target": target, "message": str(error)})
+
+    asyncio.create_task(run_send())
+    return {"ok": True, "pending": True, "target": target}
+
+
+@app.get("/api/datasources")
+async def api_datasources() -> dict:
+    """Which datasource submodules resolved, and from where.
+
+    The first thing to check when a provider misbehaves: it says whether the service is
+    calling the plugin package in-process or has fallen back to the exported bundle.
+    """
+    from . import datasources
+
+    report = await asyncio.to_thread(datasources.available)
+    return {
+        "ok": True,
+        "datasources": report,
+        "pluginRoots": [str(root) for root in datasources.plugin_roots()],
+        "usingModules": core().llm_service.use_datasource_modules,
+    }
+
+
+@app.get("/api/system/users")
+async def api_system_users() -> dict:
+    try:
+        return await asyncio.to_thread(list_system_users)
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "users": [], "error": str(error)}
+
+
+@app.get("/api/switchuser/status")
+async def api_switchuser_status(username: str = Query(default="")) -> dict:
+    instance = core()
+    if username:
+        return {"ok": True, "status": instance.su_session_manager.get_status(str(username))}
+    return {"ok": True, "statuses": instance.su_session_manager.list_statuses()}
+
+
+@app.get("/api/context-menu")
+async def api_context_menu(target: str = Query(default="")) -> dict:
+    model = await asyncio.to_thread(core().build_context_menu_model, str(target))
+    return {"ok": True, **model}
+
+
+@app.post("/api/switchuser/continue-as")
+async def api_switchuser_continue_as(body: dict = Body(default={})) -> dict:
+    instance = core()
+    username = str(body.get("username") or "")
+    result = await asyncio.to_thread(
+        instance.continue_conversation_as_user,
+        str(body.get("target") or ""),
+        username,
+        str(body["provider"]) if body.get("provider") else None,
+    )
+    # Attach the broadcast viewer eagerly: continue_conversation_as_user only does this via
+    # the switchuser-terminal-needed event when a login is actually needed, but attaching is
+    # a cheap deduped no-op, and this way a tab that opens the terminal panel right after
+    # this call never misses a race on the first chunk.
+    if is_valid_username(username):
+        instance.attach_su_viewer_broadcast(username)
+    return result
+
+
+@app.post("/api/switchuser/disconnect")
+async def api_switchuser_disconnect(body: dict = Body(default={})) -> dict:
+    instance = core()
+    username = str(body.get("username") or "")
+    await asyncio.to_thread(instance.su_session_manager.disconnect, username)
+    instance.detach_su_viewer_broadcast(username)
+    return {"ok": True}
+
+
+@app.post("/api/switchuser/pty-input")
+async def api_switchuser_pty_input(body: dict = Body(default={})) -> dict:
+    core().su_session_manager.write_input(str(body.get("username") or ""), str(body.get("data") or ""))
+    return {"ok": True}
+
+
+@app.post("/api/switchuser/pty-resize")
+async def api_switchuser_pty_resize(body: dict = Body(default={})) -> dict:
+    try:
+        cols = int(body.get("cols") or 0)
+        rows = int(body.get("rows") or 0)
+    except (TypeError, ValueError):
+        cols = rows = 0
+    core().su_session_manager.resize(str(body.get("username") or ""), cols, rows)
+    return {"ok": True}
+
+
+@app.post("/api/dcc/send-image-data")
+async def api_dcc_send_image_data(body: dict = Body(default={})) -> dict:
+    instance = core()
+    raw = body.get("bytes")
+    if isinstance(raw, str):
+        buffer = base64.b64decode(raw)
+    else:
+        buffer = bytes(bytearray(raw or []))
+    return await asyncio.to_thread(
+        instance.send_dcc_buffer,
+        body.get("target") or instance.config["channel"],
+        buffer,
+        body.get("fileName") or f"pasted-{int(time.time() * 1000)}.png",
+        body.get("mimeType") or "",
+    )
+
+
+@app.post("/api/file/open")
+async def api_file_open() -> dict:
+    return {"ok": False, "error": "Opening local files is only available in the Subjective Chat desktop app."}
+
+
+@app.post("/api/file/reveal")
+async def api_file_reveal() -> dict:
+    return {"ok": False, "error": "Show in folder is only available in the Subjective Chat desktop app."}
+
+
+@app.post("/api/log")
+async def api_log(body: dict = Body(default={})) -> dict:
+    default_log(body.get("level") or "info", body.get("message") or "Browser log", body.get("details") or {})
+    return {"ok": True}
+
+
+# --- WebSocket -------------------------------------------------------------------------
+
+
+@app.websocket("/ws")
+async def websocket_events(socket: WebSocket) -> None:
+    await socket.accept()
+    hub = state.hub
+    instance = core()
+    queue = hub.register()
+    default_log("info", "WebSocket client connected", {"clients": len(hub.queues)})
+    try:
+        await socket.send_text(json.dumps({"type": "config", **instance.public_config()}))
+        await socket.send_text(json.dumps({
+            "type": "status",
+            "state": "connected" if instance.connected else "idle",
+            "text": f"Connected to {instance.config['host']}:{instance.config['port']}" if instance.connected else "Ready",
+        }))
+
+        async def pump_incoming() -> None:
+            # The UI never sends over the socket; draining keeps disconnects prompt.
+            while True:
+                await socket.receive_text()
+
+        reader = asyncio.create_task(pump_incoming())
+        try:
+            while True:
+                event = await queue.get()
+                await socket.send_text(json.dumps(event, default=str))
+                if reader.done():
+                    break
+        finally:
+            reader.cancel()
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        hub.unregister(queue)
+        default_log("info", "WebSocket client disconnected", {"clients": len(hub.queues)})
+
+
+# --- static UI -------------------------------------------------------------------------
+
+
+def _static_files() -> dict[str, Path]:
+    """Path -> absolute file, an explicit allowlist rather than a generic "serve anything
+    under these directories" rule, so a request can never walk outside the handful of
+    files this app actually ships to the browser."""
+    root = state.client_root
+    web = root / "web"
+    src = root / "src"
+    return {
+        "/": web / "index.html",
+        "/index.html": web / "index.html",
+        "/webBridge.js": web / "webBridge.js",
+        "/fit-app.js": web / "fit-app.js",
+        "/contextMenu.css": web / "contextMenu.css",
+        "/layout.css": web / "layout.css",
+        "/terminal.html": web / "terminal.html",
+        "/terminalWebBridge.js": web / "terminalWebBridge.js",
+        "/styles.css": src / "styles.css",
+        "/terminal.css": src / "terminal.css",
+        "/messageRenderer.js": src / "messageRenderer.js",
+        "/renderer.js": src / "renderer.js",
+        "/terminal-renderer.js": src / "terminal-renderer.js",
+    }
+
+
+def _stamp_html(html: str) -> str:
+    """Replace the static placeholder so View Source shows the live release + git SHA."""
+    import re
+
+    out = str(html)
+    stamp_comment = f"<!-- devagents-deploy {state.deploy_version} served={datetime.now(timezone.utc).isoformat()} -->"
+    if "DEVAGENTS_DEPLOY_VERSION" in out:
+        out = out.replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version)
+    elif "<!doctype html>" in out.lower():
+        out = re.sub(r"<!doctype html>", lambda match: f"{match.group(0)}\n{stamp_comment}", out, count=1, flags=re.IGNORECASE)
+
+    def stamp_tag(match: "re.Match[str]") -> str:
+        attrs = match.group(1)
+        if "data-devagents-version=" in attrs:
+            attrs = re.sub(r'\sdata-devagents-version="[^"]*"', f' data-devagents-version="{state.deploy_version}"', attrs)
+            return f"<html{attrs}>"
+        return f'<html{attrs} data-devagents-version="{state.deploy_version}">'
+
+    return re.sub(r"<html\b([^>]*)>", stamp_tag, out, count=1, flags=re.IGNORECASE)
+
+
+def _send_file(file_path: Path, is_asset: bool = False) -> Response:
+    try:
+        data = file_path.read_bytes()
+    except OSError:
+        return Response(content="Not found", status_code=404, media_type="text/plain")
+    extension = file_path.suffix.lower()
+    body = data
+    if extension == ".html":
+        body = _stamp_html(data.decode("utf-8")).encode("utf-8")
+    headers = {
+        # no-store everywhere: index.html, renderer.js and layout.css ship as a matched
+        # set; a cached renderer.js against a newer index.html renders nothing.
+        "Cache-Control": "public, max-age=300" if is_asset else "no-store",
+        "X-DevAgents-Version": state.deploy_version,
+    }
+    if extension == ".html":
+        headers["Content-Security-Policy"] = FRAME_ANCESTORS
+    media_type = MIME_TYPES.get(extension) or mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    return Response(content=body, media_type=media_type, headers=headers)
+
+
+@app.get("/{path:path}")
+async def serve_static(path: str) -> Response:
+    pathname = f"/{path}"
+    target = _static_files().get(pathname)
+    if target:
+        return _send_file(target)
+
+    # /assets/** mirrors the client's assets/ directory (vendored libs, icons) — the only
+    # tree served generically, fenced to assets_dir by a resolved-path containment check
+    # so `/assets/../../etc/passwd`-style traversal cannot escape it.
+    if pathname.startswith("/assets/"):
+        assets_dir = (state.client_root / "assets").resolve()
+        resolved = (assets_dir / pathname[len("/assets/") :]).resolve()
+        if resolved == assets_dir or str(resolved).startswith(str(assets_dir) + os.sep):
+            return _send_file(resolved, is_asset=True)
+    return Response(content="Not found", status_code=404, media_type="text/plain")
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, error: Exception) -> JSONResponse:
+    default_log("error", "API handler failed", {"route": str(request.url.path), "message": str(error)})
+    return JSONResponse(status_code=400, content={"ok": False, "error": str(error)})

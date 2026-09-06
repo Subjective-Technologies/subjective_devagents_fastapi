@@ -1,0 +1,18 @@
+[submodule "plugins/subjective_codex_datasource"]
+	path = plugins/subjective_codex_datasource
+	url = git@github.com:Subjective-Technologies/subjective_codex_datasource.git
+[submodule "plugins/subjective_claude_cli_datasource"]
+	path = plugins/subjective_claude_cli_datasource
+	url = git@github.com:Subjective-Technologies/subjective_claude_cli_datasource.git
+[submodule "plugins/subjective_localchats_datasource"]
+	path = plugins/subjective_localchats_datasource
+	url = git@github.com:Subjective-Technologies/subjective-localchats-datasource.git
+[submodule "libs/dependencies/subjective-abstract-data-source-package"]
+	path = libs/dependencies/subjective-abstract-data-source-package
+	url = git@github.com:Subjective-Technologies/subjective-abstract-data-source-package.git
+[submodule "libs/dependencies/brainboost_configuration_package"]
+	path = libs/dependencies/brainboost_configuration_package
+	url = git@github.com:Subjective-Technologies/brainboost_configuration_package.git
+[submodule "libs/dependencies/brainboost_data_source_logger_package"]
+	path = libs/dependencies/brainboost_data_source_logger_package
+	url = git@github.com:Subjective-Technologies/brainboost_data_source_logger_package.git

@@ -1,0 +1,21 @@
+name = "subjective-devagents-fastapi"
+compatibility_date = "2026-06-01"
+
+# The devagents D1 database: one unified record of every conversation with any LLM,
+# whether reached through a subscription seat or a metered API key.
+#
+# Created 2026-09-06 in region ENAM. To re-apply the schema or refresh the catalog seed
+# (both are re-runnable — the schema is all IF NOT EXISTS, the seed is all upserts):
+#
+#   npx wrangler d1 execute devagents --remote --file schema/devagents.sql
+#   npx wrangler d1 execute devagents --remote --file seeds/devagents_seed.sql
+#
+# For local iteration, drop --remote to run against the local replica.
+[[d1_databases]]
+binding = "DEVAGENTS_DB"
+database_name = "devagents"
+database_id = "2348859b-1168-4ba9-81ba-044442898904"
+
+[vars]
+SERVICE_NAME = "subjective_devagents"
+SCHEMA_VERSION = "devagents-v1"
