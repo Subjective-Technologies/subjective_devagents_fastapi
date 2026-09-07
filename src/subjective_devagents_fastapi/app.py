@@ -10,7 +10,7 @@ asyncio.to_thread so one long agent turn never stalls the event loop.
 
 Run locally:
 
-    uvicorn subjective_devagents_fastapi.app:app --host 0.0.0.0 --port 8787
+    uvicorn subjective_devagents_fastapi.app:app --host 0.0.0.0 --port 8080
 """
 from __future__ import annotations
 
@@ -149,6 +149,7 @@ class AppState:
         self.deploy_version: str = WEB_UI_RELEASE
         self.history_refreshing = False
         self._refresh_lock = asyncio.Lock()
+        self.d1_last_sync: dict | None = None
 
     async def refresh_history(self, reason: str) -> dict:
         """Shared by the startup/interval refresh and the manual refresh API so a button
@@ -175,12 +176,44 @@ class AppState:
                     "reason": reason, "count": count, "ms": int((time.time() - started) * 1000),
                 })
                 core.broadcast("llm-history-refreshed", {"count": count})
-                return {"ok": True, "count": count}
+                d1_result = await asyncio.to_thread(self._sync_d1, reason)
+                return {"ok": True, "count": count, "d1": d1_result}
             except Exception as error:  # noqa: BLE001
                 default_log("error", "Local chat history pipeline crashed", {"reason": reason, "message": str(error)})
                 return {"ok": False, "error": str(error)}
             finally:
                 self.history_refreshing = False
+
+    def _sync_d1(self, reason: str) -> dict:
+        """Best-effort replica. Local JSON stays the live store if D1 is down."""
+        from .d1_client import D1Client, D1Error, d1_sync_enabled
+        from .d1_sync import conversations_for_sync, sync_conversations
+
+        if not d1_sync_enabled():
+            result = {"ok": True, "skipped": True, "reason": "disabled_or_no_credentials"}
+            self.d1_last_sync = result
+            return result
+        if self.core is None:
+            return {"ok": False, "error": "ChatCore is not initialized."}
+        started = time.time()
+        try:
+            conversations = conversations_for_sync(self.core.llm_service)
+            default_log("info", "D1 conversation sync start", {"reason": reason, "conversations": len(conversations)})
+            stats = sync_conversations(D1Client(), conversations)
+            stats.update({"ok": True, "reason": reason, "ms": int((time.time() - started) * 1000)})
+            default_log("info", "D1 conversation sync done", stats)
+            self.d1_last_sync = stats
+            return stats
+        except D1Error as error:
+            result = {"ok": False, "error": str(error)[:400], "reason": reason}
+            default_log("error", "D1 conversation sync failed", result)
+            self.d1_last_sync = result
+            return result
+        except Exception as error:  # noqa: BLE001
+            result = {"ok": False, "error": str(error)[:400], "reason": reason}
+            default_log("error", "D1 conversation sync crashed", result)
+            self.d1_last_sync = result
+            return result
 
 
 state = AppState()
@@ -265,7 +298,16 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="Subjective DevAgents", lifespan=lifespan)
 
-# The UI may be served from this process (default) or hosted separately; allow both.
+def _serve_ui() -> bool:
+    """False on the Hetzner API host. Set SUBJECTIVE_DEVAGENTS_SERVE_UI=1 to ship HTML too."""
+    return os.environ.get("SUBJECTIVE_DEVAGENTS_SERVE_UI", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _web_ui_url() -> str:
+    return (os.environ.get("SUBJECTIVE_DEVAGENTS_WEB_URL") or "https://devagents.subjectivetechnologies.com/").rstrip("/") + "/"
+
+
+# The UI may be served from this process or hosted separately; allow both.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -445,6 +487,16 @@ async def api_llm_activate_conversation(body: dict = Body(default={})) -> dict:
 @app.post("/api/llm/refresh-history")
 async def api_llm_refresh_history() -> dict:
     return await state.refresh_history("manual")
+
+
+@app.get("/api/d1/sync")
+async def api_d1_sync_status() -> dict:
+    return {"ok": True, "last": state.d1_last_sync}
+
+
+@app.post("/api/d1/sync")
+async def api_d1_sync_now() -> dict:
+    return await asyncio.to_thread(state._sync_d1, "manual")
 
 
 @app.post("/api/llm/reload-conversation")
@@ -666,6 +718,22 @@ async def websocket_events(socket: WebSocket) -> None:
         default_log("info", "WebSocket client disconnected", {"clients": len(hub.queues)})
 
 
+@app.get("/")
+async def api_root() -> Response:
+    """API index. Browser UI lives on the original web endpoint, not this process."""
+    if _serve_ui():
+        return _send_file(_static_files()["/"])
+    return JSONResponse(
+        {
+            "ok": True,
+            "service": "subjective_devagents_fastapi",
+            "docs": "/docs",
+            "openapi": "/openapi.json",
+            "web": _web_ui_url(),
+        }
+    )
+
+
 # --- static UI -------------------------------------------------------------------------
 
 
@@ -784,6 +852,11 @@ def _send_file(file_path: Path, is_asset: bool = False) -> Response:
 
 @app.get("/{path:path}")
 async def serve_static(path: str) -> Response:
+    if not _serve_ui():
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "Not found", "docs": "/docs", "web": _web_ui_url()},
+        )
     pathname = f"/{path}"
     target = _static_files().get(pathname)
     if target:

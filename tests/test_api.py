@@ -23,6 +23,7 @@ def client(tmp_path, monkeypatch):
     chat_home = tmp_path / "chat-home"
     monkeypatch.setenv("SUBJECTIVE_CHAT_HOME", str(chat_home))
     monkeypatch.setenv("SUBJECTIVE_CHAT_HISTORY_REFRESH_MS", "0")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_D1_SYNC", "0")
     monkeypatch.delenv("SUBJECTIVE_CHAT_IRC", raising=False)
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_CLIENT_ROOT", str(tmp_path / "client"))
     (tmp_path / "client" / "web").mkdir(parents=True)
@@ -52,6 +53,28 @@ def test_version(client):
     assert body["ok"] is True
     assert body["release"]
     assert body["version"].startswith(body["release"])
+
+
+def test_root_is_api_index_when_ui_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBJECTIVE_CHAT_HOME", str(tmp_path / "chat-home"))
+    monkeypatch.setenv("SUBJECTIVE_CHAT_HISTORY_REFRESH_MS", "0")
+    monkeypatch.delenv("SUBJECTIVE_CHAT_IRC", raising=False)
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_SERVE_UI", "0")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_D1_SYNC", "0")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_WEB_URL", "https://devagents.subjectivetechnologies.com/")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_CLIENT_ROOT", str(tmp_path / "client"))
+    (tmp_path / "client" / "web").mkdir(parents=True)
+    (tmp_path / "client" / "src").mkdir(parents=True)
+
+    from subjective_devagents_fastapi.app import app
+
+    with TestClient(app) as test_client:
+        body = test_client.get("/").json()
+        assert body["ok"] is True
+        assert body["docs"] == "/docs"
+        assert body["web"] == "https://devagents.subjectivetechnologies.com/"
+        assert test_client.get("/index.html").status_code == 404
+        assert test_client.get("/docs").status_code == 200
 
 
 def test_config_round_trip(client):

@@ -69,12 +69,16 @@ production runs.
 
 ```bash
 ./run_subjective_devagents_fastapi.sh          # from the monorepo root
+./run.sh                                       # from this repo
 ```
+
+Binds `0.0.0.0:8080` so it does not collide with the web UI (`:80` / `:8787`).
+Override with `SUBJECTIVE_CHAT_WEB_HOST` / `SUBJECTIVE_CHAT_WEB_PORT`.
 
 or directly:
 
 ```bash
-uvicorn subjective_devagents_fastapi.app:app --host 0.0.0.0 --port 8787
+uvicorn subjective_devagents_fastapi.app:app --host 0.0.0.0 --port 8080
 ```
 
 ## What moved where
@@ -110,7 +114,7 @@ so switching backends does not lose or rewrite anything:
 
 | Variable | Meaning |
 | --- | --- |
-| `SUBJECTIVE_CHAT_WEB_HOST` / `SUBJECTIVE_CHAT_WEB_PORT` | Bind address (launcher; default `0.0.0.0:8787`) |
+| `SUBJECTIVE_CHAT_WEB_HOST` / `SUBJECTIVE_CHAT_WEB_PORT` | Bind address (launcher; default `0.0.0.0:8080`, away from the web UI) |
 | `SUBJECTIVE_CHAT_HOME` | Application home holding conversation state (default `~/.subjective_chat`) |
 | `SUBJECTIVE_DEVAGENTS_CLIENT_ROOT` | Where the browser UI files and `pipelines/` bundles live (default: the DevAgents client in this repo) |
 | `SUBJECTIVE_CHAT_PYTHON` | Python used to run the exported CLI pipeline bundles |
@@ -122,14 +126,18 @@ so switching backends does not lose or rewrite anything:
 
 ## Serving the UI
 
-By default this process also serves the browser UI from
-`$SUBJECTIVE_DEVAGENTS_CLIENT_ROOT/web` and `/src` under a fixed allowlist, plus
-`/assets/**` with a resolved-path containment check. One origin means the UI needs no CORS
-and no API base URL — it calls relative paths and opens `/ws` on `location.host`.
+The Hetzner API host does **not** serve the browser UI (`SUBJECTIVE_DEVAGENTS_SERVE_UI=0`).
+Web stays at the original endpoint: `https://devagents.subjectivetechnologies.com/`.
+This process is the API: `/docs`, `/openapi.json`, `/api/*`, `/ws`.
 
-To host the frontend elsewhere (a CDN, another container), point it at this service and set
-`SUBJECTIVE_DEVAGENTS_CORS_ORIGINS` to that origin. Nothing else changes; the API surface
-is already origin-independent.
+`GET /` returns a JSON index pointing at `/docs` and the web URL.
+
+To serve HTML from this process anyway, set `SUBJECTIVE_DEVAGENTS_SERVE_UI=1`. Files then
+come from `$SUBJECTIVE_DEVAGENTS_CLIENT_ROOT/web` and `/src` under a fixed allowlist, plus
+`/assets/**` with a resolved-path containment check.
+
+When the UI is hosted separately, set `SUBJECTIVE_DEVAGENTS_CORS_ORIGINS` to that origin
+(default `*`). The API surface is origin-independent.
 
 HTML responses carry `Content-Security-Policy: frame-ancestors …` so the dashboard's
 **My Agents** page can iframe this app across origins — a zone-wide Cloudflare rule stamps
@@ -240,6 +248,22 @@ subscription call still reports tokens (worth tracking against the plan window) 
 nothing per token, so only `api` rows move money. `v_conversation_costs` reports both
 side by side. Cost is snapshotted into the row at write time along with
 `price_snapshot_json`, so re-pricing a model later never rewrites past spend.
+
+## D1 replica
+
+Local JSON under `$SUBJECTIVE_CHAT_HOME` is still the live store. After each history
+refresh the service upserts conversations, sessions, messages, and `import_sources`
+fingerprints into the Cloudflare D1 database `devagents` over HTTPS (this host is not a
+Worker, so the wrangler binding is unused).
+
+Unchanged transcripts are skipped via `import_sources.fingerprint`. Set
+`SUBJECTIVE_DEVAGENTS_D1_SYNC=0` to disable. Credentials come from the process
+environment or `/subjective/.env` (`CLOUDFLARE_API_TOKEN_5` preferred).
+
+```
+GET  /api/d1/sync   last run
+POST /api/d1/sync   run now
+```
 
 ## Tests
 
