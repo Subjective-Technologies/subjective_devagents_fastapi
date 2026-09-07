@@ -1447,9 +1447,15 @@ class LlmService:
             "ok": result.get("success") is not False,
             "ms": int((time.time() - started) * 1000),
         })
-        # _pipeline_result unwraps the bundle's {success, result:{pipeline_result}} envelope;
-        # a datasource returns the inner result directly, so wrap it to match.
-        return {"success": result.get("success", True), "result": result}
+        # _pipeline_result unwraps the bundle's {success, result:{pipeline_result}} envelope,
+        # but only on success — its failure branch returns the envelope untouched. Wrapping a
+        # failure would therefore bury `status` and `error` one level down where nothing looks
+        # for them, and the caller reports an empty "Unknown error" while the datasource knew
+        # exactly what went wrong. A failed datasource result already carries both fields at
+        # the top level, which is the shape that branch expects, so hand it back unwrapped.
+        if result.get("success") is False:
+            return result
+        return {"success": True, "result": result}
 
     def _run_pipeline(self, runtime_path: str, payload: dict, timeout_seconds: float) -> dict:
         action = str(payload.get("action") or "history") if isinstance(payload, dict) else "history"

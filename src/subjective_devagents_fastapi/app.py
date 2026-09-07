@@ -30,6 +30,7 @@ from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
+from . import auth
 from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
@@ -244,6 +245,14 @@ async def lifespan(application: FastAPI):
 
     core._emit = emit
 
+    # This service can read every conversation, list OS accounts and start an agent turn,
+    # and it is reachable from the public internet. Say so on every boot when it is open.
+    if not auth.auth_enabled():
+        default_log("error", "API TOKEN NOT SET — every endpoint is open to anonymous callers. "
+                             "Set SUBJECTIVE_DEVAGENTS_API_TOKEN to close it.", {})
+    else:
+        default_log("info", "API token gate enabled", {"protects": list(auth.PROTECTED_PREFIXES)})
+
     default_log("info", "Subjective DevAgents FastAPI starting", {
         "appHome": core.application_home,
         "clientRoot": str(state.client_root),
@@ -322,6 +331,25 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    """Reject unauthenticated callers before any handler runs.
+
+    Registered after the version middleware below, which means it runs *first* — an
+    unauthenticated request must not reach a handler that reads conversations or starts a
+    turn. Static UI files stay public: they are an empty shell without the API.
+    """
+    if auth.path_requires_token(request.url.path):
+        supplied = auth.token_from_request(request.headers, request.query_params)
+        if not auth.token_is_valid(supplied):
+            return JSONResponse(
+                status_code=401,
+                content={"ok": False, "error": "Unauthorized."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def add_version_and_no_store(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-DevAgents-Version", state.deploy_version)
@@ -339,6 +367,12 @@ def core() -> ChatCore:
 
 
 # --- API routes (1:1 with webServer.js) ------------------------------------------------
+
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    """Liveness only - deliberately says nothing about conversations, users or the host."""
+    return {"ok": True}
 
 
 @app.get("/api/version")
@@ -684,6 +718,13 @@ async def api_log(body: dict = Body(default={})) -> dict:
 
 @app.websocket("/ws")
 async def websocket_events(socket: WebSocket) -> None:
+    # HTTP middleware never runs for a WebSocket scope, so the gate is repeated here.
+    # A browser cannot set headers on a WebSocket handshake, hence ?token=.
+    if auth.auth_enabled():
+        supplied = auth.token_from_request(socket.headers, socket.query_params)
+        if not auth.token_is_valid(supplied):
+            await socket.close(code=1008)  # policy violation
+            return
     await socket.accept()
     hub = state.hub
     instance = core()
