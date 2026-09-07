@@ -1,0 +1,67 @@
+# INSTALL (as the user that owns the agent CLI logins):
+#   cp deploy/systemd/subjective-devagents-fastapi.service ~/.config/systemd/user/
+#   # edit the paths below: they are machine-specific (home directory, nvm node version)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now subjective-devagents-fastapi
+#   loginctl enable-linger $USER      # start at boot without a login session
+#
+# This replaces the Node `webServer.js` that used to hold :8787. One process now serves
+# both the browser UI and the API, so the page has no backend of its own.
+
+[Unit]
+# Subjective DevAgents backend, served at devagents.subjectivetechnologies.com.
+#
+# Runs natively on this coding machine rather than in a container: the agent CLIs keep
+# their logins in this user's $HOME (~/.codex, ~/.claude), the localchats datasource scans
+# every readable home for existing IDE chats, and "Continue as <user>" needs real su/pty
+# access. A container can be given all of that only by mounting /home and mapping this uid,
+# which buys nothing here — the service is meant to run exactly where the code and the CLI
+# sessions already are.
+#
+# A user unit, not a system one: it must run as goldenthinker to reach those credentials,
+# and this account has Linger=yes so the unit starts at boot without anyone logging in.
+Description=Subjective DevAgents FastAPI backend
+Documentation=https://github.com/Subjective-Technologies/subjective_devagents_fastapi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/home/goldenthinker/Dropbox/subjective/services/subjective_devagents_fastapi
+
+# Port 8787, replacing the Node webServer.js that used to hold it: this process now serves
+# BOTH the browser UI and the API, so the page has no separate backend of its own.
+#
+# 0.0.0.0 rather than loopback, matching what the Node server bound: the dashboard's
+# "My Agents" iframe reaches this over the tailnet, and narrowing to 127.0.0.1 would
+# silently break that. The listener is unauthenticated - access is fenced upstream, so do
+# not expose this port beyond the tailnet.
+Environment=SUBJECTIVE_CHAT_WEB_HOST=0.0.0.0
+Environment=SUBJECTIVE_CHAT_WEB_PORT=8787
+Environment=SUBJECTIVE_CHAT_HOME=/home/goldenthinker/.subjective_chat
+Environment=SUBJECTIVE_DEVAGENTS_CLIENT_ROOT=/home/goldenthinker/Dropbox/subjective/clients/desktop/subjective_devagents
+Environment=SUBJECTIVE_DEVAGENTS_PUBLIC_API=https://devagents-api.subjectivetechnologies.com:8080
+Environment=PYTHONPATH=/home/goldenthinker/Dropbox/subjective/services/subjective_devagents_fastapi/src
+
+# The agent CLIs are installed per-user under nvm, not system-wide; without this a
+# datasource reports `not_installed` even though the binary is right there.
+Environment=PATH=/home/goldenthinker/.nvm/versions/node/v24.11.1/bin:/home/goldenthinker/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ExecStart=/home/goldenthinker/Dropbox/subjective/services/subjective_devagents_fastapi/.venv/bin/python \
+    -m uvicorn subjective_devagents_fastapi.app:app \
+    --host ${SUBJECTIVE_CHAT_WEB_HOST} \
+    --port ${SUBJECTIVE_CHAT_WEB_PORT} \
+    --app-dir /home/goldenthinker/Dropbox/subjective/services/subjective_devagents_fastapi/src
+
+Restart=on-failure
+RestartSec=5
+# An agent turn can legitimately run 30 minutes; never interrupt one on a slow reload.
+TimeoutStopSec=45
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devagents-fastapi
+
+[Install]
+WantedBy=default.target
