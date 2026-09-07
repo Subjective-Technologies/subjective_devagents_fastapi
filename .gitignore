@@ -8,3 +8,4 @@ __pycache__/
 
 # datasource plugin bytecode from in-process imports
 plugins/**/__pycache__/
+.venv/
