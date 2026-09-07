@@ -693,11 +693,58 @@ def _static_files() -> dict[str, Path]:
     }
 
 
+def _stamp_api_base(html: str) -> str:
+    """Rewrite the page's API origin at serve time.
+
+    The bundle ships a default in <meta name="devagents-api">, but which backend a page
+    should talk to is a property of the deployment, not of the checkout: the same files are
+    served both by a split deployment (page and API on different hosts) and by this process
+    when it serves the UI itself. Baking one hostname into the file makes the second case
+    wrong in the worst way — the page would drive some *other* machine's agent CLIs.
+
+    SUBJECTIVE_DEVAGENTS_PUBLIC_API sets it explicitly. Empty (the default when this process
+    serves the UI) means same-origin, so the page talks to whichever backend served it,
+    which is this one. The CSP is rewritten to match, since connect-src must name the origin
+    or the browser blocks the call before sending it.
+    """
+    import re
+
+    configured = os.environ.get("SUBJECTIVE_DEVAGENTS_PUBLIC_API")
+    if configured is None:
+        return html
+    base = configured.strip().rstrip("/")
+    out = re.sub(
+        r'(<meta\s+name="devagents-api"\s+content=")[^"]*(")',
+        lambda match: f"{match.group(1)}{base}{match.group(2)}",
+        html,
+        count=1,
+    )
+    # Keep connect-src in step with whatever the meta tag now names. Anchor this to the CSP
+    # meta tag rather than to the first "connect-src" in the file: the page explains the
+    # directive in a comment above it, and matching that instead rewrote the prose and left
+    # the real policy untouched — which fails open, since the page then looks configured
+    # while the browser still blocks the call.
+    def fix_csp_tag(tag_match: "re.Match[str]") -> str:
+        def fix_directive(directive_match: "re.Match[str]") -> str:
+            directive = re.sub(r"\s*https?://[^\s;]+", "", directive_match.group(1)).rstrip()
+            return f"{directive} {base};" if base else f"{directive};"
+
+        return re.sub(r"(connect-src[^;\"]*);", fix_directive, tag_match.group(0), count=1)
+
+    return re.sub(
+        r'<meta\s+http-equiv="Content-Security-Policy"[^>]*>',
+        fix_csp_tag,
+        out,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def _stamp_html(html: str) -> str:
     """Replace the static placeholder so View Source shows the live release + git SHA."""
     import re
 
-    out = str(html)
+    out = _stamp_api_base(str(html))
     stamp_comment = f"<!-- devagents-deploy {state.deploy_version} served={datetime.now(timezone.utc).isoformat()} -->"
     if "DEVAGENTS_DEPLOY_VERSION" in out:
         out = out.replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version)

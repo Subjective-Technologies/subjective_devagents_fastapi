@@ -6,6 +6,7 @@ and with IRC disabled (the default) so nothing dials out.
 from __future__ import annotations
 
 import json
+import re
 import time
 import sys
 from pathlib import Path
@@ -26,8 +27,16 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_CLIENT_ROOT", str(tmp_path / "client"))
     (tmp_path / "client" / "web").mkdir(parents=True)
     (tmp_path / "client" / "src").mkdir(parents=True)
+    # Mirrors the real page's head: the version placeholder, the API origin meta tag and a
+    # CSP with connect-src, since serve-time stamping rewrites all three.
     (tmp_path / "client" / "web" / "index.html").write_text(
-        "<!doctype html>\n<html lang=\"en\"><head><title>DevAgents</title></head><body>DEVAGENTS_DEPLOY_VERSION</body></html>",
+        "<!doctype html>\n"
+        '<html lang="en"><head><title>DevAgents</title>\n'
+        '<meta name="devagents-api" content="https://devagents-api.subjectivetechnologies.com:8080">\n'
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; '
+        "connect-src 'self' ws: wss: https://devagents-api.subjectivetechnologies.com:8080; "
+        'img-src \'self\' data:;">\n'
+        "</head><body>DEVAGENTS_DEPLOY_VERSION</body></html>",
         encoding="utf-8",
     )
 
@@ -232,3 +241,62 @@ def test_history_manifest_with_real_sources_is_parsed(tmp_path, monkeypatch):
     assert conversation["provider"] == "claude"
     # The session uuid must be lifted out of the source path, not dropped or crashed on.
     assert conversation["sessionId"] == "2f0f9c2e-1111-2222-3333-444455556666"
+
+
+def test_api_origin_is_stamped_at_serve_time(client, monkeypatch):
+    """Which backend a page talks to belongs to the deployment, not the checkout. Serving
+    the UI from this process must be able to point the page at itself, or it would drive
+    another machine's agent CLIs."""
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_PUBLIC_API", "https://api.example.test:8080")
+    html = client.get("/").text
+    assert '<meta name="devagents-api" content="https://api.example.test:8080">' in html
+    # CSP has to name the same origin or the browser blocks the call before sending it.
+    csp = [line for line in html.splitlines() if "connect-src" in line][0]
+    assert "https://api.example.test:8080" in csp
+
+
+def test_empty_api_origin_means_same_origin(client, monkeypatch):
+    """The default when this process serves the UI: the page talks to whoever served it."""
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_PUBLIC_API", "")
+    html = client.get("/").text
+    assert '<meta name="devagents-api" content="">' in html
+    csp = [line for line in html.splitlines() if "connect-src" in line][0]
+    assert "https://" not in csp.split("connect-src")[1].split(";")[0]
+
+
+def test_unset_api_origin_leaves_the_shipped_default(client, monkeypatch):
+    monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_PUBLIC_API", raising=False)
+    html = client.get("/").text
+    assert 'name="devagents-api"' in html
+
+
+def test_stamping_rewrites_the_real_pages_policy_not_its_prose(monkeypatch):
+    """Regression: index.html explains connect-src in a comment above the tag, and a regex
+    anchored on the first 'connect-src' rewrote that prose while leaving the real policy
+    intact — the page then looks configured while the browser still blocks every call.
+    Runs against the shipped page, since a synthetic fixture has no such comment."""
+    import sys
+
+    sys.path.insert(0, str(SERVICE_ROOT / "src"))
+    from subjective_devagents_fastapi.app import _stamp_api_base
+
+    page = SERVICE_ROOT / ".." / ".." / "clients" / "desktop" / "subjective_devagents" / "web" / "index.html"
+    if not page.exists():
+        pytest.skip("DevAgents client checkout not present")
+    html = page.read_text(encoding="utf-8")
+
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_PUBLIC_API", "https://api.example.test:9000")
+    out = _stamp_api_base(html)
+    policy = re.search(r'<meta\s+http-equiv="Content-Security-Policy"[^>]*>', out).group(0)
+    connect = re.search(r"connect-src[^;\"]*;", policy).group(0)
+    assert "https://api.example.test:9000" in connect
+    assert "devagents-api.subjectivetechnologies.com" not in connect
+    # The explanatory comment must survive untouched.
+    assert "connect-src must name the API origin explicitly" in out
+
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_PUBLIC_API", "")
+    same_origin = _stamp_api_base(html)
+    policy = re.search(r'<meta\s+http-equiv="Content-Security-Policy"[^>]*>', same_origin).group(0)
+    connect = re.search(r"connect-src[^;\"]*;", policy).group(0)
+    assert "http" not in connect, f"same-origin policy still names a host: {connect}"
+    assert '<meta name="devagents-api" content="">' in same_origin

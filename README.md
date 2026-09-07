@@ -117,6 +117,7 @@ so switching backends does not lose or rewrite anything:
 | `SUBJECTIVE_CHAT_HISTORY_REFRESH_MS` | History rescan interval; `0` disables (default 10 min) |
 | `SUBJECTIVE_CHAT_IRC` | `1` enables the optional IRC bridge (off by default) |
 | `SUBJECTIVE_DEVAGENTS_CORS_ORIGINS` | Comma-separated origins when the UI is hosted separately (default `*`) |
+| `SUBJECTIVE_DEVAGENTS_PUBLIC_API` | Origin the served page should call. Empty = same-origin (this process). Unset leaves the checkout's default. Rewrites the page's `devagents-api` meta tag **and** its CSP `connect-src` at serve time |
 | `CURSOR_CDP_PORT` | Cursor's remote-debugging port for DOM injection (default 9222) |
 
 ## Serving the UI
