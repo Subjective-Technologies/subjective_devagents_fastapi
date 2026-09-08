@@ -326,3 +326,38 @@ def test_a_status_call_still_uses_the_module(service, monkeypatch):
     service.status("claude")
 
     assert calls == ["status"]
+
+
+def test_each_provider_gets_its_own_auto_approve_flag(service, monkeypatch):
+    """Each CLI spells 'let the agent run commands' differently, and sending the wrong flag
+    is silently ignored by that CLI — so the request must carry the right one per provider.
+    Cursor is the one that bit us: without force_commands its sandbox blocks every command."""
+    from subjective_devagents_fastapi import datasources
+
+    seen: dict[str, dict] = {}
+
+    # claude runs in-process; codex and cursor route to the bundle (no chat-capable
+    # module). The request dict is built the same way for both, so capture at each path
+    # rather than assume which one a provider takes.
+    def capture_module(provider, payload, connection=None):
+        seen[payload["target"].split(":")[1]] = payload
+        return {"success": True, "response": "ok"}
+
+    def capture_bundle(runtime_path, payload, timeout_seconds):
+        seen[payload["target"].split(":")[1]] = payload
+        return {"success": True, "result": {"success": True, "response": "ok"}}
+
+    monkeypatch.setattr(datasources, "run", capture_module)
+    service._run_pipeline = capture_bundle  # type: ignore[method-assign]
+
+    for provider, key, value in [
+        ("claude", "permission_mode", "acceptEdits"),
+        ("codex", "sandbox_mode", "workspace-write"),
+        ("cursor", "force_commands", True),
+    ]:
+        conversation = service.create_conversation(provider=provider, name=f"{provider} approve")
+        service.send_message(conversation["target"], "run a command")
+        assert seen[provider].get(key) == value, f"{provider} did not get {key}={value}"
+        # and only its own
+        others = {"permission_mode", "sandbox_mode", "force_commands"} - {key}
+        assert not (others & seen[provider].keys()), f"{provider} carried a flag meant for another CLI"

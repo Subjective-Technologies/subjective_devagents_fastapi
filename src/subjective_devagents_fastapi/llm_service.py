@@ -1292,12 +1292,17 @@ class LlmService:
                 "source_file": conversation.get("sourceFile") or source.get("sourceFile") or "",
                 "timeout": AGENT_TURN_TIMEOUT_SECONDS,
             }
-            # Codex sandboxes per request; Claude takes an equivalent permission mode;
-            # Cursor's CLI manages its own sandboxing.
+            # Let the agent actually run commands. Each CLI spells "auto-approve" its own
+            # way: Codex sandboxes per request, Claude takes a permission mode, and Cursor
+            # gates every shell command behind --force — without which its reply reads
+            # "Command blocked; no output". This is a private, single-operator tool where
+            # the whole point is the agent doing work, so all three are set to proceed.
             if provider["bundle"] == "claude":
                 request["permission_mode"] = "acceptEdits"
             elif provider["bundle"] == "codex":
                 request["sandbox_mode"] = "workspace-write"
+            elif provider["bundle"] == "cursor":
+                request["force_commands"] = True
             runtime_path = self._runtime_for(source["provider"])
             if running_as_other_user:
                 # Must stay a subprocess: the whole point is running under a different uid,
