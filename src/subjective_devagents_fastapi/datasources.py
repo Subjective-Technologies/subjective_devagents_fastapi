@@ -159,6 +159,28 @@ def available() -> dict[str, dict]:
     return report
 
 
+def supports_chat(datasource_class: type) -> bool:
+    """Can this datasource actually run an agent turn?
+
+    The fleet spans two generations, and the older one predates the chat contract
+    entirely: those classes define `_process_message` and no `run`/`handle_message` of
+    their own, so calling `run()` silently reaches the abstract base and returns a status
+    object instead of executing anything. A turn routed there does nothing and reports
+    success-shaped nonsense, which is worse than a missing plugin — a missing plugin at
+    least falls back to the exported bundle that works.
+
+    Checked against the class's own attributes, not the base's, so inheriting a stub does
+    not count as support.
+    """
+    for attribute in ("handle_message", "run"):
+        for klass in datasource_class.__mro__:
+            if klass.__name__ in ("SubjectiveDataSource", "SubjectiveOnDemandDataSource", "object"):
+                continue
+            if attribute in vars(klass):
+                return True
+    return False
+
+
 def instantiate(datasource_class: type, connection: dict | None = None):
     """Construct a datasource across both generations of the plugin API.
 

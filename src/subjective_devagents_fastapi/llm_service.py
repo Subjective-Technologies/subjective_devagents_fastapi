@@ -1420,6 +1420,21 @@ class LlmService:
             from . import datasources
         except ImportError:
             return None
+        # A datasource that predates the chat contract loads fine but cannot run a turn:
+        # its run() reaches the abstract base and returns a status object, so the send
+        # silently does nothing. The exported bundle can still do it, so treat "loaded but
+        # cannot chat" exactly like "not installed" and fall through to it.
+        if str(payload.get("action") or "") == "send":
+            try:
+                if not datasources.supports_chat(datasources.load(provider)):
+                    self.log("info", "Datasource module cannot run a turn; using exported bundle", {
+                        "provider": provider,
+                        "reason": "no handle_message/run of its own — datasource predates the chat contract",
+                    })
+                    return None
+            except LookupError:
+                return None
+
         started = time.time()
         try:
             connection = datasources.connection_for(

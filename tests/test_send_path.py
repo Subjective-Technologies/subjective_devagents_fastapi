@@ -27,9 +27,9 @@ def restore_datasources():
     """datasources.run is module-level state; put the real one back after each test."""
     from subjective_devagents_fastapi import datasources
 
-    original = datasources.run
+    original_run, original_supports = datasources.run, datasources.supports_chat
     yield
-    datasources.run = original
+    datasources.run, datasources.supports_chat = original_run, original_supports
 
 
 @pytest.fixture()
@@ -56,6 +56,10 @@ def stub_datasource(service, result, *, record=None):
         return dict(result)
 
     datasources.run = fake_run  # type: ignore[assignment]
+    # These tests exercise the in-process module path deliberately, so assert the datasource
+    # is chat-capable regardless of which generation happens to be pinned. The routing rule
+    # itself is covered by test_a_chat_incapable_datasource_falls_back_to_the_bundle.
+    datasources.supports_chat = lambda klass: True  # type: ignore[assignment]
     # Any fall-through to the bundle would be a silent subprocess; make it loud instead.
     service._run_pipeline = lambda *a, **k: pytest.fail("fell through to the exported bundle")  # type: ignore[method-assign]
     return service
@@ -279,3 +283,46 @@ def test_the_busy_flag_is_released_after_a_failure(service):
     service.send_message(target, "hello")
 
     assert target not in service.busy
+
+
+def test_a_chat_incapable_datasource_falls_back_to_the_bundle(service, monkeypatch):
+    """Regression: the pinned codex datasource loads fine but cannot run a turn. Preferring
+    it over the working bundle made every codex send return a status object and do nothing —
+    the reason codex turns silently stopped working in production."""
+    from subjective_devagents_fastapi import datasources
+
+    class ChatIncapable:
+        def run(self, request):
+            return {"success": True, "status": "ready"}  # a status object, not a turn
+
+    monkeypatch.setattr(datasources, "load", lambda provider: ChatIncapable)
+    monkeypatch.setattr(datasources, "supports_chat", lambda klass: False)
+    ran: list[str] = []
+
+    def fake_bundle(runtime_path, payload, timeout_seconds):
+        ran.append(runtime_path)
+        return {"success": True, "result": {"success": True, "response": "ran the command"}}
+
+    service._run_pipeline = fake_bundle  # type: ignore[method-assign]
+    conversation = service.create_conversation(provider="codex", name="Codex fallback")
+
+    result = service.send_message(conversation["target"], "run whoami")
+
+    assert ran, "a chat-incapable datasource was used instead of the bundle"
+    assert result["ok"] is True
+    assert result["assistantMessage"]["text"] == "ran the command"
+
+
+def test_a_status_call_still_uses_the_module(service, monkeypatch):
+    """Only `send` needs the chat contract — status works on both generations, and routing
+    it to a subprocess would cost an interpreter start for every poll."""
+    from subjective_devagents_fastapi import datasources
+
+    calls: list[str] = []
+    monkeypatch.setattr(datasources, "run",
+                        lambda provider, payload, connection=None: calls.append(payload.get("action")) or {"success": True, "status": "ready"})
+    service._run_pipeline = lambda *a, **k: pytest.fail("status should not spawn a bundle")  # type: ignore[method-assign]
+
+    service.status("claude")
+
+    assert calls == ["status"]

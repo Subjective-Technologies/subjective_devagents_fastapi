@@ -157,3 +157,47 @@ def test_a_pinned_datasource_can_be_constructed():
         pytest.skip("no agent datasource submodule is checked out")
     instance = datasources.instantiate(datasources.load(provider), datasources.connection_for(provider))
     assert hasattr(instance, "run")
+
+
+# --- can this datasource actually run a turn? ------------------------------------------------
+
+
+def test_a_datasource_with_its_own_handler_supports_chat():
+    class V2(V2DataSource):
+        def handle_message(self, message, files=None):
+            return {"success": True}
+
+    assert datasources.supports_chat(V2)
+
+
+def test_a_datasource_that_only_inherits_a_stub_does_not_support_chat():
+    """The v1 generation predates the chat contract: those classes define _process_message
+    and nothing else, so run() reaches the abstract base and returns a status object. A turn
+    routed there silently does nothing, which is worse than a missing plugin — a missing
+    plugin at least falls back to the exported bundle that works."""
+
+    class SubjectiveDataSource:  # stands in for the abstract base
+        def run(self, request):
+            return {"success": True, "status": "ready"}
+
+    class V1Legacy(SubjectiveDataSource):
+        def _process_message(self, message):
+            return message
+
+    assert not datasources.supports_chat(V1Legacy)
+
+
+def test_the_pinned_codex_datasource_is_detected_as_chat_incapable():
+    """Pins the real-world case: the codex repo on GitHub is six months stale and has no
+    run()/handle_message() of its own, so codex turns must go to the bundle."""
+    report = datasources.available()
+    if not report["codex"]["loaded"]:
+        pytest.skip("codex submodule is not checked out")
+    assert not datasources.supports_chat(datasources.load("codex"))
+
+
+def test_the_claude_datasource_can_run_a_turn():
+    report = datasources.available()
+    if not report["claude"]["loaded"]:
+        pytest.skip("claude submodule is not checked out")
+    assert datasources.supports_chat(datasources.load("claude"))

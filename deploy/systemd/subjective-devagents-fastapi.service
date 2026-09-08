@@ -41,6 +41,10 @@ Environment=SUBJECTIVE_CHAT_WEB_PORT=8787
 Environment=SUBJECTIVE_CHAT_HOME=/home/goldenthinker/.subjective_chat
 Environment=SUBJECTIVE_DEVAGENTS_CLIENT_ROOT=/home/goldenthinker/Dropbox/subjective/clients/desktop/subjective_devagents
 Environment=SUBJECTIVE_DEVAGENTS_PUBLIC_API=https://devagents-api.subjectivetechnologies.com:8080
+# The exported bundles run as subprocesses and import the shared packages by bare name;
+# without them on PYTHONPATH the bundle fallback dies with "No module named
+# brainboost_data_source_logger_package" and a provider whose datasource cannot chat has
+# nowhere left to run.
 Environment=PYTHONPATH=/home/goldenthinker/Dropbox/subjective/services/subjective_devagents_fastapi/src
 
 # The agent CLIs are installed per-user under nvm, not system-wide; without this a
