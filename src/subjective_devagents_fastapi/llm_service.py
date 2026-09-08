@@ -125,6 +125,25 @@ def writable_provider(provider: Any) -> dict | None:
     return WRITABLE_PROVIDERS.get(provider_key(provider))
 
 
+# Signatures the agent CLIs emit when two of them collide refreshing a shared OAuth token.
+# The CLI reports this as transient and asks the caller to retry, so a turn that hits it is
+# worth re-running rather than failing.
+_TRANSIENT_AUTH_REFRESH_RE = re.compile(
+    r"failed to refresh (?:the )?(?:oauth|auth) token"
+    r"|another claude code process is refreshing"
+    r"|token (?:refresh|renewal) (?:is )?in progress"
+    r"|exited mid-refresh",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_auth_refresh(result: dict | None) -> bool:
+    if not result or result.get("success") is not False:
+        return False
+    blob = f"{result.get('error') or ''} {result.get('response') or ''} {result.get('status') or ''}"
+    return bool(_TRANSIENT_AUTH_REFRESH_RE.search(blob))
+
+
 def epoch_ms(value: Any) -> float:
     if value is None or value == "":
         return 0
@@ -1316,16 +1335,33 @@ class LlmService:
                 # run-without-prompting mode, the same intent as the flags above.
                 request["permission_mode"] = "bypassPermissions"
             runtime_path = self._runtime_for(source["provider"])
-            if running_as_other_user:
-                # Must stay a subprocess: the whole point is running under a different uid,
-                # and an import cannot change the uid of this process.
-                pipeline_response = self._run_pipeline_for_user(
-                    conversation["osUser"], runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
-                )
-            else:
-                pipeline_response = self._run_datasource(
+
+            def run_once() -> dict:
+                if running_as_other_user:
+                    # Must stay a subprocess: the whole point is running under a different
+                    # uid, and an import cannot change the uid of this process.
+                    return self._run_pipeline_for_user(
+                        conversation["osUser"], runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
+                    )
+                return self._run_datasource(
                     source["provider"], request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
                 ) or self._run_pipeline(runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS)
+
+            # The Claude CLI refreshes its OAuth token in a shared file, and two claude
+            # invocations near a token's expiry collide: "another Claude Code process is
+            # refreshing it or exited mid-refresh". The CLI itself calls this transient and
+            # says to retry, so do exactly that — a couple of times, with a short pause —
+            # rather than surfacing a spurious failure. Safe to re-run: nothing in the
+            # transcript has been touched based on the result yet.
+            pipeline_response = run_once()
+            for attempt in range(2):
+                if not _is_transient_auth_refresh(self._pipeline_result(pipeline_response)):
+                    break
+                self.log("warn", "Transient OAuth token-refresh collision; retrying", {
+                    "target": target, "provider": source["provider"], "attempt": attempt + 1,
+                })
+                time.sleep(2.0 * (attempt + 1))
+                pipeline_response = run_once()
             result = self._pipeline_result(pipeline_response)
             if not result.get("success"):
                 # Preserve attachment messages so the screenshot and its failure stay

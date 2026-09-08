@@ -364,3 +364,81 @@ def test_each_provider_gets_its_own_auto_approve_flag(service, monkeypatch):
         # claude and grok, so it is not exclusive.
         exclusive = {"sandbox_mode", "force_commands"} - {key}
         assert not (exclusive & seen[provider].keys()), f"{provider} carried a flag meant for another CLI"
+
+
+def test_a_transient_oauth_refresh_collision_is_retried(service, monkeypatch):
+    """The Claude CLI refreshes a shared OAuth token and two invocations can collide with
+    "another Claude Code process is refreshing it". The CLI calls this transient and asks
+    for a retry, so a turn must retry rather than surface a spurious failure — and must not
+    double the transcript when it does."""
+    from subjective_devagents_fastapi import datasources
+
+    real_error = ("Failed to refresh OAuth token: another Claude Code process is refreshing "
+                  "it or exited mid-refresh. This is usually transient; retry in a minute.")
+    attempts = {"n": 0}
+
+    def flaky(provider, payload, connection=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return {"success": False, "status": "execution_error", "error": real_error}
+        return {"success": True, "response": "goldenthinker"}
+
+    monkeypatch.setattr(datasources, "run", flaky)
+    monkeypatch.setattr(datasources, "supports_chat", lambda klass: True)
+    monkeypatch.setattr("subjective_devagents_fastapi.llm_service.time.sleep", lambda *_: None)
+    service._run_pipeline = lambda *a, **k: pytest.fail("should not reach the bundle")  # type: ignore[method-assign]
+
+    conversation = service.create_conversation(provider="claude", name="OAuth retry")
+    result = service.send_message(conversation["target"], "try ls .. whoami")
+
+    assert attempts["n"] == 2, "the turn was not retried after a transient refresh collision"
+    assert result["ok"] is True
+    assert result["assistantMessage"]["text"] == "goldenthinker"
+    # Exactly one user line and one assistant line — the retry must not double the transcript.
+    messages = service.find_conversation(conversation["target"], include_messages=True)["messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+
+
+def test_a_persistent_oauth_error_gives_up_and_reports_it(service, monkeypatch):
+    """Retry is bounded: if it never clears, the real error must still reach the user
+    rather than looping or vanishing."""
+    from subjective_devagents_fastapi import datasources
+
+    real_error = "Failed to refresh OAuth token: another Claude Code process is refreshing it"
+    attempts = {"n": 0}
+
+    def always_failing(provider, payload, connection=None):
+        attempts["n"] += 1
+        return {"success": False, "status": "execution_error", "error": real_error}
+
+    monkeypatch.setattr(datasources, "run", always_failing)
+    monkeypatch.setattr(datasources, "supports_chat", lambda klass: True)
+    monkeypatch.setattr("subjective_devagents_fastapi.llm_service.time.sleep", lambda *_: None)
+    service._run_pipeline = lambda *a, **k: pytest.fail("should not reach the bundle")  # type: ignore[method-assign]
+
+    conversation = service.create_conversation(provider="claude", name="OAuth give up")
+    result = service.send_message(conversation["target"], "try ls")
+
+    assert attempts["n"] == 3, "expected one attempt plus two bounded retries"
+    assert result["ok"] is False
+    assert "refresh OAuth token" in result["error"]
+
+
+def test_an_ordinary_error_is_not_retried(service, monkeypatch):
+    """Only the transient refresh signature retries; a real failure must fail once."""
+    from subjective_devagents_fastapi import datasources
+
+    attempts = {"n": 0}
+
+    def failing(provider, payload, connection=None):
+        attempts["n"] += 1
+        return {"success": False, "status": "execution_error", "error": "command not found: frobnicate"}
+
+    monkeypatch.setattr(datasources, "run", failing)
+    monkeypatch.setattr(datasources, "supports_chat", lambda klass: True)
+    service._run_pipeline = lambda *a, **k: pytest.fail("should not reach the bundle")  # type: ignore[method-assign]
+
+    conversation = service.create_conversation(provider="claude", name="Ordinary error")
+    service.send_message(conversation["target"], "run frobnicate")
+
+    assert attempts["n"] == 1, "a non-transient error must not be retried"
