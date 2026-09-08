@@ -44,6 +44,7 @@ DATASOURCE_MODULES = {
     "codex": ("subjective_codex_datasource", "SubjectiveCodexDataSource", "SubjectiveCodexDataSource"),
     "claude": ("subjective_claude_cli_datasource", "SubjectiveClaudeCliDataSource", "SubjectiveClaudeCliDataSource"),
     "cursor": ("subjective_cursor_datasource", "SubjectiveCursorDataSource", "SubjectiveCursorDataSource"),
+    "grok": ("subjective_grok_cli_datasource", "SubjectiveGrokCliDataSource", "SubjectiveGrokCliDataSource"),
     "localchats": ("subjective_localchats_datasource", "SubjectiveLocalchatsDataSource", "SubjectiveLocalchatsDataSource"),
 }
 

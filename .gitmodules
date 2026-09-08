@@ -16,3 +16,6 @@
 [submodule "libs/dependencies/brainboost_data_source_logger_package"]
 	path = libs/dependencies/brainboost_data_source_logger_package
 	url = git@github.com:Subjective-Technologies/brainboost_data_source_logger_package.git
+[submodule "plugins/subjective_grok_cli_datasource"]
+	path = plugins/subjective_grok_cli_datasource
+	url = https://github.com/Subjective-Technologies/subjective_grok_cli_datasource.git

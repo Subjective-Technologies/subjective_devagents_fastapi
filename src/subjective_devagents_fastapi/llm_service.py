@@ -62,6 +62,7 @@ WRITABLE_PROVIDERS = {
     "codex": {"bundle": "codex", "label": "Codex"},
     "claude": {"bundle": "claude", "label": "Claude"},
     "cursor": {"bundle": "cursor", "label": "Cursor"},
+    "grok": {"bundle": "grok", "label": "Grok"},
 }
 DEFAULT_PROVIDER = "codex"
 
@@ -406,6 +407,11 @@ class LlmService:
         self.codex_runtime = str(Path(self.root) / "pipelines" / "codex" / "run.py")
         self.claude_runtime = str(Path(self.root) / "pipelines" / "claude" / "run.py")
         self.cursor_runtime = str(Path(self.root) / "pipelines" / "cursor" / "run.py")
+        # No exported grok bundle exists; its datasource is chat-capable in-process. This
+        # path is only reached if that in-process call is unavailable, and pointing it at a
+        # non-existent runtime makes the fallback report "runtime missing" rather than
+        # silently answering a grok turn with the default (codex) bundle.
+        self.grok_runtime = str(Path(self.root) / "pipelines" / "grok" / "run.py")
         self.history_runtime = str(Path(self.root) / "pipelines" / "history" / "run.py")
         self.reload_runtime = str(Path(self.root) / "pipelines" / "history" / "reload_one.py")
         self.pipeline_runtime = str(Path(__file__).parent / "pipeline_runtime.py")
@@ -793,6 +799,8 @@ class LlmService:
             return self.claude_runtime
         if key == "cursor":
             return self.cursor_runtime
+        if key == "grok":
+            return self.grok_runtime
         return self.codex_runtime
 
     def create_conversation(self, provider: Any = None, name: str = "", workspace: str = "") -> dict:
@@ -1303,6 +1311,10 @@ class LlmService:
                 request["sandbox_mode"] = "workspace-write"
             elif provider["bundle"] == "cursor":
                 request["force_commands"] = True
+            elif provider["bundle"] == "grok":
+                # Grok reads permission_mode per turn; bypassPermissions is its
+                # run-without-prompting mode, the same intent as the flags above.
+                request["permission_mode"] = "bypassPermissions"
             runtime_path = self._runtime_for(source["provider"])
             if running_as_other_user:
                 # Must stay a subprocess: the whole point is running under a different uid,

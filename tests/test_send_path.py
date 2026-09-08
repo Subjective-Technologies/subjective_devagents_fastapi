@@ -354,10 +354,13 @@ def test_each_provider_gets_its_own_auto_approve_flag(service, monkeypatch):
         ("claude", "permission_mode", "acceptEdits"),
         ("codex", "sandbox_mode", "workspace-write"),
         ("cursor", "force_commands", True),
+        ("grok", "permission_mode", "bypassPermissions"),
     ]:
         conversation = service.create_conversation(provider=provider, name=f"{provider} approve")
         service.send_message(conversation["target"], "run a command")
         assert seen[provider].get(key) == value, f"{provider} did not get {key}={value}"
-        # and only its own
-        others = {"permission_mode", "sandbox_mode", "force_commands"} - {key}
-        assert not (others & seen[provider].keys()), f"{provider} carried a flag meant for another CLI"
+        # and only its own: sandbox_mode and force_commands are single-provider, so their
+        # presence on the wrong provider is the real mistake. permission_mode is shared by
+        # claude and grok, so it is not exclusive.
+        exclusive = {"sandbox_mode", "force_commands"} - {key}
+        assert not (exclusive & seen[provider].keys()), f"{provider} carried a flag meant for another CLI"

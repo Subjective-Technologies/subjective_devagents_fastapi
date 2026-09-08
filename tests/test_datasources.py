@@ -127,7 +127,7 @@ def test_missing_module_names_where_it_looked(monkeypatch, tmp_path):
 
 def test_available_reports_every_provider_without_raising():
     report = datasources.available()
-    assert set(report) == {"codex", "claude", "cursor", "localchats"}
+    assert set(report) == {"codex", "claude", "cursor", "grok", "localchats"}
     for key, entry in report.items():
         assert "found" in entry and "loaded" in entry
         if not entry["loaded"]:
