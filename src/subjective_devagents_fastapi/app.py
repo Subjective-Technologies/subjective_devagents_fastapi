@@ -30,7 +30,7 @@ from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from . import auth
+from . import auth, shell_exec
 from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
@@ -711,6 +711,50 @@ async def api_file_reveal() -> dict:
 async def api_log(body: dict = Body(default={})) -> dict:
     default_log(body.get("level") or "info", body.get("message") or "Browser log", body.get("details") or {})
     return {"ok": True}
+
+
+@app.get("/api/exec/status")
+async def api_exec_status() -> dict:
+    """Whether the phone can run commands here, and where they run from.
+
+    The UI reads this to decide whether to show the terminal input at all, so it reflects
+    both interlocks — enabled *and* authenticated.
+    """
+    try:
+        shell_exec.ensure_available()
+        return {"ok": True, "enabled": True, "cwd": shell_exec.default_workdir()}
+    except shell_exec.ExecDisabled as reason:
+        return {"ok": True, "enabled": False, "reason": str(reason)}
+
+
+@app.post("/api/exec")
+async def api_exec(body: dict = Body(default={})) -> dict:
+    """Run one shell command on this host and return its output.
+
+    Already behind the API token (the require_api_token middleware ran before this), and
+    refuses outright unless execution is explicitly enabled — see shell_exec for the
+    interlocks. Every invocation is logged with its command, so the journal is the audit
+    trail.
+    """
+    command = str(body.get("command") or "")
+    try:
+        shell_exec.ensure_available()
+    except shell_exec.ExecDisabled as reason:
+        # 403, not 401: the caller authenticated fine, the capability is switched off.
+        return JSONResponse(status_code=403, content={"ok": False, "error": str(reason)})
+
+    default_log("info", "Exec request", {
+        "command": shell_exec.summarize_for_log(command),
+        "cwd": body.get("cwd") or shell_exec.default_workdir(),
+    })
+    result = await asyncio.to_thread(
+        shell_exec.run_command, command, str(body.get("cwd") or ""), body.get("timeout")
+    )
+    default_log("info" if result.get("ok") else "warn", "Exec result", {
+        "status": result.get("status") or "", "exitCode": result.get("exit_code"),
+        "ms": result.get("duration_ms"), "truncated": result.get("truncated"),
+    })
+    return result
 
 
 # --- WebSocket -------------------------------------------------------------------------

@@ -122,6 +122,8 @@ so switching backends does not lose or rewrite anything:
 | `SUBJECTIVE_CHAT_IRC` | `1` enables the optional IRC bridge (off by default) |
 | `SUBJECTIVE_DEVAGENTS_CORS_ORIGINS` | Comma-separated origins when the UI is hosted separately (default `*`) |
 | `SUBJECTIVE_DEVAGENTS_API_TOKEN` | **Set this.** Shared secret required on `/api/*`, `/ws`, `/docs`, `/openapi.json`. Unset leaves the API open to anonymous internet callers (logged loudly at startup). Seed a browser once with `?token=...` |
+| `SUBJECTIVE_DEVAGENTS_EXEC_ENABLED` | `1` enables `POST /api/exec` (run a shell command on this host). Off by default, and **refused** unless `SUBJECTIVE_DEVAGENTS_API_TOKEN` is also set |
+| `SUBJECTIVE_DEVAGENTS_EXEC_CWD` | Default working directory for `/api/exec` (default: `$HOME`) |
 | `SUBJECTIVE_DEVAGENTS_PUBLIC_API` | Origin the served page should call. Empty = same-origin (this process). Unset leaves the checkout's default. Rewrites the page's `devagents-api` meta tag **and** its CSP `connect-src` at serve time |
 | `CURSOR_CDP_PORT` | Cursor's remote-debugging port for DOM injection (default 9222) |
 
