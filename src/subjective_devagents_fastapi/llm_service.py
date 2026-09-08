@@ -137,6 +137,54 @@ _TRANSIENT_AUTH_REFRESH_RE = re.compile(
 )
 
 
+def _extract_readable_text(value: Any) -> str:
+    """Pull human-readable text out of a streamed agent event.
+
+    Progress text arrives in three shapes: plain prose ("Checking the logs"), a JSON
+    message object, or — the one that leaked to the UI as noise — a Python-repr'd dict like
+    `{'role': 'assistant', 'content': [{'type': 'text', 'text': '+'}]}`. This flattens all
+    three to the readable text a person should see, and returns "" when there is nothing
+    worth showing (an empty delta, a bare structure).
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        # A serialized structure smuggled into a string field. Try JSON, then a Python
+        # literal (single-quoted repr), and recurse; otherwise it is real prose.
+        if (stripped[0], stripped[-1]) in {("{", "}"), ("[", "]")}:
+            for parse in (json.loads, _literal_eval):
+                try:
+                    return _extract_readable_text(parse(stripped))
+                except (ValueError, SyntaxError):
+                    continue
+        return stripped
+    if isinstance(value, dict):
+        # A tool call reads better as a verb than as its arguments.
+        kind = str(value.get("type") or value.get("subtype") or "").lower()
+        if kind in ("tool_use", "tool_call", "tool") or value.get("name"):
+            name = str(value.get("name") or value.get("toolName") or "tool").strip()
+            return f"Using {name}" if name else ""
+        if "content" in value:
+            return _extract_readable_text(value["content"])
+        for key in ("text", "message", "delta", "thinking", "summary"):
+            if value.get(key):
+                found = _extract_readable_text(value[key])
+                if found:
+                    return found
+        return ""
+    if isinstance(value, list):
+        parts = [_extract_readable_text(item) for item in value]
+        return " ".join(part for part in parts if part).strip()
+    return ""
+
+
+def _literal_eval(text: str) -> Any:
+    import ast
+
+    return ast.literal_eval(text)
+
+
 def _is_transient_auth_refresh(result: dict | None) -> bool:
     if not result or result.get("success") is not False:
         return False
@@ -1605,15 +1653,18 @@ class LlmService:
                 continue
             try:
                 body = json.loads(line[index + len(prefix):])
-                text = str(body.get("text") or "").strip()
-                if text:
-                    self.on_progress({
-                        "text": text,
-                        "target": (payload or {}).get("target") or "",
-                        "sessionId": (payload or {}).get("session_id") or "",
-                    })
             except ValueError:
-                pass  # partial JSON
+                continue  # partial JSON
+            # Flatten whatever the datasource emitted to readable text — the raw shape
+            # (a stringified message dict) was reaching the status line as noise.
+            text = _extract_readable_text(body.get("text"))
+            if not text:
+                continue
+            self.on_progress({
+                "text": text[:200],
+                "target": (payload or {}).get("target") or "",
+                "sessionId": (payload or {}).get("session_id") or "",
+            })
 
     def _parse_pipeline_output(self, stdout: str, stderr: str) -> dict:
         try:
