@@ -317,15 +317,31 @@ def prefer_conversation_label(existing: Any, incoming: Any, provider: Any) -> st
     return nxt
 
 
+def _with_prompt_options(messages: list) -> list:
+    """Attach promptOptions to the trailing assistant message — the only one the UI offers
+    choices for. A copy, so the stored transcript is never touched."""
+    from . import prompt_options
+
+    if not messages or messages[-1].get("role") != "assistant":
+        return messages
+    annotated = prompt_options.annotate_message(messages[-1])
+    if annotated is messages[-1]:
+        return messages
+    return [*messages[:-1], annotated]
+
+
 def tail_conversation_for_client(conversation: dict | None, limit: int = HYDRATE_MESSAGE_LIMIT) -> dict | None:
     if not conversation or not isinstance(conversation.get("messages"), list):
         return conversation
     total = len(conversation["messages"])
     if total <= limit:
-        return conversation
+        annotated = _with_prompt_options(conversation["messages"])
+        if annotated is conversation["messages"]:
+            return conversation
+        return {**conversation, "messages": annotated}
     return {
         **conversation,
-        "messages": conversation["messages"][-limit:],
+        "messages": _with_prompt_options(conversation["messages"][-limit:]),
         "messageCount": int(conversation.get("messageCount") or total),
         "truncated": True,
         "hiddenBefore": total - limit,

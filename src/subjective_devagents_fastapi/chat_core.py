@@ -27,6 +27,7 @@ from .llm_service import (
     provider_label,
     tail_conversation_for_client,
 )
+from .prompt_options import annotate_message
 from .provider_sessions import list_provider_sessions
 from .su_session_manager import SuSessionManager
 from .system_users import current_username, is_valid_username, list_system_users
@@ -1087,7 +1088,7 @@ class ChatCore:
             if response.get("ok") and response.get("userMessage"):
                 self.broadcast("llm-message", {"target": target, "message": response["userMessage"], "provider": provider, "from": sender})
             if response.get("ok"):
-                self.broadcast("llm-message", {"target": target, "message": response["assistantMessage"], "provider": provider})
+                self.broadcast("llm-message", {"target": target, "message": annotate_message(response["assistantMessage"]), "provider": provider})
                 self.broadcast("llm-conversation", {"conversation": tail_conversation_for_client(response["conversation"])})
                 if response.get("cursorIdeHint"):
                     self.broadcast("system", {
@@ -1137,7 +1138,7 @@ class ChatCore:
                         "target": target, "message": response["userMessage"], "provider": provider, "from": self.current_nick,
                     })
                 if response.get("ok"):
-                    self.broadcast("llm-message", {"target": target, "message": response["assistantMessage"], "provider": provider})
+                    self.broadcast("llm-message", {"target": target, "message": annotate_message(response["assistantMessage"]), "provider": provider})
                     self.broadcast("llm-conversation", {"conversation": tail_conversation_for_client(response["conversation"])})
                     if self.connected and conversation and conversation.get("ircChannel"):
                         self.send_irc_text(conversation["ircChannel"], f"{label}: {response['assistantMessage']['text']}")
