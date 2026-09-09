@@ -58,11 +58,21 @@ def capture_send(state):
 # --- the click's request --------------------------------------------------------------------
 
 
-def test_clicking_yes_sends_the_reply_to_the_backend(client):
-    """The whole feature: the Yes button POSTs the canned reply, the endpoint accepts it, and
-    the reply text actually reaches send_llm_message — not dropped, not altered."""
-    created = client.post("/api/llm/create-conversation", json={"provider": "claude", "name": "Quick reply"}).json()
-    target = created["conversation"]["target"]
+# Every writable provider a Yes button can appear under. The button behaves identically
+# for each, so the acceptance-and-dispatch contract is checked for all of them.
+WRITABLE_PROVIDERS = ["codex", "claude", "cursor", "grok"]
+
+
+@pytest.mark.parametrize("provider", WRITABLE_PROVIDERS)
+def test_clicking_yes_sends_the_reply_to_the_backend(client, provider):
+    """The whole feature, for each CLI: the Yes button POSTs the canned reply, the endpoint
+    accepts it, and the reply text reaches send_llm_message for that provider — not dropped,
+    not altered, not misrouted. The send is stubbed, so no CLI actually runs here; a real
+    per-CLI turn is the opt-in live test below."""
+    created = client.post("/api/llm/create-conversation", json={"provider": provider, "name": f"Quick reply {provider}"}).json()
+    conversation = created["conversation"]
+    target = conversation["target"]
+    assert conversation["provider"] == provider
     record, done = capture_send(client.app_state)
 
     response = client.post("/api/llm/send-message", json={"target": target, "text": "Yes, proceed."})
@@ -71,8 +81,8 @@ def test_clicking_yes_sends_the_reply_to_the_backend(client):
     assert response.status_code == 200
     assert response.json() == {"ok": True, "pending": True, "target": target}
 
-    # The background task must actually run the send with the exact reply.
-    assert done.wait(timeout=5), "send_llm_message was never called for the quick reply"
+    # The background task must actually run the send with the exact reply, for this provider.
+    assert done.wait(timeout=5), f"send_llm_message was never called for a {provider} quick reply"
     assert record["target"] == target
     assert record["text"] == "Yes, proceed."
 
