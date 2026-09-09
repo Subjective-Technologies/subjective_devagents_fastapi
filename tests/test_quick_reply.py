@@ -144,3 +144,27 @@ def test_the_send_endpoint_is_gated_when_a_token_is_set(tmp_path, monkeypatch):
         )
         assert ok.status_code == 200
         assert ok.json()["status"] == "not_found"
+
+
+def test_hydrate_reports_authoritative_busy_state(client):
+    """The UI recovers a wedged conversation by trusting the server's busy flag on hydrate;
+    it must be present and reflect whether a turn is really in flight."""
+    created = client.post("/api/llm/create-conversation", json={"provider": "claude", "name": "Busy flag"}).json()
+    target = created["conversation"]["target"]
+    # Not running: busy must be False.
+    body = client.get("/api/llm/conversation", params={"target": target}).json()
+    assert body["ok"] is True
+    assert body["conversation"]["busy"] is False
+    # Mark it in-flight the way a running turn does, and confirm the hydrate says so.
+    client.app_state.core.llm_service.busy.add(target)
+    try:
+        body = client.get("/api/llm/conversation", params={"target": target}).json()
+        assert body["conversation"]["busy"] is True
+    finally:
+        client.app_state.core.llm_service.busy.discard(target)
+
+
+def test_conversation_list_includes_busy(client):
+    client.post("/api/llm/create-conversation", json={"provider": "codex", "name": "List busy"})
+    listed = client.get("/api/llm/conversations", params={"limit": 10}).json()
+    assert all("busy" in c for c in listed["conversations"]), "every listed conversation should carry a busy flag"

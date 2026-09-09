@@ -469,7 +469,12 @@ async def api_llm_conversation(target: str = Query(default="")) -> dict:
             "truncated": bool((conversation or {}).get("truncated")),
             "origin": (conversation or {}).get("origin") or "",
         })
-        return {"ok": True, "conversation": conversation} if conversation else {"ok": False, "error": "Conversation was not found."}
+        if conversation:
+            # Authoritative busy state on hydrate, so opening a chat recovers from a missed
+            # llm-busy:false (dropped socket) rather than inheriting a stale wedge.
+            conversation["busy"] = str(target) in instance.llm_service.busy
+            return {"ok": True, "conversation": conversation}
+        return {"ok": False, "error": "Conversation was not found."}
     except Exception as error:  # noqa: BLE001
         default_log("error", "LLM conversation hydrate crashed", {"target": target, "message": str(error)})
         return {"ok": False, "error": str(error)}
@@ -790,7 +795,14 @@ async def websocket_events(socket: WebSocket) -> None:
         reader = asyncio.create_task(pump_incoming())
         try:
             while True:
-                event = await queue.get()
+                try:
+                    # A heartbeat while idle: Cloudflare closes a WebSocket with no traffic
+                    # for ~100s, and when it does mid-turn the client loses the reply and the
+                    # llm-busy:false that re-enables the UI. A periodic frame keeps the
+                    # connection alive through the proxy so events actually arrive.
+                    event = await asyncio.wait_for(queue.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    event = {"type": "ping", "t": int(time.time() * 1000)}
                 await socket.send_text(json.dumps(event, default=str))
                 if reader.done():
                     break

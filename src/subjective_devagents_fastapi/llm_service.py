@@ -848,6 +848,10 @@ class LlmService:
                         "messages": [],
                         "loaded": conversation["origin"] == "local" and len(conversation["messages"]) == 0,
                         "activeOnIrc": conversation["target"] in self.active_targets,
+                        # Authoritative busy state: whether a turn is actually in flight for
+                        # this conversation right now. Lets the UI recover from a missed
+                        # llm-busy:false (a dropped socket) instead of staying wedged.
+                        "busy": conversation["target"] in self.busy,
                     }
                 )
             )
