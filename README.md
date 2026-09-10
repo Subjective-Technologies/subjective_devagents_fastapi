@@ -67,6 +67,9 @@ production runs.
 
 ## Run
 
+Production recovery, system-unit discovery, backend version checks, and the real
+send deployment gate are documented in [deploy/README.md](deploy/README.md).
+
 ```bash
 ./run_subjective_devagents_fastapi.sh          # from the monorepo root
 ./run.sh                                       # from this repo

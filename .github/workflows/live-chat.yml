@@ -1,0 +1,36 @@
+name: Live chat deployment gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: Comma-separated providers required on this deployment
+        required: true
+        default: claude,codex,cursor,grok
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live-chat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: devagents-live
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'pytest>=8' 'websockets>=12'
+      - name: Verify real CLI replies and WebSocket delivery
+        env:
+          SUBJECTIVE_DEVAGENTS_LIVE_URL: ${{ vars.DEVAGENTS_LIVE_URL }}
+          SUBJECTIVE_DEVAGENTS_LIVE_PROVIDERS: ${{ inputs.providers }}
+          SUBJECTIVE_DEVAGENTS_API_TOKEN: ${{ secrets.DEVAGENTS_API_TOKEN }}
+        run: |
+          test -n "$SUBJECTIVE_DEVAGENTS_LIVE_URL"
+          test -n "$SUBJECTIVE_DEVAGENTS_LIVE_PROVIDERS"
+          python -m pytest tests/test_quick_reply_live.py -q --tb=short

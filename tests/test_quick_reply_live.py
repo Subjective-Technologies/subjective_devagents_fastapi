@@ -1,38 +1,43 @@
-"""Opt-in live end-to-end quick-reply test, one real turn per installed CLI.
+"""Opt-in real HTTP -> CLI -> WebSocket -> persisted transcript deployment gate.
 
-Unlike test_quick_reply.py (which stubs the send), this drives a real agent turn through the
-actual CLI — the only thing that proves clicking Yes truly works for a given provider end to
-end. It is slow, costs a subscription/API turn, and needs each CLI authenticated, so it does
-NOT run in the normal suite.
-
-Enable it against a running service:
-
-    SUBJECTIVE_DEVAGENTS_LIVE_URL=http://127.0.0.1:8787 \
-    SUBJECTIVE_DEVAGENTS_LIVE_PROVIDERS=codex,claude,cursor \
-    [SUBJECTIVE_DEVAGENTS_API_TOKEN=...] \
-    python -m pytest tests/test_quick_reply_live.py -q
-
-Each named provider must report ready first; a provider that is not ready is skipped, not
-failed, so an unbilled grok or a logged-out CLI does not break the run.
+Set SUBJECTIVE_DEVAGENTS_LIVE_URL and SUBJECTIVE_DEVAGENTS_LIVE_PROVIDERS to
+explicitly select the authenticated providers required on this deployment. Selected
+providers fail if unavailable; only an unset URL skips the test. Claude also resumes
+with an image, exercising the variadic --add-dir argument that previously ate prompts.
+Each run creates labelled smoke conversations and uses real provider turns.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import time
+import re
 import urllib.parse
 import urllib.request
+import uuid
 
 import pytest
+import websockets
 
 BASE_URL = os.environ.get("SUBJECTIVE_DEVAGENTS_LIVE_URL", "").rstrip("/")
-PROVIDERS = [p.strip() for p in os.environ.get("SUBJECTIVE_DEVAGENTS_LIVE_PROVIDERS", "codex,claude,cursor").split(",") if p.strip()]
+PROVIDERS = [p.strip() for p in os.environ.get(
+    "SUBJECTIVE_DEVAGENTS_LIVE_PROVIDERS", "codex,claude,cursor,grok"
+).split(",") if p.strip()]
 TOKEN = os.environ.get("SUBJECTIVE_DEVAGENTS_API_TOKEN", "")
+if BASE_URL and not PROVIDERS:
+    raise ValueError("A live deployment gate must select at least one required provider")
+TURN_TIMEOUT = float(os.environ.get("SUBJECTIVE_DEVAGENTS_LIVE_TIMEOUT", "120"))
+# A valid 1x1 PNG; enough to exercise real image materialization and --add-dir.
+IMAGE = {
+    "filename": "smoke.png", "mime_type": "image/png",
+    "content": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=",
+}
+pytestmark = pytest.mark.skipif(
+    not BASE_URL, reason="set SUBJECTIVE_DEVAGENTS_LIVE_URL to run real CLI turns"
+)
 
-pytestmark = pytest.mark.skipif(not BASE_URL, reason="set SUBJECTIVE_DEVAGENTS_LIVE_URL to run the live quick-reply test")
 
-
-def _call(method: str, path: str, body: dict | None = None, timeout: float = 120):
+def _call(method: str, path: str, body: dict | None = None, timeout: float = 30):
     headers = {"Content-Type": "application/json"}
     if TOKEN:
         headers["X-DevAgents-Token"] = TOKEN
@@ -42,31 +47,79 @@ def _call(method: str, path: str, body: dict | None = None, timeout: float = 120
         return json.loads(response.read().decode())
 
 
+def _socket_url():
+    parts = urllib.parse.urlsplit(BASE_URL)
+    return urllib.parse.urlunsplit((
+        "wss" if parts.scheme == "https" else "ws", parts.netloc,
+        parts.path + "/ws", urllib.parse.urlencode({"token": TOKEN}) if TOKEN else "", "",
+    ))
+
+
+async def _turn(socket, target, text, expected, files=None):
+    accepted = await asyncio.to_thread(_call, "POST", "/api/llm/send-message", {
+        "target": target, "text": text, "files": files or [],
+    })
+    assert accepted.get("ok") and accepted.get("pending"), accepted
+    reply = None
+    busy = False
+    while True:
+        event = json.loads(await socket.recv())
+        if event.get("target") != target:
+            continue
+        if event["type"] == "llm-busy":
+            busy = busy or event.get("busy") is True
+            if event.get("busy") is False:
+                break
+        # Cursor also emits a successful-send notice about refreshing its IDE tab.
+        if event["type"] == "system" and re.match(r"^.+ error \([^)]+\):", event.get("text", "")):
+            pytest.fail(f"Agent failed: {event.get('text')}")
+        if event["type"] == "llm-message" and event.get("message", {}).get("role") == "assistant":
+            reply = event["message"]
+    assert busy, "WebSocket never delivered busy=true"
+    assert reply and expected in reply.get("text", ""), f"Missing expected assistant reply: {reply}"
+    saved = await asyncio.to_thread(
+        _call, "GET", "/api/llm/conversation?" + urllib.parse.urlencode({"target": target})
+    )
+    conversation = saved["conversation"]
+    messages = conversation["messages"]
+    assert messages[-1]["role"] == "assistant" and expected in messages[-1]["text"]
+    assert any(m.get("role") == "user" and m.get("text") == text for m in messages)
+    assert conversation.get("sessionId"), "Native CLI session was not persisted"
+    return conversation
+
+
+async def _exercise(provider):
+    status = await asyncio.to_thread(_call, "GET", f"/api/llm/status?provider={provider}")
+    state = status.get("status") or (status.get("result") or {}).get("status")
+    assert state == "ready", f"Required provider {provider} is not ready: {status}"
+    created = await asyncio.to_thread(_call, "POST", "/api/llm/create-conversation", {
+        "provider": provider, "name": f"[smoke] real send {provider}",
+        "workspace": os.environ.get("SUBJECTIVE_DEVAGENTS_LIVE_WORKSPACE", "/tmp"),
+    })
+    assert created.get("ok"), created
+    target = created["conversation"]["target"]
+    sentinel = "SMOKE_" + uuid.uuid4().hex[:12]
+    async with websockets.connect(_socket_url(), open_timeout=15, max_size=8 * 1024 * 1024) as socket:
+        # The server registers the subscriber before sending its initial config.
+        initial = json.loads(await asyncio.wait_for(socket.recv(), timeout=15))
+        assert initial["type"] == "config"
+        first = await asyncio.wait_for(_turn(
+            socket, target,
+            f"Reply with exactly {sentinel}. Remember this marker. Do not use tools or edit files.",
+            sentinel,
+        ), timeout=TURN_TIMEOUT)
+        if provider == "claude":
+            # Do not repeat the marker: the second turn must actually resume context.
+            second = await asyncio.wait_for(_turn(
+                socket, target,
+                "Ignore the attached image. Reply with exactly the marker from my previous message. "
+                "Do not use tools or edit files.",
+                sentinel, [IMAGE],
+            ), timeout=TURN_TIMEOUT)
+            assert second["sessionId"] == first["sessionId"], "Resume changed the native session"
+            assert any(m.get("attachments") for m in second["messages"])
+
+
 @pytest.mark.parametrize("provider", PROVIDERS)
 def test_quick_reply_runs_a_real_turn(provider):
-    status = _call("GET", f"/api/llm/status?provider={provider}", timeout=60)
-    state = status.get("status") or (status.get("result") or {}).get("status")
-    if state != "ready":
-        pytest.skip(f"{provider} is not ready ({state}); cannot run a live turn")
-
-    created = _call("POST", "/api/llm/create-conversation", {"provider": provider, "name": f"live quick-reply {provider}"})
-    target = created["conversation"]["target"]
-
-    # Exactly what the Yes button posts.
-    accepted = _call("POST", "/api/llm/send-message", {"target": target, "text": "Yes, proceed. Reply with the single word OK."})
-    assert accepted["ok"] is True and accepted["pending"] is True
-
-    # The turn runs in the background and lands on the transcript; poll the conversation
-    # until an assistant message appears (or time out).
-    deadline = time.time() + 120
-    reply = None
-    while time.time() < deadline:
-        convo = _call("GET", f"/api/llm/conversation?target={urllib.parse.quote(target)}", timeout=60)
-        messages = (convo.get("conversation") or {}).get("messages") or []
-        reply = next((m for m in reversed(messages) if m.get("role") == "assistant" and m.get("text")), None)
-        if reply:
-            break
-        time.sleep(3)
-
-    assert reply, f"{provider} produced no assistant reply within the timeout"
-
+    asyncio.run(_exercise(provider))

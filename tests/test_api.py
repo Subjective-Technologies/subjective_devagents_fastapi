@@ -49,10 +49,15 @@ def client(tmp_path, monkeypatch):
 
 
 def test_version(client):
+    from subjective_devagents_fastapi.app import resolve_deploy_version
+
     body = client.get("/api/version").json()
     assert body["ok"] is True
     assert body["release"]
     assert body["version"].startswith(body["release"])
+    assert body["backendVersion"] == resolve_deploy_version(SERVICE_ROOT)
+    assert body["backendVersion"] != body["version"]  # fixture UI has no Git checkout
+    assert client.get("/healthz").headers["x-devagents-backend-version"] == body["backendVersion"]
 
 
 def test_root_is_api_index_when_ui_disabled(tmp_path, monkeypatch):

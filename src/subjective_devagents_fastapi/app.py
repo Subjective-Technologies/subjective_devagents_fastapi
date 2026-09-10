@@ -148,6 +148,7 @@ class AppState:
         self.hub: EventHub | None = None
         self.client_root: Path = _client_root()
         self.deploy_version: str = WEB_UI_RELEASE
+        self.backend_version: str = WEB_UI_RELEASE
         self.history_refreshing = False
         self._refresh_lock = asyncio.Lock()
         self.d1_last_sync: dict | None = None
@@ -226,6 +227,8 @@ async def lifespan(application: FastAPI):
     state.hub = EventHub(loop)
     state.client_root = _client_root()
     state.deploy_version = resolve_deploy_version(state.client_root)
+    # The UI can live in a different repository. Its SHA cannot identify this API.
+    state.backend_version = resolve_deploy_version(Path(__file__).resolve().parents[2])
     core = ChatCore(
         root=str(state.client_root),
         log=default_log,
@@ -353,6 +356,7 @@ async def require_api_token(request: Request, call_next):
 async def add_version_and_no_store(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-DevAgents-Version", state.deploy_version)
+    response.headers.setdefault("X-DevAgents-Backend-Version", state.backend_version)
     if request.url.path.startswith("/api/"):
         # Without this a plain reload can serve a stale cached GET
         # /api/llm/conversations (e.g. a chat name from before a rename).
@@ -381,6 +385,7 @@ async def api_version() -> dict:
         "ok": True,
         "release": WEB_UI_RELEASE,
         "version": state.deploy_version,
+        "backendVersion": state.backend_version,
         "servedAt": datetime.now(timezone.utc).isoformat(),
     }
 
