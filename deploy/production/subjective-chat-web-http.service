@@ -1,0 +1,13 @@
+[Unit]
+Description=Subjective DevAgents HTTP socket forwarder
+Requires=subjective-devagents-proxy.service
+After=subjective-devagents-proxy.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8788
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+Restart=on-failure

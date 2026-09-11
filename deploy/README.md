@@ -15,6 +15,12 @@ sandbox enabled; install its dependency rather than disabling enforcement. A
 provider status of `ready` can still be followed by a billing failure on a real
 turn; Grok returned HTTP 402 for exhausted usage balance during this recovery.
 
+## Public web routing
+
+See [production/README.md](production/README.md) for the deployed HTTP-to-TLS
+proxy, UI override, verification, and rollback. The public page must come from
+the same FastAPI process as its API, including matching instance stamps.
+
 ## Inspect before updating
 
 ```bash

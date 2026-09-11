@@ -1,0 +1,18 @@
+[Unit]
+Description=Subjective DevAgents HTTP to verified TLS proxy
+Requires=subjective-devagents-fastapi.service
+After=subjective-devagents-fastapi.service
+
+[Service]
+ExecStart=/usr/sbin/nginx -c /etc/subjective-devagents-proxy/nginx.conf -g "daemon off;"
+ExecReload=/bin/kill -HUP $MAINPID
+DynamicUser=yes
+RuntimeDirectory=subjective-devagents-proxy
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
