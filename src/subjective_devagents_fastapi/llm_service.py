@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -71,6 +73,9 @@ DEFAULT_PROVIDER = "codex"
 # wrapper gets slightly more so the datasource's own timeout reports cleanly first.
 AGENT_TURN_TIMEOUT_SECONDS = 1800
 AGENT_TURN_WRAPPER_TIMEOUT_SECONDS = AGENT_TURN_TIMEOUT_SECONDS + 60
+# How often send_message's heartbeat tells the UI a turn is still alive while the CLI
+# subprocess call blocks. Module-level so tests can shrink it instead of actually waiting.
+HEARTBEAT_INTERVAL_SECONDS = 8.0
 CURSOR_INJECT_POLL_MS = int(os.environ.get("CURSOR_INJECT_POLL_MS") or 2000)
 CURSOR_INJECT_POLL_MAX_MS = int(os.environ.get("CURSOR_INJECT_POLL_MAX_MS") or AGENT_TURN_TIMEOUT_SECONDS * 1000)
 
@@ -951,6 +956,94 @@ class LlmService:
         self._save_state()
         return conversation
 
+    def import_chats_zip(self, data: bytes) -> dict:
+        """Import chats exported from another workstation as a zip of "localchat" JSON
+        files (the same shape SubjectiveLocalchatsDataSource writes) — no agent, sync, or
+        install required on the source machine, just the zip its export folder already
+        contains."""
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile:
+            return {"ok": False, "error": "Not a valid zip file.", "imported": 0, "skipped": 0, "errors": []}
+        existing_targets = {conversation["target"] for conversation in self.local}
+        # Dedup identity is kept in a private key rather than sessionId/sourceFile
+        # themselves, since those get cleared below (see comment) once they've served
+        # their one-time purpose of computing this identity.
+        existing_identities = {
+            conversation["_importIdentity"] for conversation in self.local if conversation.get("_importIdentity")
+        }
+        imported = 0
+        skipped = 0
+        errors: list[str] = []
+        for name in archive.namelist():
+            if name.endswith("/") or not name.lower().endswith(".json"):
+                continue
+            try:
+                payload = json.loads(archive.read(name).decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {exc}")
+                continue
+            conversation = self._normalize_conversation(payload, "local", name)
+            if not conversation or not conversation["messages"]:
+                skipped += 1
+                continue
+            session_id = conversation["sessionId"]
+            source_file = conversation["sourceFile"]
+            identity = f"{conversation['provider']}\0{session_id}\0{source_file}" if (session_id or source_file) else ""
+            if conversation["target"] in existing_targets or (identity and identity in existing_identities):
+                skipped += 1
+                continue
+            # sourceFile/sessionId came from the exporting machine's filesystem and won't
+            # resolve here — clearing them stops reload_conversation from spawning a
+            # live-reload subprocess against a path that can never exist on this host.
+            conversation["sourceFile"] = ""
+            conversation["sessionId"] = ""
+            if identity:
+                conversation["_importIdentity"] = identity
+            conversation["loaded"] = True
+            self.local.insert(0, conversation)
+            existing_targets.add(conversation["target"])
+            if identity:
+                existing_identities.add(identity)
+            imported += 1
+        if imported:
+            self._save_state()
+        self.log("info", "LLM chats imported from zip", {"imported": imported, "skipped": skipped, "errors": len(errors)})
+        return {"ok": True, "imported": imported, "skipped": skipped, "errors": errors}
+
+    def inject_test_assistant_message(self, target: str, text: str) -> dict:
+        """Test-only: append an assistant message without calling a CLI.
+
+        Lets an end-to-end test (Selenium driving the real browser) exercise UI flows that
+        depend on an assistant reply — most importantly the prompt-option buttons — on
+        demand and for free, instead of waiting on a real, non-deterministic agent turn.
+        The route calling this must gate it behind SUBJECTIVE_DEVAGENTS_ENABLE_TEST_ENDPOINTS;
+        this method itself has no gate, since a unit test may want to call it directly.
+        """
+        clean = str(text or "").strip()
+        if not clean:
+            return {"ok": False, "error": "Message is empty."}
+        conversation = next((item for item in self.local if item["target"] == target), None)
+        if not conversation:
+            source = self.find_conversation(target, include_messages=True)
+            if not source:
+                return {"ok": False, "error": "Conversation was not found."}
+            conversation = {
+                **source,
+                "origin": "local",
+                "historyExportPath": source["exportPath"],
+                "messageCount": len(source["messages"]),
+                "messages": list(source["messages"]),
+            }
+            self.local.insert(0, conversation)
+        message = {"role": "assistant", "text": clean, "time": time.time() * 1000}
+        conversation["messages"].append(message)
+        conversation["updatedAt"] = message["time"]
+        conversation["sortAt"] = message["time"]
+        conversation["messageCount"] = len(conversation["messages"])
+        self._save_state()
+        return {"ok": True, "conversation": conversation, "assistantMessage": message}
+
     def find_conversation(self, target: str, include_messages: bool = False) -> dict | None:
         local = next((conversation for conversation in self.local if conversation["target"] == target), None)
         if local:
@@ -1415,21 +1508,45 @@ class LlmService:
                     source["provider"], request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
                 ) or self._run_pipeline(runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS)
 
-            # The Claude CLI refreshes its OAuth token in a shared file, and two claude
-            # invocations near a token's expiry collide: "another Claude Code process is
-            # refreshing it or exited mid-refresh". The CLI itself calls this transient and
-            # says to retry, so do exactly that — a couple of times, with a short pause —
-            # rather than surfacing a spurious failure. Safe to re-run: nothing in the
-            # transcript has been touched based on the result yet.
-            pipeline_response = run_once()
-            for attempt in range(2):
-                if not _is_transient_auth_refresh(self._pipeline_result(pipeline_response)):
-                    break
-                self.log("warn", "Transient OAuth token-refresh collision; retrying", {
-                    "target": target, "provider": source["provider"], "attempt": attempt + 1,
-                })
-                time.sleep(2.0 * (attempt + 1))
+            # A turn can block for a long time inside run_once() with no visible sign of
+            # life — the CLI is a single blocking subprocess call, not a live stream. Until
+            # the CLIs are ported to a streaming output mode, a heartbeat is the honest
+            # signal we can give: it does not know what the agent is doing, only that the
+            # turn is still in flight, so it reaches the same llm-progress/"thinking steps"
+            # UI a real per-tool-call event would, rather than the UI looking frozen.
+            heartbeat_stop = threading.Event()
+
+            def _emit_heartbeat() -> None:
+                elapsed = 0.0
+                while not heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+                    elapsed += HEARTBEAT_INTERVAL_SECONDS
+                    if callable(self.on_progress):
+                        self.on_progress({
+                            "target": target,
+                            "text": f"{provider['label']} is still working… {int(elapsed)}s",
+                        })
+
+            heartbeat_thread = threading.Thread(target=_emit_heartbeat, daemon=True)
+            heartbeat_thread.start()
+            try:
+                # The Claude CLI refreshes its OAuth token in a shared file, and two claude
+                # invocations near a token's expiry collide: "another Claude Code process is
+                # refreshing it or exited mid-refresh". The CLI itself calls this transient
+                # and says to retry in about a minute, so do exactly that rather than
+                # surfacing a spurious failure. Safe to re-run: nothing in the transcript has
+                # been touched based on the result yet.
                 pipeline_response = run_once()
+                for attempt in range(3):
+                    if not _is_transient_auth_refresh(self._pipeline_result(pipeline_response)):
+                        break
+                    self.log("warn", "Transient OAuth token-refresh collision; retrying", {
+                        "target": target, "provider": source["provider"], "attempt": attempt + 1,
+                    })
+                    time.sleep(10.0 * (attempt + 1))
+                    pipeline_response = run_once()
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
             result = self._pipeline_result(pipeline_response)
             if not result.get("success"):
                 # Preserve attachment messages so the screenshot and its failure stay

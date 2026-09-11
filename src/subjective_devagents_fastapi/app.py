@@ -21,12 +21,13 @@ import mimetypes
 import os
 import subprocess
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
@@ -149,6 +150,11 @@ class AppState:
         self.client_root: Path = _client_root()
         self.deploy_version: str = WEB_UI_RELEASE
         self.backend_version: str = WEB_UI_RELEASE
+        # deploy_version is a git SHA and only changes on a commit — this process restarts
+        # far more often than it commits (a plain reload of an uncommitted edit), so it is
+        # the wrong signal for "does an open tab need to reload". A fresh id every startup
+        # catches that case too.
+        self.instance_id: str = str(uuid.uuid4())
         self.history_refreshing = False
         self._refresh_lock = asyncio.Lock()
         self.d1_last_sync: dict | None = None
@@ -229,6 +235,7 @@ async def lifespan(application: FastAPI):
     state.deploy_version = resolve_deploy_version(state.client_root)
     # The UI can live in a different repository. Its SHA cannot identify this API.
     state.backend_version = resolve_deploy_version(Path(__file__).resolve().parents[2])
+    state.instance_id = str(uuid.uuid4())
     core = ChatCore(
         root=str(state.client_root),
         log=default_log,
@@ -386,6 +393,7 @@ async def api_version() -> dict:
         "release": WEB_UI_RELEASE,
         "version": state.deploy_version,
         "backendVersion": state.backend_version,
+        "instanceId": state.instance_id,
         "servedAt": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -525,12 +533,60 @@ async def api_llm_activate_conversation(body: dict = Body(default={})) -> dict:
     if not conversation:
         return {"ok": False, "error": "Conversation was not found."}
     await asyncio.to_thread(instance.llm_service.mark_active, conversation["target"])
-    return instance.activate_llm_irc_channel(conversation)
+    result = instance.activate_llm_irc_channel(conversation)
+    # Authoritative busy state here too, not just on the one-time hydrate fetch: this call
+    # runs on every activation (setActiveTarget calls it unconditionally), so it is what
+    # actually recovers a conversation whose buttons got stuck disabled by a missed
+    # llm-busy:false — e.g. a dropped websocket during a turn — for as long as the tab
+    # stays open, not just the first time that conversation is ever opened.
+    if isinstance(result, dict):
+        result["busy"] = conversation["target"] in instance.llm_service.busy
+    return result
 
 
 @app.post("/api/llm/refresh-history")
 async def api_llm_refresh_history() -> dict:
     return await state.refresh_history("manual")
+
+
+@app.post("/api/llm/import-chats")
+async def api_llm_import_chats(file: UploadFile = File(...)) -> dict:
+    instance = core()
+    try:
+        data = await file.read()
+        result = await asyncio.to_thread(instance.llm_service.import_chats_zip, data)
+        if result.get("imported"):
+            instance.broadcast("llm-history-refreshed", {"count": instance.llm_service.count_conversations()})
+        return result
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "error": str(error)}
+
+
+# Off by default: this lets a caller put words in an assistant's mouth without running a
+# CLI turn, which is exactly what an end-to-end UI test wants and exactly what production
+# must never expose. Set SUBJECTIVE_DEVAGENTS_ENABLE_TEST_ENDPOINTS=1 only on a test
+# deployment, never on the public one.
+TEST_ENDPOINTS_ENABLED = os.environ.get("SUBJECTIVE_DEVAGENTS_ENABLE_TEST_ENDPOINTS") == "1"
+
+
+@app.post("/api/llm/test/inject-assistant-message")
+async def api_llm_test_inject_assistant_message(body: dict = Body(default={})) -> dict:
+    if not TEST_ENDPOINTS_ENABLED:
+        return {"ok": False, "error": "Test endpoints are disabled on this deployment."}
+    instance = core()
+    target = str(body.get("target") or "")
+    text = str(body.get("text") or "")
+    result = await asyncio.to_thread(instance.llm_service.inject_test_assistant_message, target, text)
+    if result.get("ok"):
+        from .prompt_options import annotate_message
+
+        provider = (result.get("conversation") or {}).get("provider") or ""
+        instance.broadcast("llm-message", {
+            "target": target,
+            "message": annotate_message(result["assistantMessage"]),
+            "provider": provider,
+        })
+    return result
 
 
 @app.get("/api/d1/sync")
@@ -918,15 +974,22 @@ def _stamp_html(html: str) -> str:
     stamp_comment = f"<!-- devagents-deploy {state.deploy_version} served={datetime.now(timezone.utc).isoformat()} -->"
     if "DEVAGENTS_DEPLOY_VERSION" in out:
         out = out.replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version)
-    elif "<!doctype html>" in out.lower():
+    if "DEVAGENTS_INSTANCE_ID" in out:
+        out = out.replace("DEVAGENTS_INSTANCE_ID", state.instance_id)
+    if "DEVAGENTS_DEPLOY_VERSION" not in html and "<!doctype html>" in out.lower():
         out = re.sub(r"<!doctype html>", lambda match: f"{match.group(0)}\n{stamp_comment}", out, count=1, flags=re.IGNORECASE)
 
     def stamp_tag(match: "re.Match[str]") -> str:
         attrs = match.group(1)
         if "data-devagents-version=" in attrs:
             attrs = re.sub(r'\sdata-devagents-version="[^"]*"', f' data-devagents-version="{state.deploy_version}"', attrs)
-            return f"<html{attrs}>"
-        return f'<html{attrs} data-devagents-version="{state.deploy_version}">'
+        else:
+            attrs = f'{attrs} data-devagents-version="{state.deploy_version}"'
+        if "data-devagents-instance=" in attrs:
+            attrs = re.sub(r'\sdata-devagents-instance="[^"]*"', f' data-devagents-instance="{state.instance_id}"', attrs)
+        else:
+            attrs = f'{attrs} data-devagents-instance="{state.instance_id}"'
+        return f"<html{attrs}>"
 
     return re.sub(r"<html\b([^>]*)>", stamp_tag, out, count=1, flags=re.IGNORECASE)
 

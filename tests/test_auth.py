@@ -174,3 +174,78 @@ def test_the_token_is_never_stamped_into_the_served_page(guarded):
     """The page is public. A token baked into it would be public too."""
     html = guarded.get("/").text
     assert TOKEN not in html
+
+
+# --- Firebase owner sign-in, alongside the static secret --------------------------------------
+#
+# firebase_auth.verify_firebase_id_token is mocked throughout: it is a verbatim port of the
+# same RS256/JWKS verification already used (and already exercised against the real Firebase
+# project) by subjective_pipeline_fastapi and friends. What is new and actually needs testing
+# here is auth.py's own logic layered on top of it — the owner allowlist, and that a bad or
+# mismatched token cannot substitute for the real operator.
+
+
+def test_a_firebase_token_for_the_owner_is_accepted(guarded, monkeypatch):
+    from subjective_devagents_fastapi import auth, firebase_auth
+
+    monkeypatch.setattr(
+        firebase_auth,
+        "verify_firebase_id_token",
+        lambda token: {"sub": auth.OWNER_UID, "email": auth.OWNER_EMAIL},
+    )
+    response = guarded.get("/api/config", headers={"Authorization": "Bearer not-checked-by-the-mock"})
+    assert response.status_code == 200
+
+
+def test_a_firebase_token_for_a_different_uid_is_refused(guarded, monkeypatch):
+    from subjective_devagents_fastapi import auth, firebase_auth
+
+    monkeypatch.setattr(
+        firebase_auth,
+        "verify_firebase_id_token",
+        lambda token: {"sub": "someone-else-entirely", "email": auth.OWNER_EMAIL},
+    )
+    response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
+    assert response.status_code == 401
+
+
+def test_a_firebase_token_for_a_different_email_is_refused(guarded, monkeypatch):
+    """The uid is the real identity, but checking email too means a Firebase project
+    misconfiguration or an account-linking bug fails closed instead of silently trusting
+    a uid collision."""
+    from subjective_devagents_fastapi import auth, firebase_auth
+
+    monkeypatch.setattr(
+        firebase_auth,
+        "verify_firebase_id_token",
+        lambda token: {"sub": auth.OWNER_UID, "email": "someone-else@example.com"},
+    )
+    response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
+    assert response.status_code == 401
+
+
+def test_a_token_that_does_not_verify_as_firebase_is_refused(guarded, monkeypatch):
+    """A wrong guess at the static secret must not accidentally fall through to the Firebase
+    path and be treated as a signature-verification failure worth investigating — it is just
+    not a JWT, and verify_firebase_id_token's own shape check rejects it fast."""
+    from subjective_devagents_fastapi import firebase_auth
+
+    def _reject(token):
+        raise firebase_auth.FirebaseTokenError("bad_token")
+
+    monkeypatch.setattr(firebase_auth, "verify_firebase_id_token", _reject)
+    response = guarded.get("/api/config", headers={"Authorization": "Bearer garbage-not-a-jwt"})
+    assert response.status_code == 401
+
+
+def test_the_static_secret_still_works_once_firebase_auth_exists(guarded):
+    """Adding the Firebase path must not have displaced the original credential."""
+    assert guarded.get("/api/config", headers={"X-DevAgents-Token": TOKEN}).status_code == 200
+
+
+def test_an_unset_static_token_still_leaves_the_gate_open_even_with_a_bad_firebase_token(open_gate):
+    """Backwards compatibility must hold regardless of what a caller sends: a deployment that
+    has never configured SUBJECTIVE_DEVAGENTS_API_TOKEN stays fully open, exactly as before
+    Firebase auth was added — token_is_valid's "gate disabled" branch returns before the
+    Firebase check ever runs."""
+    assert open_gate.get("/api/config", headers={"Authorization": "Bearer nonsense"}).status_code == 200

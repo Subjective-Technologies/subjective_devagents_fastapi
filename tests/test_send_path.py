@@ -419,9 +419,43 @@ def test_a_persistent_oauth_error_gives_up_and_reports_it(service, monkeypatch):
     conversation = service.create_conversation(provider="claude", name="OAuth give up")
     result = service.send_message(conversation["target"], "try ls")
 
-    assert attempts["n"] == 3, "expected one attempt plus two bounded retries"
+    assert attempts["n"] == 4, "expected one attempt plus three bounded retries"
     assert result["ok"] is False
     assert "refresh OAuth token" in result["error"]
+
+
+def test_a_slow_turn_emits_heartbeat_progress(service, monkeypatch):
+    """A turn is one blocking CLI subprocess call with no live signal of its own — the
+    heartbeat is what keeps the UI's "thinking steps" list (and therefore the busy
+    indicator) from looking frozen on a turn that legitimately takes a while."""
+    from subjective_devagents_fastapi import datasources, llm_service
+
+    monkeypatch.setattr(llm_service, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    def slow(provider, payload, connection=None):
+        time.sleep(0.08)
+        return {"success": True, "response": "done"}
+
+    monkeypatch.setattr(datasources, "run", slow)
+    monkeypatch.setattr(datasources, "supports_chat", lambda klass: True)
+    service._run_pipeline = lambda *a, **k: pytest.fail("should not reach the bundle")  # type: ignore[method-assign]
+
+    events: list[dict] = []
+    service.on_progress = events.append
+
+    conversation = service.create_conversation(provider="claude", name="Heartbeat check")
+    result = service.send_message(conversation["target"], "do something slow")
+
+    assert result["ok"] is True
+    assert events, "expected at least one heartbeat while the turn was in flight"
+    assert all(event["target"] == conversation["target"] for event in events)
+    assert all("still working" in event["text"] for event in events)
+
+    # The heartbeat thread must not keep firing (or crash on a torn-down service) after
+    # the turn already returned.
+    count_after_return = len(events)
+    time.sleep(0.05)
+    assert len(events) == count_after_return
 
 
 def test_an_ordinary_error_is_not_retried(service, monkeypatch):

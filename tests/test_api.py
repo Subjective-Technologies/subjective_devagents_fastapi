@@ -144,6 +144,115 @@ def test_conversation_lifecycle(client):
     assert not client.get("/api/llm/conversations", params={"q": "zzz-no-such-chat"}).json()["conversations"]
 
 
+def test_test_endpoints_are_disabled_by_default(client):
+    result = client.post(
+        "/api/llm/test/inject-assistant-message", json={"target": "llm:codex:local:x", "text": "hi"}
+    ).json()
+    assert result == {"ok": False, "error": "Test endpoints are disabled on this deployment."}
+
+
+def test_injected_assistant_message_carries_prompt_options(client, monkeypatch):
+    from subjective_devagents_fastapi import app as app_module
+
+    monkeypatch.setattr(app_module, "TEST_ENDPOINTS_ENABLED", True)
+
+    created = client.post("/api/llm/create-conversation", json={"provider": "codex", "name": "E2E target"}).json()
+    target = created["conversation"]["target"]
+
+    injected = client.post(
+        "/api/llm/test/inject-assistant-message",
+        json={"target": target, "text": "Should I proceed with this change?"},
+    ).json()
+    assert injected["ok"] is True
+    assert injected["assistantMessage"]["role"] == "assistant"
+
+    fetched = client.get("/api/llm/conversation", params={"target": target}).json()
+    last = fetched["conversation"]["messages"][-1]
+    assert last["text"] == "Should I proceed with this change?"
+    options = last["promptOptions"]["options"]
+    assert [option["id"] for option in options] == ["yes", "no"]
+    assert last["promptOptions"]["allows_other"] is True
+
+
+def test_activate_conversation_reports_authoritative_busy_state(client):
+    """activate-conversation runs on every single conversation open (unconditionally, not
+    gated on first-hydrate like the /api/llm/conversation recovery path) — it is what
+    actually self-heals a conversation whose prompt-option/code-run buttons got stuck
+    disabled by a missed llm-busy:false (e.g. a dropped websocket mid-turn), for as long as
+    the tab stays open, not just the first time that conversation is ever opened."""
+    from subjective_devagents_fastapi.app import core
+
+    created = client.post("/api/llm/create-conversation", json={"provider": "codex", "name": "Busy check"}).json()
+    target = created["conversation"]["target"]
+
+    idle = client.post("/api/llm/activate-conversation", json={"target": target}).json()
+    assert idle["ok"] is True
+    assert idle["busy"] is False
+
+    # Simulate a turn stuck in flight (or, the actual failure mode: a turn that finished
+    # but whose llm-busy:false the client never saw) without needing a real CLI call.
+    core().llm_service.busy.add(target)
+    try:
+        busy = client.post("/api/llm/activate-conversation", json={"target": target}).json()
+        assert busy["ok"] is True
+        assert busy["busy"] is True
+    finally:
+        core().llm_service.busy.discard(target)
+
+    recovered = client.post("/api/llm/activate-conversation", json={"target": target}).json()
+    assert recovered["ok"] is True
+    assert recovered["busy"] is False
+
+
+def test_import_chats_zip(client):
+    import io
+    import zipfile
+
+    chat = {
+        "type": "localchat",
+        "title": "Imported from laptop",
+        "product": "claude",
+        "kind": "chat",
+        "source_file": "/home/other/.claude/projects/x/session-abc.jsonl",
+        "messages": [
+            {"role": "user", "text": "hello from another machine", "timestamp": 1000},
+            {"role": "assistant", "text": "hi there", "timestamp": 2000},
+        ],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("chat-1.json", json.dumps(chat))
+        archive.writestr("not-a-chat.txt", "ignored")
+    buffer.seek(0)
+
+    result = client.post(
+        "/api/llm/import-chats", files={"file": ("chats.zip", buffer.getvalue(), "application/zip")}
+    ).json()
+    assert result == {"ok": True, "imported": 1, "skipped": 0, "errors": []}
+
+    listed = client.get("/api/llm/conversations", params={"q": "imported from laptop"}).json()
+    assert listed["total"] == 1
+    target = listed["conversations"][0]["target"]
+    fetched = client.get("/api/llm/conversation", params={"target": target}).json()
+    assert fetched["ok"] is True
+    assert [m["text"] for m in fetched["conversation"]["messages"]] == ["hello from another machine", "hi there"]
+
+    # Re-importing the same zip is a no-op — deduped by (provider, sessionId, sourceFile).
+    buffer.seek(0)
+    again = client.post(
+        "/api/llm/import-chats", files={"file": ("chats.zip", buffer.getvalue(), "application/zip")}
+    ).json()
+    assert again == {"ok": True, "imported": 0, "skipped": 1, "errors": []}
+
+
+def test_import_chats_rejects_bad_zip(client):
+    result = client.post(
+        "/api/llm/import-chats", files={"file": ("chats.zip", b"not a zip", "application/zip")}
+    ).json()
+    assert result["ok"] is False
+    assert "zip" in result["error"].lower()
+
+
 def test_rename_rejects_empty(client):
     created = client.post("/api/llm/create-conversation", json={"provider": "claude"}).json()["conversation"]
     result = client.post("/api/llm/rename-conversation", json={"target": created["target"], "name": "  "}).json()
@@ -204,8 +313,24 @@ def test_static_index_is_stamped_and_framable(client):
     assert response.status_code == 200
     assert "DEVAGENTS_DEPLOY_VERSION" not in response.text
     assert 'data-devagents-version="' in response.text
+    assert 'data-devagents-instance="' in response.text
     assert "frame-ancestors" in response.headers["content-security-policy"]
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_instance_id_is_stable_within_a_run_and_matches_the_stamped_page(client):
+    """instanceId exists precisely to catch a plain restart with no new commit — the most
+    common case during active development, where the git-SHA-based version string does not
+    change but every already-open tab is still running pre-restart JS."""
+    import re
+
+    first = client.get("/api/version").json()["instanceId"]
+    second = client.get("/api/version").json()["instanceId"]
+    assert first and first == second
+
+    page = client.get("/").text
+    match = re.search(r'data-devagents-instance="([^"]+)"', page)
+    assert match and match.group(1) == first
 
 
 def test_asset_traversal_is_blocked(client):
