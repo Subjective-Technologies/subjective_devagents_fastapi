@@ -77,3 +77,47 @@ FastAPI API endpoint remains on TLS port 8080 throughout.
 Authentication is separate: this routing fix does not enable direct execution or
 change credentials. Owner login and token enforcement still require a browser
 credential flow; dashboard login alone does not protect this API.
+
+## Firebase owner access
+
+Install `95-owner-auth.conf` in
+`/etc/systemd/system/subjective-devagents-fastapi.service.d/95-owner-auth.conf`,
+then reload systemd and restart the backend. Owner mode is also the code default:
+unset static-token configuration no longer opens the API. Static secrets cannot
+bypass owner mode. Direct execution remains disabled.
+
+A valid, unexpired Firebase ID token from `subjectivetechnologies-login` must have
+UID `WO55hP1UlbRziVhokDMJyQoqVyl2` **or** verified email
+`subjectivetechnologies@gmail.com` (case-insensitive). JWT signature, issuer,
+audience, issue/expiry time and authentication time are checked. Authentication
+uses Firebase's public signing keys; it does not mint tokens or need account keys.
+
+The dashboard sends its current Firebase token to its exact DevAgents iframe via
+`postMessage`. The frame validates sender origin/window, then asks FastAPI to
+validate the token before loading chat code. Refresh requests return to the
+dashboard's Firebase SDK. The standalone page also supports Firebase Google and
+email/password sign-in. If Google rejects the standalone hostname because it is
+not in Firebase's authorized-domain list, the page goes to dashboard My Agents;
+a persistent "Continue in dashboard" link is also available. Existing dashboard
+sessions work without adding a new Firebase authorized domain. Google sign-in for
+new sessions still requires the hostname used for that sign-in to be authorized
+in Firebase; no domain settings were changed by this deployment.
+
+REST credentials use `Authorization: Bearer`. Owner WebSockets receive the token
+in their first frame and join the event hub only after verification. Connections
+close at token expiry and the browser reconnects with a refreshed token. HTTP
+query-string credentials are not accepted. `/healthz`, `/api/auth/config`, and
+the static login shell remain public; chat data, action endpoints, documentation,
+and `/api/version` require authentication. CORS wraps authentication so browser
+preflight succeeds and rejected requests remain visible as 401 responses.
+
+Deploy the dashboard relay before enabling the backend gate. Refresh existing
+browser tabs after deployment. Never enable `development` mode on the public
+service; tests explicitly opt into it for credential-free fixtures. `token` mode
+is an explicit compatibility mode for automation requiring a configured static
+secret; it is not the production owner-only policy.
+
+Firebase revocation is not checked through an admin API. Existing ID tokens can
+remain usable until their normal expiration. Logout clears the client session
+and unloads chat data; no refresh token or ID token is copied into application
+localStorage, HTML, or URLs.

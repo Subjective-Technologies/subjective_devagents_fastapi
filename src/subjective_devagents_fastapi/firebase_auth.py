@@ -10,7 +10,7 @@ this only verifies tokens Firebase already signed, it never mints them.
 from __future__ import annotations
 
 import os
-import threading
+import time
 
 import jwt
 from jwt import PyJWKClient, PyJWKClientError
@@ -24,8 +24,7 @@ JWKS_URL = (
 ISSUER = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
 _LEEWAY_SECONDS = 30
 
-_jwk_client = PyJWKClient(JWKS_URL, cache_keys=True, max_cached_keys=16, lifespan=3600)
-_jwk_lock = threading.Lock()
+_jwk_client = PyJWKClient(JWKS_URL, cache_keys=True, max_cached_keys=16, lifespan=3600, timeout=5)
 
 
 class FirebaseTokenError(Exception):
@@ -36,31 +35,35 @@ def _signing_key_for(token: str):
     try:
         return _jwk_client.get_signing_key_from_jwt(token).key
     except PyJWKClientError as exc:
-        # Force a JWKS refresh in case the kid is brand new.
-        with _jwk_lock:
-            _jwk_client.jwk_set_cache.last_updated = 0  # type: ignore[attr-defined]
-            try:
-                return _jwk_client.get_signing_key_from_jwt(token).key
-            except PyJWKClientError as exc2:
-                raise FirebaseTokenError("unknown_kid") from exc2
+        # PyJWKClient already refreshes once for an unknown kid. Do not mutate
+        # private cache state or repeat unbounded network retries.
+        raise FirebaseTokenError("signing_key_unavailable") from exc
 
 
 def verify_firebase_id_token(token: str) -> dict:
     """Verify a Firebase ID token and return its decoded payload."""
-    if not token or token.count(".") != 2:
+    if not token or len(token) > 16384 or token.count(".") != 2:
         raise FirebaseTokenError("bad_token")
     try:
+        header = jwt.get_unverified_header(token)
+        if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str) or not 0 < len(header["kid"]) <= 256:
+            raise FirebaseTokenError("bad_header")
         payload = jwt.decode(
             token,
             _signing_key_for(token),
             algorithms=["RS256"],
             audience=FIREBASE_PROJECT_ID,
             issuer=ISSUER,
-            options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+            options={"require": ["exp", "iat", "iss", "aud", "sub", "auth_time"]},
             leeway=_LEEWAY_SECONDS,
         )
     except FirebaseTokenError:
         raise
     except jwt.PyJWTError as exc:
         raise FirebaseTokenError(str(exc) or "bad_token") from exc
+    if not isinstance(payload["sub"], str) or not 0 < len(payload["sub"]) <= 128:
+        raise FirebaseTokenError("bad_subject")
+    auth_time = payload["auth_time"]
+    if isinstance(auth_time, bool) or not isinstance(auth_time, (int, float)) or not 0 <= auth_time <= time.time() + _LEEWAY_SECONDS:
+        raise FirebaseTokenError("bad_auth_time")
     return payload

@@ -258,10 +258,9 @@ async def lifespan(application: FastAPI):
     # This service can read every conversation, list OS accounts and start an agent turn,
     # and it is reachable from the public internet. Say so on every boot when it is open.
     if not auth.auth_enabled():
-        default_log("error", "API TOKEN NOT SET — every endpoint is open to anonymous callers. "
-                             "Set SUBJECTIVE_DEVAGENTS_API_TOKEN to close it.", {})
+        default_log("error", "Development authentication mode: anonymous API access enabled.", {})
     else:
-        default_log("info", "API token gate enabled", {"protects": list(auth.PROTECTED_PREFIXES)})
+        default_log("info", "API authentication enabled", {"mode": auth.auth_mode(), "protects": list(auth.PROTECTED_PREFIXES)})
 
     default_log("info", "Subjective DevAgents FastAPI starting", {
         "appHome": core.application_home,
@@ -326,20 +325,6 @@ def _web_ui_url() -> str:
     return (os.environ.get("SUBJECTIVE_DEVAGENTS_WEB_URL") or "https://devagents.subjectivetechnologies.com/").rstrip("/") + "/"
 
 
-# The UI may be served from this process or hosted separately; allow both.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in (os.environ.get("SUBJECTIVE_DEVAGENTS_CORS_ORIGINS") or "*").split(",")
-        if origin.strip()
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 @app.middleware("http")
 async def require_api_token(request: Request, call_next):
     """Reject unauthenticated callers before any handler runs.
@@ -349,8 +334,8 @@ async def require_api_token(request: Request, call_next):
     turn. Static UI files stay public: they are an empty shell without the API.
     """
     if auth.path_requires_token(request.url.path):
-        supplied = auth.token_from_request(request.headers, request.query_params)
-        if not auth.token_is_valid(supplied):
+        supplied = auth.token_from_request(request.headers)
+        if not await asyncio.to_thread(auth.token_is_valid, supplied):
             return JSONResponse(
                 status_code=401,
                 content={"ok": False, "error": "Unauthorized."},
@@ -371,6 +356,22 @@ async def add_version_and_no_store(request: Request, call_next):
     return response
 
 
+# CORS must wrap authentication: preflight needs no credential, and 401s need CORS headers.
+# The UI may be served from this process or hosted separately; allow both.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        origin.strip()
+        for origin in (os.environ.get("SUBJECTIVE_DEVAGENTS_CORS_ORIGINS") or "*").split(",")
+        if origin.strip()
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
 def core() -> ChatCore:
     if state.core is None:
         raise RuntimeError("ChatCore is not initialized.")
@@ -383,6 +384,16 @@ def core() -> ChatCore:
 @app.get("/healthz")
 async def healthz() -> dict:
     """Liveness only - deliberately says nothing about conversations, users or the host."""
+    return {"ok": True}
+
+
+@app.get("/api/auth/config")
+async def api_auth_config() -> dict:
+    return {"mode": auth.auth_mode(), "required": auth.auth_enabled()}
+
+
+@app.get("/api/auth/session")
+async def api_auth_session() -> dict:
     return {"ok": True}
 
 
@@ -828,14 +839,30 @@ async def api_exec(body: dict = Body(default={})) -> dict:
 
 @app.websocket("/ws")
 async def websocket_events(socket: WebSocket) -> None:
-    # HTTP middleware never runs for a WebSocket scope, so the gate is repeated here.
-    # A browser cannot set headers on a WebSocket handshake, hence ?token=.
+    # Authenticate before registering with the broadcast hub or sending any data.
+    # Owner browsers send credentials in the first frame, never in logged URLs.
+    accepted = False
+    claims = None
     if auth.auth_enabled():
         supplied = auth.token_from_request(socket.headers, socket.query_params)
-        if not auth.token_is_valid(supplied):
-            await socket.close(code=1008)  # policy violation
+        if auth.auth_mode() in {"owner", "token"} and not supplied:
+            await socket.accept()
+            accepted = True
+            try:
+                message = await asyncio.wait_for(socket.receive_json(), timeout=5)
+                if not isinstance(message, dict) or message.get("type") != "auth":
+                    raise ValueError("Expected authentication")
+                supplied = message.get("token", "")
+            except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
+                await socket.close(code=4401)
+                return
+        claims = await asyncio.to_thread(auth.authenticated_claims, supplied)
+        if claims is None:
+            await socket.close(code=4401 if accepted else 1008)
             return
-    await socket.accept()
+    if not accepted:
+        await socket.accept()
+    expires_at = claims.get("exp") if claims else None
     hub = state.hub
     instance = core()
     queue = hub.register()
@@ -861,8 +888,15 @@ async def websocket_events(socket: WebSocket) -> None:
                     # for ~100s, and when it does mid-turn the client loses the reply and the
                     # llm-busy:false that re-enables the UI. A periodic frame keeps the
                     # connection alive through the proxy so events actually arrive.
-                    event = await asyncio.wait_for(queue.get(), timeout=25)
+                    remaining = expires_at - time.time() if expires_at else 25
+                    if remaining <= 0:
+                        await socket.close(code=4401)
+                        break
+                    event = await asyncio.wait_for(queue.get(), timeout=min(25, remaining))
                 except asyncio.TimeoutError:
+                    if expires_at and time.time() >= expires_at:
+                        await socket.close(code=4401)
+                        break
                     event = {"type": "ping", "t": int(time.time() * 1000)}
                 await socket.send_text(json.dumps(event, default=str))
                 if reader.done():
@@ -906,6 +940,9 @@ def _static_files() -> dict[str, Path]:
         "/": web / "index.html",
         "/index.html": web / "index.html",
         "/webBridge.js": web / "webBridge.js",
+        "/firebaseAuth.js": web / "firebaseAuth.js",
+        "/bootstrap.js": web / "bootstrap.js",
+        "/auth.css": web / "auth.css",
         "/fit-app.js": web / "fit-app.js",
         "/contextMenu.css": web / "contextMenu.css",
         "/layout.css": web / "layout.css",
@@ -952,7 +989,13 @@ def _stamp_api_base(html: str) -> str:
     # while the browser still blocks the call.
     def fix_csp_tag(tag_match: "re.Match[str]") -> str:
         def fix_directive(directive_match: "re.Match[str]") -> str:
-            directive = re.sub(r"\s*https?://[^\s;]+", "", directive_match.group(1)).rstrip()
+            directive = re.sub(
+                r"\s*https?://[^\s;]+",
+                lambda match: match.group(0) if match.group(0).strip() in {
+                    "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com",
+                    "https://www.googleapis.com", "https://subjectivetechnologies-login.firebaseapp.com",
+                } else "", directive_match.group(1),
+            ).rstrip()
             return f"{directive} {base};" if base else f"{directive};"
 
         return re.sub(r"(connect-src[^;\"]*);", fix_directive, tag_match.group(0), count=1)

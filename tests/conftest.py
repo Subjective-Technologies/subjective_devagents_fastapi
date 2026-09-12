@@ -88,3 +88,9 @@ def make_turn(connection: sqlite3.Connection, conversation_id: str, session_id: 
         started_at=overrides.pop("started_at", NOW),
         **overrides,
     )
+
+
+@pytest.fixture(autouse=True)
+def explicit_test_auth_mode(monkeypatch):
+    """Credential-free unit fixtures opt into development mode, never production."""
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_AUTH_MODE", "development")

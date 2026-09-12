@@ -191,28 +191,26 @@ def test_a_firebase_token_for_the_owner_is_accepted(guarded, monkeypatch):
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
-        lambda token: {"sub": auth.OWNER_UID, "email": auth.OWNER_EMAIL},
+        lambda token: {"sub": auth.OWNER_UID, "email": auth.OWNER_EMAIL, "email_verified": True},
     )
     response = guarded.get("/api/config", headers={"Authorization": "Bearer not-checked-by-the-mock"})
     assert response.status_code == 200
 
 
-def test_a_firebase_token_for_a_different_uid_is_refused(guarded, monkeypatch):
+def test_a_firebase_token_for_the_verified_owner_email_is_accepted(guarded, monkeypatch):
     from subjective_devagents_fastapi import auth, firebase_auth
 
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
-        lambda token: {"sub": "someone-else-entirely", "email": auth.OWNER_EMAIL},
+        lambda token: {"sub": "someone-else-entirely", "email": auth.OWNER_EMAIL, "email_verified": True},
     )
     response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
-    assert response.status_code == 401
+    assert response.status_code == 200
 
 
-def test_a_firebase_token_for_a_different_email_is_refused(guarded, monkeypatch):
-    """The uid is the real identity, but checking email too means a Firebase project
-    misconfiguration or an account-linking bug fails closed instead of silently trusting
-    a uid collision."""
+def test_a_firebase_token_for_the_owner_uid_is_accepted_with_a_different_email(guarded, monkeypatch):
+    """The configured UID remains sufficient when the owner changes email."""
     from subjective_devagents_fastapi import auth, firebase_auth
 
     monkeypatch.setattr(
@@ -221,7 +219,7 @@ def test_a_firebase_token_for_a_different_email_is_refused(guarded, monkeypatch)
         lambda token: {"sub": auth.OWNER_UID, "email": "someone-else@example.com"},
     )
     response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
-    assert response.status_code == 401
+    assert response.status_code == 200
 
 
 def test_a_token_that_does_not_verify_as_firebase_is_refused(guarded, monkeypatch):
