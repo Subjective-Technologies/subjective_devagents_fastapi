@@ -282,17 +282,6 @@ class SuSessionManager:
         threading.Thread(target=cleanup, daemon=True).start()
         self._set_status(session, STATUS_DISCONNECTED)
 
-    def _target_home(self, username: str) -> str:
-        try:
-            with open("/etc/passwd", encoding="utf-8") as handle:
-                for line in handle:
-                    fields = line.split(":")
-                    if fields[0] == username and len(fields) > 5 and fields[5]:
-                        return fields[5]
-        except OSError:
-            pass
-        return str(Path("/home") / username)
-
     def _su_spawn_env(self) -> dict:
         # Login `su -` must not inherit this process's HOME/USER/XDG — otherwise
         # cursor-agent writes sandbox-policies into the chat process owner's ~/.cursor
@@ -344,7 +333,11 @@ class SuSessionManager:
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
-            cwd=self._target_home(session.username),
+            # NOT the target user's home: subprocess applies cwd= in the forked child
+            # before exec, so that chdir runs as the server account and dies with EACCES on
+            # any normal drwx------ home. `su -` is a login shell and enters the home
+            # itself, after the uid switch - the only point where it is readable.
+            cwd="/",
             env=self._su_spawn_env(),
             start_new_session=True,
             close_fds=True,
