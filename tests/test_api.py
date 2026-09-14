@@ -453,3 +453,34 @@ def test_stamping_rewrites_the_real_pages_policy_not_its_prose(monkeypatch):
     connect = re.search(r"connect-src[^;\"]*;", policy).group(0)
     assert "http" not in connect, f"same-origin policy still names a host: {connect}"
     assert '<meta name="devagents-api" content="">' in same_origin
+
+
+def test_every_creatable_agent_is_listed_for_the_picker(client):
+    """The new-chat picker hard-coded codex/claude/cursor in two index.html files and
+    drifted: Grok was creatable on the backend but absent from the UI, and Cursor was
+    offered even where its datasource module is missing. The list has to come from the
+    same WRITABLE_PROVIDERS the create call validates against."""
+    from subjective_devagents_fastapi.llm_service import WRITABLE_PROVIDERS
+
+    payload = client.get("/api/llm/providers").json()
+
+    assert payload["ok"] is True
+    listed = {item["key"]: item for item in payload["providers"]}
+    assert set(listed) == set(WRITABLE_PROVIDERS), "picker list drifted from the backend"
+    assert "grok" in listed, "Grok is creatable and must be offered"
+    assert payload["default"] in listed
+    for key, provider in WRITABLE_PROVIDERS.items():
+        assert listed[key]["label"] == provider["label"]
+        assert isinstance(listed[key]["available"], bool)
+
+
+def test_every_listed_agent_can_actually_be_created(client):
+    """A provider offered by the picker must survive create-conversation, so the list can
+    never advertise something the backend rejects."""
+    for item in client.get("/api/llm/providers").json()["providers"]:
+        created = client.post(
+            "/api/llm/create-conversation",
+            json={"provider": item["key"], "name": f"{item['key']} smoke"},
+        ).json()
+        assert created["ok"] is True, (item["key"], created)
+        assert created["conversation"]["provider"] == item["key"]

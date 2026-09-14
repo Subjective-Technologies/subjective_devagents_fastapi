@@ -628,6 +628,37 @@ async def api_llm_reload_conversation(body: dict = Body(default={})) -> dict:
         return {"ok": False, "error": str(error)}
 
 
+@app.get("/api/llm/providers")
+async def api_llm_providers() -> dict:
+    """The agents a new chat can actually be created with.
+
+    The picker used to hard-code its options in two index.html files, which drifted from
+    the backend: Grok was creatable here but absent from the UI, while Cursor was offered
+    despite its datasource module being missing on this host. Serving the list is the only
+    way the two stay in step.
+
+    `available` reports whether the in-process datasource module imports. It is a hint, not
+    a gate — a provider whose module is missing can still run through its exported bundle,
+    so every writable provider is listed either way.
+    """
+    from . import datasources
+    from .llm_service import DEFAULT_PROVIDER, WRITABLE_PROVIDERS
+
+    report = await asyncio.to_thread(datasources.available)
+    return {
+        "ok": True,
+        "default": DEFAULT_PROVIDER,
+        "providers": [
+            {
+                "key": key,
+                "label": provider["label"],
+                "available": bool((report.get(key) or {}).get("loaded")),
+            }
+            for key, provider in WRITABLE_PROVIDERS.items()
+        ],
+    }
+
+
 @app.get("/api/llm/status")
 async def api_llm_status(provider: str = Query(default="codex")) -> dict:
     result = await asyncio.to_thread(core().llm_service.status, provider)
