@@ -810,7 +810,14 @@ class LlmService:
         def last_activity(conversation: dict) -> float:
             return float(conversation.get("sortAt") or conversation.get("updatedAt") or conversation.get("createdAt") or 0)
 
-        return sorted(deduplicated.values(), key=last_activity, reverse=True)
+        # Resolve assigned names before caching/searching, not only when serializing
+        # the response. A history import can share a session with a named local chat.
+        overrides = self._label_override_index()
+        return sorted(
+            (self._with_label_override(item, overrides) for item in deduplicated.values()),
+            key=last_activity,
+            reverse=True,
+        )
 
     # --- listing ---------------------------------------------------------------------
 
@@ -824,9 +831,10 @@ class LlmService:
         if isinstance(limit, int) and limit > 0:
             listed = listed[:limit]
         conversations = []
+        overrides = self._label_override_index()
         for conversation in listed:
             if include_messages:
-                conversations.append(self._with_label_override(self._hydrate_local_conversation(conversation)))
+                conversations.append(self._with_label_override(self._hydrate_local_conversation(conversation), overrides))
                 continue
             conversations.append(
                 self._with_label_override(
@@ -857,15 +865,48 @@ class LlmService:
                         # this conversation right now. Lets the UI recover from a missed
                         # llm-busy:false (a dropped socket) instead of staying wedged.
                         "busy": conversation["target"] in self.busy,
-                    }
+                    },
+                    overrides,
                 )
             )
         return {"conversations": conversations, "total": total}
 
-    def _with_label_override(self, conversation: dict | None) -> dict | None:
+    def _label_override_index(self) -> dict[str, str]:
+        """Assigned name per session identity, covering every alias that carries one.
+
+        Built in a single pass and reused across a whole listing. Resolving each
+        conversation by rescanning the local and history records for a matching identity
+        made listing quadratic in the number of imported chats - 6s for 3k of them, on the
+        same fetch the manifest shortcut above exists to keep under the sidebar's timeout.
+        """
+        index: dict[str, str] = {}
+        # History first, then local: a local alias's name wins where the two disagree.
+        for item in [*self._history_conversations(), *self.local]:
+            override = self.label_overrides.get(item["target"])
+            if override:
+                index[conversation_key(item)] = override
+        for item in self.local:
+            identity = conversation_key(item)
+            if identity in index:
+                continue
+            # Older create-conversation calls stored the assigned name only in local.label,
+            # unlike Rename's separate labelOverrides map. Recover that name for both the
+            # local target and its imported session alias.
+            label = str(item.get("label") or "").strip()
+            if (
+                ":local:" in item["target"]
+                and label
+                and label != f"New {provider_label(item.get('provider'))} chat"
+                and not is_generic_provider_label(label, item.get("provider"))
+            ):
+                index[identity] = label
+        return index
+
+    def _with_label_override(self, conversation: dict | None, index: dict[str, str] | None = None) -> dict | None:
         if not conversation:
             return conversation
-        override = self.label_overrides.get(conversation["target"])
+        overrides = self._label_override_index() if index is None else index
+        override = overrides.get(conversation_key(conversation))
         if not override or override == conversation.get("label"):
             return conversation
         return {**conversation, "label": override}
@@ -881,6 +922,12 @@ class LlmService:
         if local:
             local["label"] = clean
         self.label_overrides[key] = clean
+        conversation = self.find_conversation(key)
+        if conversation:
+            identity = conversation_key(conversation)
+            for alias in [*self.local, *self._history_conversations()]:
+                if conversation_key(alias) == identity:
+                    self.label_overrides[alias["target"]] = clean
         self._save_state()
         self.log("info", "LLM conversation renamed", {"target": key, "label": clean, "local": bool(local)})
         return {"ok": True, "conversation": self.find_conversation(key)}
@@ -915,6 +962,10 @@ class LlmService:
             "local",
         )
         self.local.insert(0, conversation)
+        if str(name or "").strip():
+            # A name assigned at creation is just as authoritative as a later rename.
+            self.label_overrides[conversation["target"]] = str(name).strip()[:200]
+            conversation["label"] = self.label_overrides[conversation["target"]]
         self.mark_active(conversation["target"])
         self._save_state()
         return conversation
@@ -1486,7 +1537,7 @@ class LlmService:
             # "Command blocked; no output". This is a private, single-operator tool where
             # the whole point is the agent doing work, so all three are set to proceed.
             if provider["bundle"] == "claude":
-                request["permission_mode"] = "acceptEdits"
+                request["permission_mode"] = "bypassPermissions"
             elif provider["bundle"] == "codex":
                 request["sandbox_mode"] = "workspace-write"
             elif provider["bundle"] == "cursor":

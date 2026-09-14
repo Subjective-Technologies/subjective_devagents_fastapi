@@ -236,8 +236,10 @@ def test_the_request_carries_what_the_provider_needs(service):
     assert payload["prompt"] == "do the thing"
     assert payload["new_session"] is True, "a fresh chat has no session to resume"
     # Claude takes a permission mode; codex takes a sandbox mode. Sending the wrong one is
-    # silently ignored by the CLI, which is worse than failing.
-    assert payload["permission_mode"] == "acceptEdits"
+    # silently ignored by the CLI, which is worse than failing. The mode is
+    # bypassPermissions, not acceptEdits: the CLI runs headless under -p, so a Bash
+    # approval prompt has nobody to answer it and the whole turn fails closed.
+    assert payload["permission_mode"] == "bypassPermissions"
     assert "sandbox_mode" not in payload
 
 
@@ -351,7 +353,7 @@ def test_each_provider_gets_its_own_auto_approve_flag(service, monkeypatch):
     service._run_pipeline = capture_bundle  # type: ignore[method-assign]
 
     for provider, key, value in [
-        ("claude", "permission_mode", "acceptEdits"),
+        ("claude", "permission_mode", "bypassPermissions"),
         ("codex", "sandbox_mode", "workspace-write"),
         ("cursor", "force_commands", True),
         ("grok", "permission_mode", "bypassPermissions"),
