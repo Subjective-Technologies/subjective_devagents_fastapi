@@ -504,3 +504,40 @@ def test_stop_endpoint_is_safe_on_an_idle_chat(client):
 
 def test_stop_without_a_target_is_rejected(client):
     assert client.post("/api/llm/cancel-message", json={}).json()["ok"] is False
+
+
+def test_a_chat_can_be_created_against_another_users_cli_login(client):
+    """Each agent's credentials live in a home directory, so "Codex" really means "Codex
+    as <someone>". Naming the account at creation lets a chat start against any of them
+    instead of only the service account's, then being switched afterwards."""
+    created = client.post(
+        "/api/llm/create-conversation",
+        json={"provider": "codex", "name": "as someone else", "osUser": "otheruser"},
+    ).json()
+
+    assert created["ok"] is True, created
+    conversation = created["conversation"]
+    assert conversation["osUser"] == "otheruser"
+    assert conversation["sourceUser"] == "otheruser"
+    # send_message reads osUser to route the turn through that user's session.
+    listed = client.get("/api/llm/conversations").json()["conversations"]
+    assert any(item["target"] == conversation["target"] and item["osUser"] == "otheruser" for item in listed)
+
+
+def test_a_chat_for_the_current_user_carries_no_os_user(client):
+    """A set osUser means "route through someone else's su session", so the service
+    account's own chats must leave it empty or every turn would demand a connection."""
+    created = client.post(
+        "/api/llm/create-conversation", json={"provider": "codex", "name": "mine"}
+    ).json()
+
+    assert not created["conversation"]["osUser"]
+
+
+def test_an_invalid_os_user_is_rejected(client):
+    created = client.post(
+        "/api/llm/create-conversation",
+        json={"provider": "codex", "name": "bad", "osUser": "../../etc/passwd"},
+    ).json()
+
+    assert created["ok"] is False

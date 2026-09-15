@@ -513,6 +513,7 @@ async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
             body.get("provider"),
             body.get("name") or "",
             body.get("workspace") or "",
+            body.get("osUser") or "",
         )
         instance.activate_llm_irc_channel(conversation)
         instance.broadcast("llm-conversation", {"conversation": conversation})

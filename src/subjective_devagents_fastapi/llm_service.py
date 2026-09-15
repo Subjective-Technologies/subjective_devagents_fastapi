@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from .cursor_inject import inject_into_cursor_dom
 from .provider_sessions import list_provider_sessions, sessions_for_provider
-from .system_users import current_username
+from .system_users import current_username, is_valid_username
 
 PROVIDER_ICONS = {
     "codex": "../assets/providers/codex.svg",
@@ -948,18 +948,40 @@ class LlmService:
             return self.grok_runtime
         return self.codex_runtime
 
-    def create_conversation(self, provider: Any = None, name: str = "", workspace: str = "") -> dict:
+    def create_conversation(
+        self, provider: Any = None, name: str = "", workspace: str = "", os_user: str = ""
+    ) -> dict:
+        """`os_user` picks whose CLI login answers this chat.
+
+        Each agent's credentials live in a home directory, so "Codex" is really "Codex as
+        <someone>" — and which logins exist differs per user. Naming the account at
+        creation means a chat can be started against any of them, instead of only the
+        service account's and then switched afterwards with "Continue as".
+
+        A turn for another user routes through that user's su session (see send_message),
+        which must be connected before it can run.
+        """
         now = time.time() * 1000
         key = provider_key(provider) if writable_provider(provider) else DEFAULT_PROVIDER
         label = provider_label(key)
+        me = current_username()
+        owner = str(os_user or "").strip() or me
+        if owner != me and not is_valid_username(owner):
+            raise ValueError("Invalid username.")
         conversation = self._normalize_conversation(
             {
                 "target": f"llm:{key}:local:{uuid.uuid4()}",
                 "provider": key,
                 "label": str(name or f"New {label} chat").strip() or f"New {label} chat",
-                "description": f"{label} CLI conversation",
+                "description": (
+                    f"{label} CLI conversation as {owner}" if owner != me
+                    else f"{label} CLI conversation"
+                ),
                 "workspace": str(workspace or self.root).strip() or self.root,
-                "sourceUser": current_username(),
+                "sourceUser": owner,
+                # Only tag a chat with an owner when it is not the service account's own:
+                # send_message treats a set osUser as "route through that user's session".
+                "osUser": owner if owner != me else None,
                 "messages": [],
                 "createdAt": now,
                 "updatedAt": now,
