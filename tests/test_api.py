@@ -541,3 +541,49 @@ def test_an_invalid_os_user_is_rejected(client):
     ).json()
 
     assert created["ok"] is False
+
+
+def test_the_agent_registry_is_served(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("SUBJECTIVE_AGENTS_DIR", str(tmp_path))
+    (tmp_path / "registry.md").write_text(
+        "| Agent ID | Role file | Primary capability |\n|---|---|---|\n"
+        "| `manager_agent` | `roles/manager_agent.md` | orchestration |\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "roles").mkdir()
+    (tmp_path / "roles" / "manager_agent.md").write_text("# manager_agent\n", encoding="utf-8")
+
+    listed = client.get("/api/agents").json()
+
+    assert listed["ok"] is True
+    assert [item["id"] for item in listed["agents"]] == ["manager_agent"]
+
+
+def test_an_agent_can_be_created_and_re_pointed_at_another_model(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("SUBJECTIVE_AGENTS_DIR", str(tmp_path))
+    (tmp_path / "registry.md").write_text(
+        "| Agent ID | Role file | Primary capability |\n|---|---|---|\n"
+        "| `manager_agent` | `roles/manager_agent.md` | orchestration |\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "roles").mkdir()
+    (tmp_path / "roles" / "manager_agent.md").write_text("# manager_agent\n", encoding="utf-8")
+
+    created = client.post(
+        "/api/agents", json={"id": "triage_agent", "capability": "triage", "model": "claude"}
+    ).json()
+    assert created["ok"] is True, created
+
+    changed = client.post("/api/agents/model", json={"id": "triage_agent", "model": "grok"}).json()
+    assert changed["ok"] is True
+
+    listed = {item["id"]: item for item in client.get("/api/agents").json()["agents"]}
+    assert listed["triage_agent"]["model"] == "grok"
+    # Never in the registry table: models are runtime metadata, not identity.
+    assert "grok" not in (tmp_path / "registry.md").read_text(encoding="utf-8")
+
+
+def test_creating_an_agent_with_a_bad_id_is_refused(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("SUBJECTIVE_AGENTS_DIR", str(tmp_path))
+    (tmp_path / "registry.md").write_text("| Agent ID | Role file | Primary capability |\n|---|---|---|\n", encoding="utf-8")
+    assert client.post("/api/agents", json={"id": "../evil", "capability": "x"}).json()["ok"] is False

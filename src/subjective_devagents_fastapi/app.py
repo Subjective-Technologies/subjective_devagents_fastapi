@@ -629,6 +629,49 @@ async def api_llm_reload_conversation(body: dict = Body(default={})) -> dict:
         return {"ok": False, "error": str(error)}
 
 
+@app.get("/api/agents")
+async def api_agents() -> dict:
+    """The agent registry in workflow/agents — one entry per row of registry.md."""
+    from . import agents as agents_module
+
+    return await asyncio.to_thread(agents_module.list_agents)
+
+
+@app.get("/api/agents/role")
+async def api_agent_role(agent: str = Query(default="")) -> dict:
+    from . import agents as agents_module
+
+    return await asyncio.to_thread(agents_module.read_role, agent)
+
+
+@app.post("/api/agents")
+async def api_create_agent(body: dict = Body(default={})) -> dict:
+    """Add an agent: a role file in roles/ and a row in registry.md, or neither."""
+    from . import agents as agents_module
+
+    return await asyncio.to_thread(
+        agents_module.create_agent,
+        str(body.get("id") or ""),
+        str(body.get("capability") or ""),
+        str(body.get("model") or ""),
+        str(body.get("mission") or ""),
+    )
+
+
+@app.post("/api/agents/model")
+async def api_set_agent_model(body: dict = Body(default={})) -> dict:
+    """Re-point an agent at a different CLI.
+
+    Written to the role file's Runtime section, never the registry table: the registry's
+    contract is that models are runtime metadata and not part of agent identity.
+    """
+    from . import agents as agents_module
+
+    return await asyncio.to_thread(
+        agents_module.set_agent_model, str(body.get("id") or ""), str(body.get("model") or "")
+    )
+
+
 @app.post("/api/llm/cancel-message")
 async def api_llm_cancel_message(body: dict = Body(default={})) -> dict:
     """Stop the turn in flight for a conversation.
