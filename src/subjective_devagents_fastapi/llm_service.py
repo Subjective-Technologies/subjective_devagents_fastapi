@@ -509,6 +509,12 @@ class LlmService:
         self.use_datasource_modules = os.environ.get("SUBJECTIVE_DEVAGENTS_USE_BUNDLES") != "1"
         self.log = log or (lambda level, message, details=None: None)
         self.busy: set[str] = set()
+        # Stop: how to abort the turn currently in flight for a target. A turn registers
+        # its canceller while it runs and clears it on the way out; cancel_message() calls
+        # whatever is registered. Keyed by target because turns run concurrently.
+        self._cancellers: dict[str, Callable[[], bool]] = {}
+        self._cancel_lock = threading.Lock()
+        self._cancelled_targets: set[str] = set()
         self._history_refresh_deferred = False
         self._history_cache: list[dict] | None = None
         self._sorted_cache: dict | None = None
@@ -1376,6 +1382,53 @@ class LlmService:
             time.sleep(interval)
         return {"ok": False, "error": "Cursor tab did not produce a reply yet"}
 
+    def _register_canceller(self, target: str, canceller: Callable[[], bool]) -> None:
+        with self._cancel_lock:
+            self._cancellers[target] = canceller
+            already = target in self._cancelled_targets
+        # Stop can land in the window between the request being accepted and the process
+        # existing. Honour it immediately rather than letting the turn run on unstoppable.
+        if already:
+            try:
+                canceller()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _clear_canceller(self, target: str) -> None:
+        with self._cancel_lock:
+            self._cancellers.pop(target, None)
+            self._cancelled_targets.discard(target)
+
+    def was_cancelled(self, target: str) -> bool:
+        with self._cancel_lock:
+            return target in self._cancelled_targets
+
+    def cancel_message(self, target: str) -> dict:
+        """Stop the turn in flight for `target`.
+
+        Latches the request even when no process is running yet, so a Stop pressed while
+        the CLI is still starting is not lost. Idempotent: stopping an idle chat is a
+        no-op, not an error.
+        """
+        key = str(target or "")
+        if not key:
+            return {"ok": False, "error": "Missing conversation target."}
+        with self._cancel_lock:
+            canceller = self._cancellers.get(key)
+            running = key in self.busy
+            if running:
+                self._cancelled_targets.add(key)
+        stopped = False
+        if canceller is not None:
+            try:
+                stopped = bool(canceller())
+            except Exception as error:  # noqa: BLE001
+                self.log("error", "LLM cancel failed", {"target": key, "message": str(error)})
+        self.log("info", "LLM turn cancel requested", {
+            "target": key, "running": running, "signalled": stopped,
+        })
+        return {"ok": True, "target": key, "running": running, "stopped": stopped}
+
     def send_message(self, target: str, text: str, files: list | None = None) -> dict:
         files = files or []
         clean = str(text or "").strip()
@@ -1600,6 +1653,24 @@ class LlmService:
                 heartbeat_thread.join(timeout=1)
             result = self._pipeline_result(pipeline_response)
             if not result.get("success"):
+                # A turn the operator stopped is not a failure. Keep the prompt they sent
+                # — rolling it back would make Stop look like the message was never typed
+                # — and mark it stopped so the UI can say so rather than "Send failed".
+                if result.get("status") == "cancelled" or self.was_cancelled(target):
+                    user_message["stopped"] = True
+                    self._save_state()
+                    self.log("info", "LLM turn stopped by operator", {
+                        "target": target,
+                        "provider": source["provider"],
+                        "ms": int((time.time() - started) * 1000),
+                    })
+                    return {
+                        "ok": False,
+                        "stopped": True,
+                        "status": "cancelled",
+                        "error": "Stopped.",
+                        "userMessage": user_message,
+                    }
                 # Preserve attachment messages so the screenshot and its failure stay
                 # visible after reload; plain failed text keeps legacy rollback behavior.
                 if files:
@@ -1732,7 +1803,20 @@ class LlmService:
                 session_id=str(payload.get("session_id") or ""),
                 timeout=int(timeout_seconds),
             )
-            result = datasources.run(provider, payload, connection)
+            target = str(payload.get("target") or "")
+
+            def hold(instance) -> None:
+                # Only datasources that implement cancel() can be stopped; the rest simply
+                # run to completion, and Stop reports that it signalled nothing.
+                canceller = getattr(instance, "cancel", None)
+                if target and callable(canceller):
+                    self._register_canceller(target, canceller)
+
+            try:
+                result = datasources.run(provider, payload, connection, on_instance=hold)
+            finally:
+                if target:
+                    self._clear_canceller(target)
         except LookupError as error:
             # Not installed for this provider — the bundle path handles it.
             self.log("info", "Datasource module unavailable; using exported bundle", {
@@ -1810,11 +1894,28 @@ class LlmService:
 
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stderr_thread.start()
+        bundle_target = str(payload.get("target") or "") if isinstance(payload, dict) else ""
+
+        def stop_bundle() -> bool:
+            if process.poll() is not None:
+                return False
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            return True
+
+        if bundle_target:
+            self._register_canceller(bundle_target, stop_bundle)
         try:
             stdout, _ = process.communicate(input=json.dumps(payload), timeout=timeout_seconds + 120)
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, _ = process.communicate()
+        finally:
+            if bundle_target:
+                self._clear_canceller(bundle_target)
         stderr_thread.join(timeout=5)
         with stderr_lock:
             stderr = "".join(stderr_chunks)

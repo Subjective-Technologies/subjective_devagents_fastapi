@@ -628,6 +628,23 @@ async def api_llm_reload_conversation(body: dict = Body(default={})) -> dict:
         return {"ok": False, "error": str(error)}
 
 
+@app.post("/api/llm/cancel-message")
+async def api_llm_cancel_message(body: dict = Body(default={})) -> dict:
+    """Stop the turn in flight for a conversation.
+
+    Idempotent and safe on an idle chat: `running` says whether a turn was actually in
+    flight, `stopped` whether a process was signalled. A Stop pressed in the gap before
+    the CLI exists is latched and applied as soon as the process appears.
+    """
+    instance = core()
+    target = str(body.get("target") or "")
+    result = await asyncio.to_thread(instance.llm_service.cancel_message, target)
+    if result.get("ok") and result.get("running"):
+        instance.broadcast("llm-busy", {"target": target, "busy": False})
+        instance.broadcast("system", {"target": target, "text": "Stopped."})
+    return result
+
+
 @app.get("/api/llm/providers")
 async def api_llm_providers() -> dict:
     """The agents a new chat can actually be created with.

@@ -199,15 +199,25 @@ def instantiate(datasource_class: type, connection: dict | None = None):
         return datasource_class(params=settings)
 
 
-def run(provider: str, request: dict, connection: dict | None = None) -> dict:
+def run(
+    provider: str,
+    request: dict,
+    connection: dict | None = None,
+    on_instance: Callable[[Any], None] | None = None,
+) -> dict:
     """Instantiate the datasource and run one request, returning its result dict.
 
     A fresh instance per call keeps this stateless: the datasources hold a session id and a
     lock on the instance, and conversations here are resumed by passing `session_id` in the
     request rather than by keeping a long-lived object per chat.
+
+    `on_instance` is handed the live instance before the (blocking) call, which is the only
+    moment a caller can reach it — that is how Stop gets hold of a turn's cancel().
     """
     datasource_class = load(provider)
     instance = instantiate(datasource_class, connection)
+    if on_instance is not None:
+        on_instance(instance)
     result = instance.run(dict(request or {}))
     if not isinstance(result, dict):
         return {"success": True, "status": "completed", "result": result}

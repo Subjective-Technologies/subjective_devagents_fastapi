@@ -484,3 +484,23 @@ def test_every_listed_agent_can_actually_be_created(client):
         ).json()
         assert created["ok"] is True, (item["key"], created)
         assert created["conversation"]["provider"] == item["key"]
+
+
+def test_stop_endpoint_is_safe_on_an_idle_chat(client):
+    """Stop must be idempotent: pressing it when nothing is running is a no-op, not an
+    error, because the UI cannot know the turn just finished."""
+    created = client.post(
+        "/api/llm/create-conversation", json={"provider": "claude", "name": "idle"}
+    ).json()
+
+    result = client.post(
+        "/api/llm/cancel-message", json={"target": created["conversation"]["target"]}
+    ).json()
+
+    assert result["ok"] is True
+    assert result["running"] is False
+    assert result["stopped"] is False
+
+
+def test_stop_without_a_target_is_rejected(client):
+    assert client.post("/api/llm/cancel-message", json={}).json()["ok"] is False

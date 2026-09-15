@@ -50,7 +50,7 @@ def stub_datasource(service, result, *, record=None):
     """
     from subjective_devagents_fastapi import datasources
 
-    def fake_run(provider, payload, connection=None):
+    def fake_run(provider, payload, connection=None, on_instance=None):
         if record is not None:
             record.append({"provider": provider, "payload": payload, "connection": connection})
         return dict(result)
@@ -322,7 +322,7 @@ def test_a_status_call_still_uses_the_module(service, monkeypatch):
 
     calls: list[str] = []
     monkeypatch.setattr(datasources, "run",
-                        lambda provider, payload, connection=None: calls.append(payload.get("action")) or {"success": True, "status": "ready"})
+                        lambda provider, payload, connection=None, on_instance=None: calls.append(payload.get("action")) or {"success": True, "status": "ready"})
     service._run_pipeline = lambda *a, **k: pytest.fail("status should not spawn a bundle")  # type: ignore[method-assign]
 
     service.status("claude")
@@ -341,7 +341,7 @@ def test_each_provider_gets_its_own_auto_approve_flag(service, monkeypatch):
     # claude runs in-process; codex and cursor route to the bundle (no chat-capable
     # module). The request dict is built the same way for both, so capture at each path
     # rather than assume which one a provider takes.
-    def capture_module(provider, payload, connection=None):
+    def capture_module(provider, payload, connection=None, on_instance=None):
         seen[payload["target"].split(":")[1]] = payload
         return {"success": True, "response": "ok"}
 
@@ -379,7 +379,7 @@ def test_a_transient_oauth_refresh_collision_is_retried(service, monkeypatch):
                   "it or exited mid-refresh. This is usually transient; retry in a minute.")
     attempts = {"n": 0}
 
-    def flaky(provider, payload, connection=None):
+    def flaky(provider, payload, connection=None, on_instance=None):
         attempts["n"] += 1
         if attempts["n"] == 1:
             return {"success": False, "status": "execution_error", "error": real_error}
@@ -409,7 +409,7 @@ def test_a_persistent_oauth_error_gives_up_and_reports_it(service, monkeypatch):
     real_error = "Failed to refresh OAuth token: another Claude Code process is refreshing it"
     attempts = {"n": 0}
 
-    def always_failing(provider, payload, connection=None):
+    def always_failing(provider, payload, connection=None, on_instance=None):
         attempts["n"] += 1
         return {"success": False, "status": "execution_error", "error": real_error}
 
@@ -434,7 +434,7 @@ def test_a_slow_turn_emits_heartbeat_progress(service, monkeypatch):
 
     monkeypatch.setattr(llm_service, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
-    def slow(provider, payload, connection=None):
+    def slow(provider, payload, connection=None, on_instance=None):
         time.sleep(0.08)
         return {"success": True, "response": "done"}
 
@@ -466,7 +466,7 @@ def test_an_ordinary_error_is_not_retried(service, monkeypatch):
 
     attempts = {"n": 0}
 
-    def failing(provider, payload, connection=None):
+    def failing(provider, payload, connection=None, on_instance=None):
         attempts["n"] += 1
         return {"success": False, "status": "execution_error", "error": "command not found: frobnicate"}
 
