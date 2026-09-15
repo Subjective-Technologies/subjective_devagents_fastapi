@@ -1095,6 +1095,13 @@ def _send_file(file_path: Path, is_asset: bool = False) -> Response:
     body = data
     if extension == ".html":
         body = _stamp_html(data.decode("utf-8")).encode("utf-8")
+    elif extension == ".js" and b"DEVAGENTS_DEPLOY_VERSION" in data:
+        # bootstrap.js carries the ?v= tags for the scripts it loads. Those were
+        # hand-maintained constants that had not been bumped since 2026-09-11, so every
+        # renderer change after that reached the origin and was still served from
+        # Cloudflare's edge and from browsers' own caches. Stamping the live deploy
+        # version makes each deploy a new URL, which is the only thing those caches key on.
+        body = data.decode("utf-8").replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version).encode("utf-8")
     headers = {
         # no-store everywhere: index.html, renderer.js and layout.css ship as a matched
         # set; a cached renderer.js against a newer index.html renders nothing.
