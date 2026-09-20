@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -46,6 +47,7 @@ DATASOURCE_MODULES = {
     "cursor": ("subjective_cursor_datasource", "SubjectiveCursorDataSource", "SubjectiveCursorDataSource"),
     "grok": ("subjective_grok_cli_datasource", "SubjectiveGrokCliDataSource", "SubjectiveGrokCliDataSource"),
     "localchats": ("subjective_localchats_datasource", "SubjectiveLocalchatsDataSource", "SubjectiveLocalchatsDataSource"),
+    "ssh": ("subjective_ssh_datasource", "SubjectiveSshDataSource", "SubjectiveSshDataSource"),
 }
 
 # The abstract base every datasource subclasses, plus the config and logger packages they
@@ -236,5 +238,58 @@ def connection_for(provider: str, workspace: str = "", session_id: str = "", tim
         connection["timeout"] = int(timeout)
     if provider and str(provider).lower() == "codex":
         connection.setdefault("sandbox_mode", "workspace-write")
+    if provider and str(provider).lower() == "ssh":
+        connection.update(ssh_connection_from_workspace(workspace))
     connection.update(extra or {})
+    return connection
+
+
+# `[user@]host[:port][:/path]` or `ssh://[user@]host[:port]/path`.
+_SSH_WORKSPACE_RE = re.compile(
+    r"""^
+    (?:(?P<username>[^@/\s]+)@)?
+    (?P<host>\[[0-9A-Fa-f:]+\]|[^@:/\s]+)
+    (?::(?P<port>\d+))?
+    (?::?(?P<path>/\S*))?
+    $""",
+    re.VERBOSE,
+)
+
+
+def ssh_connection_from_workspace(workspace: str) -> dict:
+    """Read an SSH target out of a conversation's workspace string.
+
+    The SSH datasource needs a host and an account, and a conversation has exactly one
+    free-text field that can carry them: its workspace. So an SSH chat's workspace is
+    written `deploy@server.example.com:/srv/app` (or `ssh://deploy@server:2222/srv/app`)
+    and is split here into the datasource's connection fields.
+
+    This reaches only the fields that fit in one line, which means agent
+    authentication — the default, and the only method that stores no secret. Keys,
+    passwords and pinned fingerprints need somewhere to be entered and stored per
+    connection; until that exists they can be supplied through `extra`.
+
+    An unparseable workspace yields `{}` rather than a guess: the datasource then
+    reports `configuration_required` naming what is missing, which is a better failure
+    than connecting somewhere unintended.
+    """
+    text = str(workspace or "").strip()
+    if not text:
+        return {}
+    if text.startswith("ssh://"):
+        text = text[len("ssh://"):]
+    # A plain local path is a workspace for the CLI datasources, not an SSH target.
+    if text.startswith(("/", ".", "~")):
+        return {}
+    match = _SSH_WORKSPACE_RE.match(text)
+    if not match:
+        return {}
+    connection: dict[str, Any] = {"host": match.group("host").strip("[]")}
+    if match.group("username"):
+        connection["username"] = match.group("username")
+    if match.group("port"):
+        connection["port"] = int(match.group("port"))
+    # The datasource's own `working_directory`, not the raw workspace string that
+    # connection_for already put there.
+    connection["working_directory"] = match.group("path") or ""
     return connection

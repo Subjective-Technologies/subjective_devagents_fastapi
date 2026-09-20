@@ -124,9 +124,12 @@ so switching backends does not lose or rewrite anything:
 | `SUBJECTIVE_CHAT_HISTORY_REFRESH_MS` | History rescan interval; `0` disables (default 10 min) |
 | `SUBJECTIVE_CHAT_IRC` | `1` enables the optional IRC bridge (off by default) |
 | `SUBJECTIVE_DEVAGENTS_CORS_ORIGINS` | Comma-separated origins when the UI is hosted separately (default `*`) |
-| `SUBJECTIVE_DEVAGENTS_API_TOKEN` | **Set this.** Shared secret required on `/api/*`, `/ws`, `/docs`, `/openapi.json`. Unset leaves the API open to anonymous internet callers (logged loudly at startup). Seed a browser once with `?token=...` |
+| `SUBJECTIVE_DEVAGENTS_API_TOKEN` | **Set this.** Shared secret required on `/api/*`, `/ws`, `/ws/ssh`, `/docs`, `/openapi.json`. `run.sh` reads it from the monorepo's `.env` when the environment does not already set one. Unset leaves the API open to anonymous internet callers (logged loudly at startup). Seed a browser once with `?token=...` |
 | `SUBJECTIVE_DEVAGENTS_EXEC_ENABLED` | `1` enables `POST /api/exec` (run a shell command on this host). Off by default, and **refused** unless `SUBJECTIVE_DEVAGENTS_API_TOKEN` is also set |
 | `SUBJECTIVE_DEVAGENTS_EXEC_CWD` | Default working directory for `/api/exec` (default: `$HOME`) |
+| `SUBJECTIVE_DEVAGENTS_SSH_TERMINAL_ENABLED` | `1` enables `/ws/ssh` (a live shell on another machine). Off by default, and **refused** unless `SUBJECTIVE_DEVAGENTS_API_TOKEN` is also set |
+| `SUBJECTIVE_DEVAGENTS_SSH_MAX_SESSIONS` | Concurrent `/ws/ssh` sessions allowed (default 8) |
+| `SUBJECTIVE_DEVAGENTS_SSH_IDLE_TIMEOUT` | Seconds an idle `/ws/ssh` session is kept before closing (default 1800) |
 | `SUBJECTIVE_DEVAGENTS_PUBLIC_API` | Origin the served page should call. Empty = same-origin (this process). Unset leaves the checkout's default. Rewrites the page's `devagents-api` meta tag **and** its CSP `connect-src` at serve time |
 | `CURSOR_CDP_PORT` | Cursor's remote-debugging port for DOM injection (default 9222) |
 
@@ -160,8 +163,57 @@ the reply over the WebSocket (`llm-message` / `llm-busy` / `system`). Cloudflare
 reverse proxies close idle HTTP at ~100s with a 524, while agent turns are allowed 30
 minutes, so the answer cannot ride the request that started it.
 
+## SSH terminal (`/ws/ssh`)
+
+A WebSocket that opens a live shell on another machine through
+`subjective_ssh_datasource`. One session per socket; shell state persists across
+commands and output streams back as the remote writes it.
+
+```
+client → {"type":"auth","token":"…"}            (when the socket needs it)
+client → {"type":"open","host":"subjective-agents"}
+server → {"type":"hello"|"opening"|"ready", …}
+client → {"type":"input","command":"ls -la"}
+server → {"type":"output","stream":"stdout","data":"…"}  … then
+server → {"type":"exit","code":0,"cwd":"/tmp"}
+client → {"type":"interrupt"|"close"}
+server → {"type":"closed","code":0} | {"type":"error","error":"…"}
+```
+
+`host` may be a `Host` alias from the service account's `~/.ssh/config`, in which case
+no credential passes through this service at all. Keys and passwords may be supplied
+per session instead; they never appear in argv, logs, the `opening` frame or any
+result. Only the fields in `ssh_terminal.ALLOWED_CONNECTION_KEYS` are taken from the
+browser — notably not `ssh_path`.
+
+`GET /api/ssh/sessions` lists what is open, without credentials.
+
+The console at `/ssh` drives this socket and is the only way to exercise the service
+on its own: the DevAgents client pins the production API origin in a meta tag and a
+CSP and gates itself behind Firebase. Open it with the token already filled in —
+`run.sh` prints this line at startup:
+
+```bash
+xdg-open "http://127.0.0.1:8090/ssh?token=$(grep -m1 '^SUBJECTIVE_DEVAGENTS_API_TOKEN=' /subjective/.env | cut -d= -f2-)"
+```
+
+An owner Firebase ID token also authenticates, in every mode — `authenticated_claims`
+falls through from the static secret to Firebase verification — but it expires in an
+hour and cannot be revoked before it does, so use the static token locally.
+
+The remote shell is closed when the socket closes, including when the browser tab
+disappears: the endpoint's cleanup does no `await` before unregistering and closing,
+because a client disconnect cancels the coroutine and the first `await` in a `finally`
+would raise straight past it.
+
+Not a terminal emulator — no pty, so `top`, `vim` and `sudo` prompts do not work, and
+`interrupt` tears the connection down rather than sending SIGINT to the remote job.
+
 ## Security notes
 
+- `/ws/ssh` is remote code execution on a **third** machine. It is off unless
+  `SUBJECTIVE_DEVAGENTS_SSH_TERMINAL_ENABLED=1`, and refuses to switch on without an
+  API token configured.
 - The listener is **unauthenticated**; owner-only access is enforced upstream in the
   dashboard. Do not expose it publicly.
 - Nothing here ever collects or types an OS password. `su` ptys are driven interactively by

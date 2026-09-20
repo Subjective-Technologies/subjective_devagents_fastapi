@@ -127,7 +127,7 @@ def test_missing_module_names_where_it_looked(monkeypatch, tmp_path):
 
 def test_available_reports_every_provider_without_raising():
     report = datasources.available()
-    assert set(report) == {"codex", "claude", "cursor", "grok", "localchats"}
+    assert set(report) == {"codex", "claude", "cursor", "grok", "localchats", "ssh"}
     for key, entry in report.items():
         assert "found" in entry and "loaded" in entry
         if not entry["loaded"]:
@@ -201,3 +201,55 @@ def test_the_claude_datasource_can_run_a_turn():
     if not report["claude"]["loaded"]:
         pytest.skip("claude submodule is not checked out")
     assert datasources.supports_chat(datasources.load("claude"))
+
+
+# --- the SSH target hidden in a conversation's workspace --------------------------------------
+
+
+def test_ssh_reads_its_target_out_of_the_workspace():
+    """An SSH chat has no connection form yet, so its workspace names the machine."""
+    connection = datasources.connection_for("ssh", workspace="deploy@server.example.com:/srv/app")
+    assert connection["host"] == "server.example.com"
+    assert connection["username"] == "deploy"
+    assert connection["working_directory"] == "/srv/app"
+
+
+def test_an_ssh_url_workspace_carries_a_port():
+    connection = datasources.connection_for("ssh", workspace="ssh://deploy@server:2222/srv/app")
+    assert connection["host"] == "server"
+    assert connection["port"] == 2222
+    assert connection["working_directory"] == "/srv/app"
+
+
+def test_an_ssh_target_without_a_path_leaves_the_directory_to_the_login_shell():
+    connection = datasources.connection_for("ssh", workspace="deploy@server.example.com")
+    assert connection["host"] == "server.example.com"
+    assert connection["working_directory"] == ""
+
+
+def test_a_local_path_is_not_read_as_an_ssh_host():
+    """A workspace that is just a directory must not be turned into a hostname."""
+    assert datasources.ssh_connection_from_workspace("/srv/app") == {}
+    assert datasources.ssh_connection_from_workspace("~/work") == {}
+
+
+def test_an_unparseable_ssh_workspace_yields_no_host_rather_than_a_guess():
+    """Better to report configuration_required than to connect somewhere unintended."""
+    assert datasources.ssh_connection_from_workspace("not a host name") == {}
+
+
+def test_other_providers_keep_the_workspace_as_a_plain_directory():
+    connection = datasources.connection_for("claude", workspace="deploy@server:/srv/app")
+    assert "host" not in connection
+    assert connection["working_directory"] == "deploy@server:/srv/app"
+
+
+def test_the_ssh_datasource_is_registered():
+    assert "ssh" in datasources.DATASOURCE_MODULES
+
+
+def test_the_ssh_datasource_can_run_a_turn():
+    report = datasources.available()
+    if not report["ssh"]["loaded"]:
+        pytest.skip("ssh plugin is not checked out")
+    assert datasources.supports_chat(datasources.load("ssh"))

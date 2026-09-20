@@ -31,9 +31,10 @@ PROVIDER_ALIASES = {
     "google": "gemini",
     "grok": "grok",
     "xai": "grok",
+    "ssh": "ssh",
 }
 
-KNOWN_PROVIDERS = {"codex", "claude", "cursor", "anthropic", "openai", "gemini", "grok"}
+KNOWN_PROVIDERS = {"codex", "claude", "cursor", "anthropic", "openai", "gemini", "grok", "ssh"}
 ALLOWED_ROLES = {"user", "assistant", "system", "tool", "tool_output"}
 
 

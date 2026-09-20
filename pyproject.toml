@@ -28,3 +28,8 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The standalone /ssh console is read from disk at request time, so it has to
+# survive an install, not just a source checkout.
+[tool.setuptools.package-data]
+"subjective_devagents_fastapi" = ["static/*.html", "static/*.js", "static/*.css", "static/*.LICENSE"]

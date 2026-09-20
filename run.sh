@@ -69,11 +69,42 @@ elif ! "${py}" -c "import uvicorn, fastapi" 2>/dev/null; then
   "${py}" -m pip install -q -e "${SCRIPT_DIR}" "requests>=2.25.1"
 fi
 
+# Secrets live in the monorepo's .env, never in this script or in a unit file. Read
+# only the keys this service needs, and only when the environment has not already set
+# them, so an explicit override or a systemd unit still wins.
+env_file="${SUBJECTIVE_ENV_FILE:-}"
+if [ -z "${env_file}" ]; then
+  for candidate in "${SCRIPT_DIR}/../../.env" "/subjective/.env"; do
+    if [ -f "${candidate}" ]; then env_file="${candidate}"; break; fi
+  done
+fi
+if [ -n "${env_file:-}" ] && [ -f "${env_file}" ]; then
+  for key in SUBJECTIVE_DEVAGENTS_API_TOKEN; do
+    if [ -z "$(eval "printf '%s' \"\${${key}:-}\"")" ]; then
+      # `cut -d= -f2-` keeps a value that itself contains '='.
+      value="$(grep -m1 "^${key}=" "${env_file}" | cut -d= -f2-)"
+      if [ -n "${value}" ]; then export "${key}=${value}"; fi
+    fi
+  done
+  unset value
+fi
+
+if [ -z "${SUBJECTIVE_DEVAGENTS_API_TOKEN:-}" ]; then
+  echo "### no SUBJECTIVE_DEVAGENTS_API_TOKEN — the API is open and the SSH terminal will refuse to start" >&2
+fi
+
 export SUBJECTIVE_CHAT_WEB_HOST="${HOST}"
 export SUBJECTIVE_CHAT_WEB_PORT="${PORT}"
 export SUBJECTIVE_CHAT_PYTHON="${SUBJECTIVE_CHAT_PYTHON:-${py}}"
 
 echo "### DevAgents FastAPI (datasources) on http://${HOST}:${PORT}/"
+if [ "${SUBJECTIVE_DEVAGENTS_SSH_TERMINAL_ENABLED:-}" = "1" ]; then
+  echo "### ssh console: http://${HOST}:${PORT}/ssh"
+  # The command, never the token itself: this script's output is routinely
+  # redirected to a log file, and the secret must not end up in one.
+  echo "### open it with the token already filled in:"
+  echo "###   xdg-open \"http://${HOST}:${PORT}/ssh?token=\$(grep -m1 '^SUBJECTIVE_DEVAGENTS_API_TOKEN=' ${env_file:-.env} | cut -d= -f2-)\""
+fi
 echo "### plugins=${SCRIPT_DIR}/plugins"
 if [ -n "${SUBJECTIVE_DEVAGENTS_CLIENT_ROOT:-}" ]; then
   echo "### client=${SUBJECTIVE_DEVAGENTS_CLIENT_ROOT}"

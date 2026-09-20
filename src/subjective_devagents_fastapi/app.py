@@ -20,6 +20,7 @@ import json
 import mimetypes
 import os
 import subprocess
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -31,14 +32,14 @@ from fastapi import Body, FastAPI, File, Query, Request, UploadFile, WebSocket, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from . import auth, shell_exec
+from . import auth, shell_exec, ssh_terminal
 from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
 
 # Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
 # with the live git SHA so View Source proves which build the browser loaded.
-WEB_UI_RELEASE = "20260906k"
+WEB_UI_RELEASE = "20260920a"
 
 MAX_BODY_BYTES = 32 * 1024 * 1024  # room for a handful of base64 image/file attachments
 
@@ -929,10 +930,14 @@ async def api_exec(body: dict = Body(default={})) -> dict:
 # --- WebSocket -------------------------------------------------------------------------
 
 
-@app.websocket("/ws")
-async def websocket_events(socket: WebSocket) -> None:
-    # Authenticate before registering with the broadcast hub or sending any data.
-    # Owner browsers send credentials in the first frame, never in logged URLs.
+async def _authenticate_socket(socket: WebSocket) -> tuple[bool, dict | None]:
+    """Accept and authenticate a socket, or close it and report failure.
+
+    Returns `(ok, claims)`. Owner browsers send credentials in the first frame rather
+    than the query string, because URLs are logged and a token in one outlives the
+    request. Shared by every socket this service exposes so a new one cannot quietly
+    ship with weaker authentication than /ws.
+    """
     accepted = False
     claims = None
     if auth.auth_enabled():
@@ -947,13 +952,22 @@ async def websocket_events(socket: WebSocket) -> None:
                 supplied = message.get("token", "")
             except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
                 await socket.close(code=4401)
-                return
+                return False, None
         claims = await asyncio.to_thread(auth.authenticated_claims, supplied)
         if claims is None:
             await socket.close(code=4401 if accepted else 1008)
-            return
+            return False, None
     if not accepted:
         await socket.accept()
+    return True, claims
+
+
+@app.websocket("/ws")
+async def websocket_events(socket: WebSocket) -> None:
+    # Authenticate before registering with the broadcast hub or sending any data.
+    ok, claims = await _authenticate_socket(socket)
+    if not ok:
+        return
     expires_at = claims.get("exp") if claims else None
     hub = state.hub
     instance = core()
@@ -1000,6 +1014,298 @@ async def websocket_events(socket: WebSocket) -> None:
     finally:
         hub.unregister(queue)
         default_log("info", "WebSocket client disconnected", {"clients": len(hub.queues)})
+
+
+@app.websocket("/ws/ssh")
+async def websocket_ssh_terminal(socket: WebSocket) -> None:
+    """A live shell on another machine, for the duration of this socket.
+
+    Protocol, client to server:
+      {"type": "auth",      "token": "..."}          (only when the socket needs it)
+      {"type": "open",      "host": "...", ...}      connection fields; host required
+                            "pty": true, "cols": 120, "rows": 32   for terminal mode
+      {"type": "input",     "command": "ls -la"}     one command (both modes)
+      {"type": "data",      "data": "ls\r"}          raw keystrokes    (pty mode only)
+      {"type": "resize",    "cols": 120, "rows": 32}                   (pty mode only)
+      {"type": "interrupt"}
+      {"type": "close"}
+
+    Server to client:
+      {"type": "hello",   "maxSessions": n, "idleTimeout": n}
+      {"type": "opening", "connection": {...}}       secrets never appear here
+      {"type": "ready",   "sessionId": "...", "mode": "command"|"pty", ...}
+      {"type": "closed",  "code": 0}                 the remote shell is gone
+      {"type": "error",   "error": "..."}
+    command mode adds:
+      {"type": "output",  "stream": "stdout"|"stderr", "data": "..."}
+      {"type": "exit",    "code": 0, "cwd": "..."}   one per command
+    pty mode adds:
+      {"type": "data",    "data": "..."}             raw terminal output
+
+    **The two modes are different products, not a flag.** Command mode frames each
+    command, so a UI or an agent gets exit codes, a working directory and separated
+    streams. A terminal has no machine-readable command boundary — the shell's prompt
+    is cosmetic and a sentinel would be echoed back to the user — so pty mode gives
+    up all of that, and in return `claude` and `codex` with no arguments, `top`, `vim`
+    and `sudo` prompts work, and Ctrl-C reaches the remote job instead of dropping
+    the connection.
+
+    One session per socket: a terminal is a connection, and multiplexing several onto
+    one socket would only move the bookkeeping into the client.
+    """
+    ok, claims = await _authenticate_socket(socket)
+    if not ok:
+        return
+
+    loop = asyncio.get_running_loop()
+    events: asyncio.Queue = asyncio.Queue()
+    session = None
+    session_id = ""
+    expires_at = claims.get("exp") if claims else None
+
+    async def say(payload: dict) -> None:
+        await socket.send_text(json.dumps(payload, default=str))
+
+    try:
+        ssh_terminal.ensure_available()
+    except ssh_terminal.TerminalDisabled as error:
+        await say({"type": "error", "error": str(error)})
+        await socket.close(code=4403)
+        return
+
+    try:
+        await say({
+            "type": "hello",
+            "maxSessions": ssh_terminal.max_sessions(),
+            "idleTimeout": ssh_terminal.idle_timeout_seconds(),
+        })
+
+        while True:
+            # The socket may carry an auth frame first; keep reading until `open`.
+            message = await socket.receive_json()
+            if isinstance(message, dict) and message.get("type") == "open":
+                break
+            if isinstance(message, dict) and message.get("type") in {"auth", "ping"}:
+                continue
+            await say({"type": "error", "error": "Open a session before sending anything else."})
+
+        try:
+            connection = ssh_terminal.connection_from_request(message)
+        except ValueError as error:
+            await say({"type": "error", "error": str(error)})
+            await socket.close(code=4400)
+            return
+
+        use_pty = bool(message.get("pty"))
+        cols, rows = ssh_terminal.clamp_size(message.get("cols"), message.get("rows"))
+        described = ssh_terminal.describe(connection)
+        await say({"type": "opening", "connection": described, "mode": "pty" if use_pty else "command"})
+        default_log("info", "SSH terminal opening", {**described, "pty": use_pty})
+
+        # Every event the shell produces is pushed onto an asyncio queue from the
+        # reader threads, so the socket never polls and output reaches the browser as
+        # soon as the remote writes it.
+        def forward(event: dict) -> None:
+            loop.call_soon_threadsafe(events.put_nowait, event)
+
+        try:
+            instance, session = await asyncio.to_thread(
+                lambda: ssh_terminal.open_session(connection, pty=use_pty, cols=cols, rows=rows)
+            )
+        except (LookupError, ValueError) as error:
+            await say({"type": "error", "error": str(error)})
+            await socket.close(code=4400)
+            return
+
+        started = await asyncio.to_thread(session.start)
+        if started.get("type") != "ready":
+            await say({"type": "error", "error": started.get("error") or "Could not open the session."})
+            await asyncio.to_thread(session.close)
+            default_log("error", "SSH terminal failed to open", {
+                **described, "error": started.get("error") or "",
+            })
+            return
+
+        session_id = uuid.uuid4().hex
+        try:
+            ssh_terminal.sessions.register(session_id, session, connection)
+        except ssh_terminal.TerminalBusy as error:
+            await say({"type": "error", "error": str(error)})
+            await asyncio.to_thread(session.close)
+            await socket.close(code=4429)
+            return
+
+        session.attach(forward)
+        await say({
+            "type": "ready",
+            "sessionId": session_id,
+            "mode": "pty" if use_pty else "command",
+            "cwd": started.get("cwd") or "",
+            "cols": started.get("cols"),
+            "rows": started.get("rows"),
+            "term": started.get("term"),
+        })
+        default_log("info", "SSH terminal ready", {
+            **described, "sessionId": session_id, "pty": use_pty,
+        })
+
+        async def pump_events() -> None:
+            while True:
+                event = await events.get()
+                await say(event)
+                if event.get("type") == "closed":
+                    return
+
+        async def pump_input() -> None:
+            while True:
+                frame = await socket.receive_json()
+                if not isinstance(frame, dict):
+                    continue
+                kind = frame.get("type")
+                ssh_terminal.sessions.touch(session_id)
+                if kind == "input":
+                    command = str(frame.get("command") or "")
+                    if len(command.encode("utf-8", "replace")) > ssh_terminal.MAX_COMMAND_BYTES:
+                        await say({"type": "error", "error": "That command is too long."})
+                        continue
+                    # In pty mode there is no command concept — a line is keystrokes
+                    # plus Return, which is what a terminal's own input would be.
+                    ok = await (
+                        asyncio.to_thread(session.write, command + "\r")
+                        if use_pty
+                        else asyncio.to_thread(session.send_command, command)
+                    )
+                    if not ok:
+                        await say({"type": "error", "error": "The remote shell is no longer accepting input."})
+                        return
+                elif kind == "data":
+                    if not use_pty:
+                        await say({"type": "error", "error": "Raw input needs a pty session."})
+                        continue
+                    data = str(frame.get("data") or "")
+                    if len(data.encode("utf-8", "replace")) > ssh_terminal.MAX_INPUT_BYTES:
+                        await say({"type": "error", "error": "That input is too large."})
+                        continue
+                    if not await asyncio.to_thread(session.write, data):
+                        await say({"type": "error", "error": "The terminal is no longer accepting input."})
+                        return
+                elif kind == "resize":
+                    if not use_pty:
+                        continue
+                    width, height = ssh_terminal.clamp_size(frame.get("cols"), frame.get("rows"))
+                    await asyncio.to_thread(session.resize, width, height)
+                elif kind == "interrupt":
+                    await asyncio.to_thread(session.interrupt)
+                elif kind == "close":
+                    return
+                elif kind == "ping":
+                    await say({"type": "pong", "t": int(time.time() * 1000)})
+
+        async def watch_deadlines() -> None:
+            while True:
+                await asyncio.sleep(15)
+                if expires_at and time.time() >= expires_at:
+                    await say({"type": "error", "error": "The session credential expired."})
+                    return
+                if ssh_terminal.sessions.idle_seconds(session_id) > ssh_terminal.idle_timeout_seconds():
+                    await say({"type": "error", "error": "Closed after being idle."})
+                    return
+
+        tasks = [
+            asyncio.create_task(pump_events()),
+            asyncio.create_task(pump_input()),
+            asyncio.create_task(watch_deadlines()),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        # Nothing here may `await` before the session is dealt with. A client
+        # disconnect cancels this coroutine, and the first await in a finally then
+        # raises CancelledError immediately — which would leave a registered session
+        # and a live SSH connection behind for every closed tab.
+        if session_id:
+            ssh_terminal.sessions.unregister(session_id)
+            default_log("info", "SSH terminal closed", {"sessionId": session_id})
+        if session is not None:
+            # Closing waits for ssh to exit, so it runs on a thread that outlives
+            # this task rather than blocking the event loop.
+            threading.Thread(target=session.close, daemon=True).start()
+        try:
+            await socket.close()
+        except RuntimeError:
+            pass
+
+
+@app.get("/ssh")
+async def ssh_terminal_page() -> Response:
+    """A standalone console for /ws/ssh, for driving this service on its own.
+
+    The DevAgents client cannot do it: its page pins the production API origin in a
+    meta tag and a CSP and gates itself behind Firebase, so it will not talk to a
+    local backend. This page is same-origin with the socket and has no dependencies.
+
+    Served only while the terminal is enabled, so it cannot turn up on a deployment
+    that has the feature switched off.
+    """
+    if not ssh_terminal.terminal_enabled():
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "The SSH terminal is disabled. Set "
+                         "SUBJECTIVE_DEVAGENTS_SSH_TERMINAL_ENABLED=1 to enable it.",
+            },
+            status_code=404,
+        )
+    page = Path(__file__).parent / "static" / "ssh_terminal.html"
+    return Response(
+        content=page.read_text(encoding="utf-8"),
+        media_type="text/html; charset=utf-8",
+        # A console for opening shells is never worth serving from a cache.
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# Only these, by exact name: the directory holds a page and a vendored terminal
+# emulator, and a path parameter here would be a file-read primitive.
+_SSH_ASSETS = {
+    "xterm.js": "text/javascript; charset=utf-8",
+    "xterm.css": "text/css; charset=utf-8",
+    "xterm.LICENSE": "text/plain; charset=utf-8",
+}
+
+
+@app.get("/ssh/assets/{name}")
+async def ssh_terminal_asset(name: str) -> Response:
+    """xterm.js and its stylesheet, for the console's terminal mode.
+
+    Vendored into this service rather than loaded from a CDN: the page must work on a
+    machine with no internet, and a terminal is not something to hand to a third
+    party's script host.
+    """
+    media_type = _SSH_ASSETS.get(name)
+    if not media_type or not ssh_terminal.terminal_enabled():
+        return JSONResponse({"ok": False, "error": "Not found."}, status_code=404)
+    asset = Path(__file__).parent / "static" / name
+    return Response(
+        content=asset.read_bytes(),
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/api/ssh/sessions")
+async def api_ssh_sessions(request: Request) -> Response:
+    """What SSH terminals are open right now. Never includes credentials."""
+    return JSONResponse({
+        "enabled": ssh_terminal.terminal_enabled(),
+        "maxSessions": ssh_terminal.max_sessions(),
+        "sessions": ssh_terminal.sessions.snapshot(),
+    })
 
 
 @app.get("/")

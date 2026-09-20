@@ -1,0 +1,379 @@
+<!doctype html>
+<!--
+  Standalone console for /ws/ssh, served by this service and nothing else.
+
+  The DevAgents client is not usable for this: its page hard-codes the production API
+  origin in a meta tag and a CSP, and gates itself behind Firebase, so it cannot drive
+  a local backend. This page is same-origin with the socket, needs no sign-in, and
+  loads nothing from the internet — which is what makes it possible to exercise the
+  FastAPI service on its own.
+
+  Two modes, because the socket offers two and they are genuinely different:
+
+  - command: one command per submit, with exit codes, a tracked working directory and
+    stdout/stderr kept apart. Rendered as text.
+  - terminal (pty): a real tty on the far side, so `claude`, `codex`, `top`, `vim` and
+    `sudo` prompts work and Ctrl-C reaches the remote job. No framing at all, so it is
+    rendered by xterm.js, which this service vendors.
+
+  Served only while SUBJECTIVE_DEVAGENTS_SSH_TERMINAL_ENABLED=1.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSH terminal — DevAgents</title>
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none';">
+<link rel="stylesheet" href="/ssh/assets/xterm.css">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #12151c; --panel: #1a1f29; --line: #2b3444; --text: #d7dee9;
+    --muted: #8fa3bf; --accent: #63c088; --error: #f2635f; --warn: #f6c25c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0 8px 0 0; }
+  input, button, select {
+    font: inherit; color: var(--text); background: #0e1117;
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px;
+  }
+  input:focus, button:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { background: #222b3a; cursor: pointer; }
+  button:hover:not(:disabled) { background: #2c3849; }
+  button:disabled { opacity: .45; cursor: default; }
+  #host { min-width: 200px; flex: 1 1 200px; }
+  #token { min-width: 140px; flex: 0 1 190px; }
+  #state { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  #state.on { color: var(--accent); }
+  #state.off { color: var(--error); }
+  main { flex: 1; min-height: 0; position: relative; }
+  #log {
+    position: absolute; inset: 0; overflow-y: auto; padding: 12px 16px; margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px; white-space: pre-wrap; word-break: break-word;
+  }
+  #term { position: absolute; inset: 0; padding: 6px 8px; }
+  .cmd { color: var(--accent); margin-top: 10px; }
+  .err { color: var(--error); }
+  .note { color: var(--muted); font-style: italic; }
+  .code-bad { color: var(--warn); }
+  footer {
+    display: flex; gap: 8px; padding: 10px 16px;
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  #cmd { flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  [hidden] { display: none !important; }
+  @media (max-width: 620px) { #token { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>SSH</h1>
+  <input id="host" placeholder="host or ~/.ssh/config alias" autocomplete="off" spellcheck="false">
+  <select id="mode" title="command: exit codes and separated streams. terminal: a real tty.">
+    <option value="command">command mode</option>
+    <option value="pty">terminal (pty)</option>
+  </select>
+  <input id="token" type="password" placeholder="API token" autocomplete="off">
+  <button id="connect">Connect</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <span id="state" class="off">idle</span>
+</header>
+
+<main>
+  <div id="log"></div>
+  <div id="term" hidden></div>
+</main>
+
+<footer id="bar">
+  <input id="cmd" placeholder="command — Enter to run, ↑/↓ for history" autocomplete="off" spellcheck="false" disabled>
+  <button id="send" disabled>Run</button>
+  <button id="stop" disabled>Interrupt</button>
+</footer>
+
+<script src="/ssh/assets/xterm.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const log = $('log'), termBox = $('term'), hostBox = $('host'), tokenBox = $('token');
+  const cmdBox = $('cmd'), modeBox = $('mode'), state = $('state'), bar = $('bar');
+  const params = new URLSearchParams(location.search);
+
+  // A token in the URL is convenient for a local test and terrible everywhere else:
+  // it lands in history and in any access log. So it is read once, stripped from the
+  // address bar, and kept in sessionStorage — which survives a reload but dies with
+  // the tab, and never reaches a URL, a log or another tab. Memory alone was worse:
+  // every refresh silently emptied the box and the socket answered 4401.
+  const TOKEN_KEY = 'devagents.ssh.token';
+  const remember = (value) => { try { sessionStorage.setItem(TOKEN_KEY, value); } catch {} };
+  const recall = () => { try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; } };
+  const forget = () => { try { sessionStorage.removeItem(TOKEN_KEY); } catch {} };
+
+  hostBox.value = params.get('host') || '';
+  tokenBox.value = params.get('token') || recall();
+  if (params.get('mode') === 'pty') modeBox.value = 'pty';
+  if (params.has('token')) {
+    remember(tokenBox.value);
+    params.delete('token');
+    const rest = params.toString();
+    history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
+  }
+
+  let socket = null, term = null, pty = false, running = false;
+  const history_ = [];
+  let historyAt = 0;
+
+  // --- text log (command mode) ---------------------------------------------------
+
+  function write(text, className) {
+    const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    const node = document.createElement('span');
+    if (className) node.className = className;
+    node.textContent = text;
+    log.appendChild(node);
+    if (stick) log.scrollTop = log.scrollHeight;
+  }
+
+  function setState(text, on) {
+    state.textContent = text;
+    state.className = on === true ? 'on' : on === false ? 'off' : '';
+  }
+
+  // --- terminal (pty mode) -------------------------------------------------------
+
+  function fitTerminal() {
+    if (!term) return;
+    // xterm's fit addon is not vendored, and the arithmetic is two lines: measure one
+    // cell from the renderer and divide the box by it.
+    const dims = term._core?._renderService?.dimensions?.css?.cell;
+    if (!dims || !dims.width || !dims.height) return;
+    const cols = Math.max(20, Math.floor((termBox.clientWidth - 16) / dims.width));
+    const rows = Math.max(5, Math.floor((termBox.clientHeight - 12) / dims.height));
+    if (cols === term.cols && rows === term.rows) return;
+    term.resize(cols, rows);
+    if (socket && socket.readyState === 1) {
+      socket.send(JSON.stringify({ type: 'resize', cols, rows }));
+    }
+  }
+
+  function makeTerminal() {
+    term = new Terminal({
+      convertEol: false,
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 13,
+      scrollback: 5000,
+      theme: { background: '#12151c', foreground: '#d7dee9', cursor: '#63c088' },
+    });
+    term.open(termBox);
+    // Every keystroke goes to the remote tty as-is: it does the echoing, the line
+    // editing and the signals. Intercepting any of it here would break all three.
+    term.onData((data) => {
+      if (socket && socket.readyState === 1) socket.send(JSON.stringify({ type: 'data', data }));
+    });
+    addEventListener('resize', fitTerminal);
+    setTimeout(fitTerminal, 0);
+  }
+
+  function setBusy(isRunning) {
+    running = isRunning;
+    $('send').disabled = !socket || isRunning || pty;
+    cmdBox.disabled = !socket || (isRunning && !pty);
+    $('stop').disabled = !socket;
+    if (!isRunning && socket && !pty) cmdBox.focus();
+  }
+
+  function setConnected(isConnected) {
+    $('connect').disabled = isConnected;
+    $('disconnect').disabled = !isConnected;
+    hostBox.disabled = tokenBox.disabled = modeBox.disabled = isConnected;
+    setBusy(false);
+  }
+
+  function connect() {
+    const host = hostBox.value.trim();
+    if (!host) { hostBox.focus(); return; }
+    if (!tokenBox.value) {
+      // Opening a socket only to be closed with 4401 tells the operator less than
+      // saying so here does.
+      write('\n!! No API token. Paste it, or open this page once as ' +
+            '/ssh?token=YOUR_TOKEN — it is the service\'s ' +
+            'SUBJECTIVE_DEVAGENTS_API_TOKEN, not an SSH credential.\n', 'err');
+      log.hidden = false; termBox.hidden = true;
+      tokenBox.focus();
+      return;
+    }
+    pty = modeBox.value === 'pty';
+    const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/ssh';
+
+    if (pty) {
+      log.hidden = true; termBox.hidden = false; bar.hidden = true;
+      if (!term) makeTerminal();
+      term.reset(); term.focus(); fitTerminal();
+    } else {
+      log.hidden = false; termBox.hidden = true; bar.hidden = false;
+      write(`\n== connecting to ${host}\n`, 'note');
+    }
+    setState('connecting…');
+    socket = new WebSocket(url);
+
+    socket.onopen = () => {
+      // The token goes in the first frame rather than the query string, which is what
+      // the service expects and keeps it out of logged URLs.
+      if (tokenBox.value) socket.send(JSON.stringify({ type: 'auth', token: tokenBox.value }));
+      const open = { type: 'open', host };
+      if (pty) { open.pty = true; open.cols = term.cols; open.rows = term.rows; }
+      socket.send(JSON.stringify(open));
+      setConnected(true);
+    };
+
+    socket.onmessage = (event) => {
+      let frame;
+      try { frame = JSON.parse(event.data); } catch { return; }
+      switch (frame.type) {
+        case 'hello':
+          // Only a token the service actually accepted is worth keeping.
+          remember(tokenBox.value);
+          break;
+        case 'opening':
+          if (!pty) write(`   ${JSON.stringify(frame.connection)}\n`, 'note');
+          break;
+        case 'ready':
+          setState(`${frame.mode} — ${frame.cwd || frame.term || ''}`, true);
+          if (!pty) write(`== ready  ${frame.cwd || ''}\n`, 'note');
+          setBusy(false);
+          if (pty) { term.focus(); fitTerminal(); }
+          break;
+        case 'data':
+          term && term.write(frame.data);
+          break;
+        case 'output':
+          write(frame.data, frame.stream === 'stderr' ? 'err' : null);
+          break;
+        case 'exit':
+          if (frame.code !== 0) write(`[exit ${frame.code}]\n`, 'code-bad');
+          if (frame.cwd) setState(`command — ${frame.cwd}`, true);
+          setBusy(false);
+          break;
+        case 'closed':
+          if (pty) term.write(`\r\n\x1b[2m== remote shell closed (exit ${frame.code})\x1b[0m\r\n`);
+          else write(`== remote shell closed (exit ${frame.code})\n`, 'note');
+          break;
+        case 'error':
+          if (pty) term.write(`\r\n\x1b[31m!! ${frame.error}\x1b[0m\r\n`);
+          else write(`!! ${frame.error}\n`, 'err');
+          setBusy(false);
+          break;
+      }
+    };
+
+    // A bare close code tells the operator nothing. These are the ones this service
+    // sends deliberately, and each has a different fix.
+    const CLOSE_REASONS = {
+      4401: 'The API token was missing or rejected. Put it in the token box, or open ' +
+            'this page once as /ssh?token=YOUR_TOKEN — it is the service\'s ' +
+            'SUBJECTIVE_DEVAGENTS_API_TOKEN, not anything to do with SSH.',
+      4403: 'The SSH terminal is switched off on this service ' +
+            '(SUBJECTIVE_DEVAGENTS_SSH_TERMINAL_ENABLED=1 enables it).',
+      4400: 'The service refused the connection details.',
+      4429: 'Too many SSH sessions are already open. Close one and retry.',
+    };
+
+    socket.onclose = (event) => {
+      socket = null;
+      setConnected(false);
+      const reason = CLOSE_REASONS[event.code];
+      setState(reason ? `refused (${event.code})` : event.wasClean ? 'disconnected'
+               : `disconnected (${event.code})`, false);
+      const text = `== socket closed${event.code ? ' (' + event.code + ')' : ''}`;
+      if (pty && term) {
+        term.write(`\r\n\x1b[2m${text}\x1b[0m\r\n`);
+        if (reason) term.write(`\x1b[31m!! ${reason}\x1b[0m\r\n`);
+      } else {
+        write(text + '\n', 'note');
+        if (reason) write(`!! ${reason}\n`, 'err');
+        write('\n');
+      }
+      // Auth is the one failure where the fix is on this page, so put the cursor
+      // where the fix goes.
+      if (event.code === 4401) {
+        // Do not keep a token the service rejected: it would fail again on reload
+        // and read as the page being broken rather than the token being wrong.
+        forget();
+        tokenBox.focus();
+        tokenBox.select();
+      }
+    };
+
+    socket.onerror = () => {
+      const text = '!! socket error — is the service running?';
+      if (pty && term) term.write(`\r\n\x1b[31m${text}\x1b[0m\r\n`);
+      else write(text + '\n', 'err');
+    };
+  }
+
+  function send() {
+    const command = cmdBox.value;
+    if (!socket || running || !command.trim()) return;
+    write(`$ ${command}\n`, 'cmd');
+    socket.send(JSON.stringify({ type: 'input', command }));
+    if (history_[history_.length - 1] !== command) history_.push(command);
+    historyAt = history_.length;
+    cmdBox.value = '';
+    setBusy(true);
+  }
+
+  $('connect').onclick = connect;
+  $('disconnect').onclick = () => {
+    if (!socket) return;
+    socket.send(JSON.stringify({ type: 'close' }));
+    socket.close();
+  };
+  $('send').onclick = send;
+  $('stop').onclick = () => socket && socket.send(JSON.stringify({ type: 'interrupt' }));
+
+  modeBox.onchange = () => {
+    const isPty = modeBox.value === 'pty';
+    write(isPty
+      ? '\nTerminal mode: a real tty — claude, codex, top, vim and sudo prompts work, and\n' +
+        'Ctrl-C reaches the remote job. No exit codes or working directory: a terminal\n' +
+        'has no command boundary to report.\n'
+      : '\nCommand mode: one command at a time, with exit codes, a tracked working\n' +
+        'directory and stdout/stderr kept apart. Interactive programs will not run.\n',
+      'note');
+  };
+
+  cmdBox.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); send(); return; }
+    if (event.key === 'ArrowUp' && historyAt > 0) {
+      event.preventDefault();
+      cmdBox.value = history_[--historyAt];
+    } else if (event.key === 'ArrowDown' && historyAt < history_.length) {
+      event.preventDefault();
+      historyAt += 1;
+      cmdBox.value = historyAt === history_.length ? '' : history_[historyAt];
+    }
+  });
+
+  hostBox.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+  tokenBox.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); });
+
+  write('Command mode: one command at a time, with exit codes and separated streams.\n' +
+        'Terminal (pty): a real tty — interactive programs and a working Ctrl-C, but no\n' +
+        'framing. Pick above before connecting.\n', 'note');
+  (hostBox.value ? $('connect') : hostBox).focus();
+})();
+</script>
+</body>
+</html>
