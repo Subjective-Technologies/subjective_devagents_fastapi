@@ -57,8 +57,12 @@ export PYTHONPATH="${py_path}${PYTHONPATH:+:${PYTHONPATH}}"
 venv="${SCRIPT_DIR}/.venv"
 py="${venv}/bin/python"
 if [ ! -x "${py}" ]; then
-  echo "### creating venv in ${SCRIPT_DIR}" >&2
-  python3 -m venv "${venv}"
+  # Never build from a conda interpreter: conda is not used in this project and
+  # a conda-based venv breaks when conda is removed or its base env deactivated.
+  base_py="${SUBJECTIVE_BASE_PYTHON:-/usr/bin/python3}"
+  [ -x "${base_py}" ] || base_py="$(command -v python3)"
+  echo "### creating venv in ${SCRIPT_DIR} (base: ${base_py})" >&2
+  "${base_py}" -m venv "${venv}"
   "${py}" -m pip install -q -U pip setuptools wheel
   "${py}" -m pip install -q -e "${SCRIPT_DIR}" "requests>=2.25.1"
 elif ! "${py}" -c "import uvicorn, fastapi" 2>/dev/null; then

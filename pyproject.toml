@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
+    # firebase_auth.py imports jwt/PyJWKClient at module scope; without this the
+    # app fails to import rather than degrading to unauthenticated.
+    "pyjwt[crypto]>=2.8",
     "websockets>=12",
     "python-multipart>=0.0.9",
     "pyjwt[crypto]>=2.8",
