@@ -19,3 +19,6 @@
 [submodule "plugins/subjective_grok_cli_datasource"]
 	path = plugins/subjective_grok_cli_datasource
 	url = https://github.com/Subjective-Technologies/subjective_grok_cli_datasource.git
+[submodule "plugins/subjective_ssh_datasource"]
+	path = plugins/subjective_ssh_datasource
+	url = git@github.com:Subjective-Technologies/subjective_ssh_datasource.git
