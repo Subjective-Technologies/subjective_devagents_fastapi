@@ -39,6 +39,7 @@ PROVIDER_ICONS = {
     "chat-gpt": "../assets/providers/chatgpt.svg",
     "openai": "../assets/providers/chatgpt.svg",
     "openai-chat-gpt": "../assets/providers/chatgpt.svg",
+    "ssh": "../assets/providers/ssh.svg",
 }
 
 PROVIDER_LABELS = {
@@ -55,6 +56,7 @@ PROVIDER_LABELS = {
     "chat-gpt": "ChatGPT",
     "openai": "ChatGPT",
     "openai-chat-gpt": "ChatGPT",
+    "ssh": "SSH",
 }
 
 STATE_VERSION = 2
@@ -65,6 +67,10 @@ WRITABLE_PROVIDERS = {
     "claude": {"bundle": "claude", "label": "Claude"},
     "cursor": {"bundle": "cursor", "label": "Cursor"},
     "grok": {"bundle": "grok", "label": "Grok"},
+    # Not an LLM CLI: the other end is a shell on another machine, and a turn's text is
+    # run there as a command. The conversation's workspace names the target, written
+    # `user@host:/path` — see datasources.ssh_connection_from_workspace.
+    "ssh": {"bundle": "ssh", "label": "SSH"},
 }
 DEFAULT_PROVIDER = "codex"
 
@@ -500,6 +506,9 @@ class LlmService:
         # non-existent runtime makes the fallback report "runtime missing" rather than
         # silently answering a grok turn with the default (codex) bundle.
         self.grok_runtime = str(Path(self.root) / "pipelines" / "grok" / "run.py")
+        # Same as grok: no exported ssh bundle exists and none is planned, so this path
+        # reports "runtime missing" rather than answering an SSH turn with Codex.
+        self.ssh_runtime = str(Path(self.root) / "pipelines" / "ssh" / "run.py")
         self.history_runtime = str(Path(self.root) / "pipelines" / "history" / "run.py")
         self.reload_runtime = str(Path(self.root) / "pipelines" / "history" / "reload_one.py")
         self.pipeline_runtime = str(Path(__file__).parent / "pipeline_runtime.py")
@@ -938,6 +947,17 @@ class LlmService:
         self.log("info", "LLM conversation renamed", {"target": key, "label": clean, "local": bool(local)})
         return {"ok": True, "conversation": self.find_conversation(key)}
 
+    def cancel_ssh_chat(self, target: str) -> bool:
+        """Ctrl-C an SSH chat's running command.
+
+        SSH chats do not register a canceller the way a datasource turn does — there
+        is no per-turn instance to hold — so Stop reaches the live shell through
+        ssh_chat instead.
+        """
+        from . import ssh_chat
+
+        return ssh_chat.sessions.interrupt(target)
+
     def _runtime_for(self, provider: Any) -> str:
         key = provider_key(provider)
         if key == "claude":
@@ -946,6 +966,8 @@ class LlmService:
             return self.cursor_runtime
         if key == "grok":
             return self.grok_runtime
+        if key == "ssh":
+            return self.ssh_runtime
         return self.codex_runtime
 
     def create_conversation(
@@ -1446,6 +1468,14 @@ class LlmService:
                 stopped = bool(canceller())
             except Exception as error:  # noqa: BLE001
                 self.log("error", "LLM cancel failed", {"target": key, "message": str(error)})
+        if not stopped:
+            # An SSH chat has no per-turn canceller to register, so Stop reaches its
+            # shell directly — and there it is a real Ctrl-C to the foreground job,
+            # not a teardown, so the conversation survives being interrupted.
+            try:
+                stopped = self.cancel_ssh_chat(key)
+            except Exception as error:  # noqa: BLE001
+                self.log("error", "SSH chat cancel failed", {"target": key, "message": str(error)})
         self.log("info", "LLM turn cancel requested", {
             "target": key, "running": running, "signalled": stopped,
         })
@@ -1621,9 +1651,32 @@ class LlmService:
                 # Grok reads permission_mode per turn; bypassPermissions is its
                 # run-without-prompting mode, the same intent as the flags above.
                 request["permission_mode"] = "bypassPermissions"
+            elif provider["bundle"] == "ssh":
+                # Nothing to auto-approve: the message *is* the command, and the
+                # operator typed it. This request never reaches a datasource anyway.
+                pass
             runtime_path = self._runtime_for(source["provider"])
 
             def run_once() -> dict:
+                if provider["bundle"] == "ssh":
+                    # An SSH chat is not a datasource turn. Its shell has to outlive
+                    # the message so `cd`, `export` and a half-answered `sudo` prompt
+                    # carry into the next one, and a fresh instance per turn — which
+                    # is what datasources.run does, deliberately — would throw all of
+                    # that away. ssh_chat keeps one shell per conversation instead.
+                    from . import ssh_chat
+
+                    try:
+                        connection = ssh_chat.connection_for_conversation(conversation)
+                    except ValueError as error:
+                        return {"success": False, "status": "configuration_required", "error": str(error)}
+                    outcome = ssh_chat.sessions.send(
+                        target, connection, clean, timeout=AGENT_TURN_TIMEOUT_SECONDS
+                    )
+                    # Same envelope as _run_datasource: _pipeline_result unwraps
+                    # `result`, and a bare result dict loses every key it carries —
+                    # which showed up as a successful send with an empty reply.
+                    return {"success": True, "result": outcome}
                 if running_as_other_user:
                     # Must stay a subprocess: the whole point is running under a different
                     # uid, and an import cannot change the uid of this process.
