@@ -237,3 +237,23 @@ def read_role(agent_id: str) -> dict:
     if not path.is_file():
         return {"ok": False, "error": f"No role file for {agent_id}."}
     return {"ok": True, "id": agent_id, "model": read_model(agent_id), "text": _read(path)}
+
+
+def write_role(agent_id: str, text: str) -> dict:
+    """Overwrite an existing role file's full prose (the "Edit agent" UI's Save).
+
+    Unlike `set_agent_model`, this replaces the whole file verbatim — the operator is
+    editing the agent's own words on purpose, Runtime section included. Only an existing,
+    already-registered role can be edited here; use `create_agent` to add a new one, so a
+    typo'd agent id can never silently create an orphaned file with no registry row.
+    """
+    if not is_valid_agent_id(agent_id):
+        return {"ok": False, "error": "Invalid agent id."}
+    path = _role_path(agent_id)
+    if not path.is_file():
+        return {"ok": False, "error": f"No role file for {agent_id}."}
+    body = str(text or "")
+    if not body.strip():
+        return {"ok": False, "error": "Role text cannot be empty."}
+    _write_atomic(path, body if body.endswith("\n") else body + "\n")
+    return {"ok": True, "id": agent_id, "model": read_model(agent_id), "text": _read(path)}

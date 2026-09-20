@@ -645,6 +645,16 @@ async def api_agent_role(agent: str = Query(default="")) -> dict:
     return await asyncio.to_thread(agents_module.read_role, agent)
 
 
+@app.post("/api/agents/role")
+async def api_save_agent_role(body: dict = Body(default={})) -> dict:
+    """Save the full text of an existing agent's role file (the "Edit agent" dialog)."""
+    from . import agents as agents_module
+
+    return await asyncio.to_thread(
+        agents_module.write_role, str(body.get("id") or ""), str(body.get("text") or "")
+    )
+
+
 @app.post("/api/agents")
 async def api_create_agent(body: dict = Body(default={})) -> dict:
     """Add an agent: a role file in roles/ and a row in registry.md, or neither."""

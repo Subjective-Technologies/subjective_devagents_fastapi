@@ -126,6 +126,35 @@ def test_model_and_agent_inputs_are_validated(registry):
     assert agents.set_agent_model("no_such_agent", "claude")["ok"] is False
 
 
+def test_editing_a_role_overwrites_its_full_prose(registry):
+    result = agents.write_role("coder_agent", "# coder_agent\n\n## Mission\n\nRewritten by the operator.\n")
+
+    assert result["ok"] is True, result
+    role = (registry / "roles" / "coder_agent.md").read_text(encoding="utf-8")
+    assert role == "# coder_agent\n\n## Mission\n\nRewritten by the operator.\n"
+    assert agents.read_role("coder_agent")["text"] == role
+
+
+def test_editing_preserves_the_runtime_section_since_it_is_not_special_cased(registry):
+    """Unlike set_agent_model, write_role replaces the file verbatim — the operator is
+    editing on purpose, Runtime section included."""
+    agents.set_agent_model("coder_agent", "claude")
+
+    agents.write_role("coder_agent", "# coder_agent\n\n## Mission\n\nNo Runtime section anymore.\n")
+
+    updated = (registry / "roles" / "coder_agent.md").read_text(encoding="utf-8")
+    assert "## Runtime" not in updated
+    assert agents.read_model("coder_agent") == ""
+
+
+def test_editing_a_nonexistent_or_empty_role_is_refused(registry):
+    assert agents.write_role("no_such_agent", "# no_such_agent\n")["ok"] is False
+    assert agents.write_role("coder_agent", "   \n")["ok"] is False
+    assert agents.write_role("../../etc/passwd", "x")["ok"] is False
+    # Refused, so the original file must be untouched.
+    assert "Do the thing." in (registry / "roles" / "coder_agent.md").read_text(encoding="utf-8")
+
+
 def test_the_real_repository_registry_parses(monkeypatch):
     """The shipped registry must actually be readable by this parser."""
     monkeypatch.delenv("SUBJECTIVE_AGENTS_DIR", raising=False)
