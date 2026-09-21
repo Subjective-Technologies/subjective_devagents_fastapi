@@ -1667,7 +1667,9 @@ class LlmService:
                     from . import ssh_chat
 
                     try:
-                        connection = ssh_chat.connection_for_conversation(conversation)
+                        connection = ssh_chat.connection_for_conversation(
+                            conversation, app_home=self.app_home
+                        )
                     except ValueError as error:
                         return {"success": False, "status": "configuration_required", "error": str(error)}
                     outcome = ssh_chat.sessions.send(

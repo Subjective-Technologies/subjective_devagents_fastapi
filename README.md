@@ -188,6 +188,24 @@ browser — notably not `ssh_path`.
 
 `GET /api/ssh/sessions` lists what is open, without credentials.
 
+### Saved connections
+
+`GET /api/ssh/connections` returns three things the picker shows together: connections
+saved in `<app home>/ssh-connections.json`, private keys found in the service
+account's `~/.ssh` (by path — contents are never read), and `Host` aliases from its
+`~/.ssh/config`. Aliases are listed, never copied: an alias already carries its
+account, port, key and options, and duplicating it here would be a second copy to
+keep in step.
+
+`POST /api/ssh/connections`, `.../update`, `.../delete` manage the saved ones, and
+`.../test` opens a status check without starting a chat.
+
+A saved password or key passphrase is a plaintext secret on this server's disk. The
+store is written `0600` atomically, `get()` is the only path that returns a secret
+and is not reachable from the API, and every listing reports `hasPassword` /
+`hasKeyPassphrase` booleans instead of the values. Agent and key authentication
+store no secret at all and are the default.
+
 The console at `/ssh` drives this socket and is the only way to exercise the service
 on its own: the DevAgents client pins the production API origin in a meta tag and a
 CSP and gates itself behind Firebase. Open it with the token already filled in —

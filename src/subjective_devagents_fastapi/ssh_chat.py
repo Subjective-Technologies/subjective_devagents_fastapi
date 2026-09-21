@@ -351,18 +351,25 @@ class SshChatSessions:
 sessions = SshChatSessions()
 
 
-def connection_for_conversation(conversation: dict) -> dict:
+def connection_for_conversation(conversation: dict, app_home: str = "") -> dict:
     """Where an SSH chat's target comes from: the conversation's workspace.
 
-    A chat already has one free-text field that can name a machine, and reusing it
-    means no new storage and no new dialog — an SSH chat's workspace is written
-    `deploy@host:/srv/app`, or just a `~/.ssh/config` alias.
+    A chat has one field that can name a machine, so that is where the reference
+    lives. It holds either `saved:<id>` — a connection from the store, with its key,
+    password and options — or a target written out longhand (`user@host:/path`, or a
+    `~/.ssh/config` alias), which is what SSH chats used before the store existed and
+    still works without one.
     """
-    workspace = str(conversation.get("workspace") or "").strip()
-    connection = datasources.ssh_connection_from_workspace(workspace)
-    if not connection.get("host"):
-        raise ValueError(
-            "This SSH chat has no host. Set its workspace to a machine — "
-            "`user@host`, `user@host:/path`, or a Host alias from ~/.ssh/config."
-        )
-    return connection
+    from . import ssh_connections
+
+    reference = str(conversation.get("workspace") or "").strip()
+    if not app_home:
+        # No store to consult: only the longhand form can be resolved.
+        settings = datasources.ssh_connection_from_workspace(reference)
+        if not settings.get("host"):
+            raise ValueError(
+                "This SSH chat has no host. Set its workspace to a machine — "
+                "`user@host`, `user@host:/path`, or a Host alias from ~/.ssh/config."
+            )
+        return settings
+    return ssh_connections.connection_settings(app_home, reference)

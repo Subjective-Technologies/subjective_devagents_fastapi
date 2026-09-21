@@ -39,7 +39,7 @@ from .system_users import is_valid_username, list_system_users
 
 # Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
 # with the live git SHA so View Source proves which build the browser loaded.
-WEB_UI_RELEASE = "20260920a"
+WEB_UI_RELEASE = "20260920b"
 
 MAX_BODY_BYTES = 32 * 1024 * 1024  # room for a handful of base64 image/file attachments
 
@@ -1306,6 +1306,126 @@ async def ssh_terminal_asset(name: str) -> Response:
         media_type=media_type,
         headers={"Cache-Control": "public, max-age=3600"},
     )
+
+
+# --- saved SSH connections -------------------------------------------------------------
+
+
+def _ssh_app_home() -> str:
+    """Where the connection store lives — the same app home the transcript uses."""
+    return core().llm_service.app_home
+
+
+@app.get("/api/ssh/connections")
+async def api_ssh_connections() -> dict:
+    """Saved connections, the operator's ~/.ssh keys, and their config aliases.
+
+    All three in one response because the picker shows all three together, and two
+    of them are free to read. Passwords and passphrases are never included — only
+    booleans saying whether one is stored.
+    """
+    from . import ssh_connections
+
+    home = _ssh_app_home()
+    connections, keys, hosts = await asyncio.gather(
+        asyncio.to_thread(ssh_connections.list_connections, home),
+        asyncio.to_thread(ssh_connections.list_keys),
+        asyncio.to_thread(ssh_connections.list_config_hosts),
+    )
+    return {
+        "ok": True,
+        "connections": connections,
+        "keys": keys,
+        "configHosts": hosts,
+        "authMethods": list(ssh_connections.AUTH_METHODS),
+    }
+
+
+@app.post("/api/ssh/connections")
+async def api_create_ssh_connection(body: dict = Body(default={})) -> Response:
+    from . import ssh_connections
+
+    try:
+        created = await asyncio.to_thread(
+            ssh_connections.create, _ssh_app_home(), body or {}
+        )
+    except ValueError as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
+    default_log("info", "SSH connection saved", {"id": created["id"], "host": created["host"]})
+    return JSONResponse({"ok": True, "connection": created})
+
+
+@app.post("/api/ssh/connections/update")
+async def api_update_ssh_connection(body: dict = Body(default={})) -> Response:
+    from . import ssh_connections
+
+    try:
+        updated = await asyncio.to_thread(
+            ssh_connections.update, _ssh_app_home(), str(body.get("id") or ""), body or {}
+        )
+    except ValueError as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
+    except LookupError as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=404)
+    return JSONResponse({"ok": True, "connection": updated})
+
+
+@app.post("/api/ssh/connections/delete")
+async def api_delete_ssh_connection(body: dict = Body(default={})) -> Response:
+    from . import ssh_connections
+
+    removed = await asyncio.to_thread(
+        ssh_connections.delete, _ssh_app_home(), str(body.get("id") or "")
+    )
+    if not removed:
+        return JSONResponse({"ok": False, "error": "No such connection."}, status_code=404)
+    default_log("info", "SSH connection deleted", {"id": str(body.get("id") or "")})
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/ssh/connections/test")
+async def api_test_ssh_connection(body: dict = Body(default={})) -> Response:
+    """Try the connection and report what happened, without opening a chat.
+
+    The equivalent of an SSH client's "Test" button: the failures worth catching
+    here — a wrong account, an unreadable key, a changed host key — are all ones the
+    operator can only otherwise discover by starting a chat and watching it fail.
+    """
+    from . import ssh_connections, ssh_terminal
+
+    try:
+        ssh_terminal.ensure_available()
+    except ssh_terminal.TerminalDisabled as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=403)
+
+    identifier = str(body.get("id") or "")
+    try:
+        if identifier:
+            settings = ssh_connections.connection_settings(_ssh_app_home(), f"saved:{identifier}")
+        else:
+            settings = ssh_connections._clean(body or {})
+            settings = {
+                key: value for key, value in settings.items()
+                if key in ssh_connections.EDITABLE_FIELDS and key != "name"
+            }
+    except ValueError as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
+
+    def probe() -> dict:
+        from . import datasources
+
+        instance = datasources.instantiate(datasources.load("ssh"), settings)
+        return instance.get_status()
+
+    try:
+        status = await asyncio.to_thread(probe)
+    except LookupError as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
+    return JSONResponse({
+        "ok": bool(status.get("success")),
+        "status": status.get("status") or "",
+        "error": status.get("error") or "",
+    })
 
 
 @app.get("/api/ssh/sessions")
