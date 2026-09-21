@@ -400,3 +400,102 @@ def test_malformed_output_still_produces_a_reply():
     """A turn must not be lost to a byte sequence no terminal would emit."""
     broken = "\x1b[2J\x1b[999999999999;1Hstill here\x1b[\x1b[\x1b"
     assert "still here" in ssh_chat.render_terminal_text(broken, cols=40, rows=10)
+
+
+# --- answering a password prompt ---------------------------------------------------
+
+
+@pytest.mark.parametrize("line", [
+    "[sudo] password for worktwins:",
+    "worktwins@host's password:",
+    "Enter passphrase for key '/home/x/.ssh/id_ed25519':",
+    "Password:",
+    "password: ",
+    "Verification code:",
+])
+def test_a_prompt_for_a_secret_is_recognised(line):
+    assert ssh_chat.secret_prompt(line) == line.strip()
+
+
+@pytest.mark.parametrize("line", [
+    "total 48",
+    "The password is stored in the vault",
+    "PASSWORD_FILE=/etc/secret",
+    "",
+])
+def test_ordinary_output_is_not_mistaken_for_a_prompt(line):
+    assert ssh_chat.secret_prompt(line) == ""
+
+
+def test_only_the_last_line_counts():
+    """The prompt is the last thing written before the program blocks; the word
+    appearing earlier in a log means nothing."""
+    assert ssh_chat.secret_prompt("Password:\nall done\n") == ""
+    assert ssh_chat.secret_prompt("checking\nPassword:") == "Password:"
+
+
+def test_a_completed_command_never_asks_for_a_secret(connection):
+    """The shell being back at its prompt means nothing is waiting, whatever the
+    output happens to say — otherwise `echo Password:` would open the dialog."""
+    result = say("t", connection, "echo 'Password:'")
+    assert result["response"] == "Password:"
+    assert result["awaitingSecret"] == ""
+
+
+def test_a_blocked_prompt_is_reported(connection):
+    result = say("t", connection, 'read -s -p "Password: " pw')
+    assert result["awaitingProgram"] is True
+    assert result["awaitingSecret"] == "Password:"
+
+
+def test_the_secret_reaches_the_program_and_is_not_echoed(connection):
+    say("t", connection, 'read -s -p "Password: " pw')
+    result = ssh_chat.sessions.send_secret("t", "hunter2", timeout=30)
+    assert result["success"] is True
+    # The program chose to reveal the length; nothing echoed the secret itself.
+    assert "hunter2" not in result["response"]
+    check = say("t", connection, 'echo "${#pw}"')
+    assert check["response"] == "7"
+
+
+def test_a_secret_is_never_sent_to_a_chat_with_no_shell():
+    """A secret is an answer to something already asking; it must not open a
+    session and type a password into a fresh login shell."""
+    result = ssh_chat.sessions.send_secret("never-opened", "hunter2", timeout=5)
+    assert result["success"] is False
+    assert result["status"] == "no_session"
+
+
+def test_the_transcript_gets_a_mask_not_the_secret(service, monkeypatch):
+    monkeypatch.setattr(
+        ssh_chat.sessions, "send",
+        lambda target, connection, text, timeout=None: {
+            "success": True, "status": "completed", "response": "Password:",
+            "error": "", "awaitingSecret": "Password:",
+        },
+    )
+    monkeypatch.setattr(
+        ssh_chat.sessions, "send_secret",
+        lambda target, secret, timeout=None: {
+            "success": True, "status": "completed", "response": "Welcome.", "error": "",
+        },
+    )
+    conversation = service.create_conversation(provider="ssh", name="Box", workspace="host")
+    target = conversation["target"]
+    first = service.send_message(target, "sudo -S id")
+    assert first["assistantMessage"]["awaitingSecret"] == "Password:"
+
+    outcome = service.send_ssh_secret(target, "hunter2")
+    assert outcome["ok"] is True
+    assert outcome["assistantMessage"]["text"] == "Welcome."
+    stored = service.find_conversation(target, include_messages=True)["messages"]
+    assert "hunter2" not in str(stored)
+    assert stored[-2]["text"] == "••••••••"
+    assert stored[-2]["secretInput"] is True
+
+
+def test_a_secret_is_refused_for_a_chat_that_is_not_ssh(service):
+    conversation = service.create_conversation(provider="claude", name="Not ssh")
+    outcome = service.send_ssh_secret(conversation["target"], "hunter2")
+    assert outcome["ok"] is False
+    assert outcome["status"] == "read_only"

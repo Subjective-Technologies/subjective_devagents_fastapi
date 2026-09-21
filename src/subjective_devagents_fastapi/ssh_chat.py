@@ -61,10 +61,46 @@ SETUP_TIMEOUT = 30.0
 DEFAULT_TURN_TIMEOUT = 900.0
 # A chat bubble is not a terminal; beyond this the reply is unreadable anyway.
 MAX_REPLY_CHARS = 200_000
-# Wide, because output wraps at the terminal width and a chat has no horizontal scroll.
-COLS = 200
-ROWS = 50
+# The width a full-screen program draws to, and therefore the width of the widest
+# line a chat bubble has to show. 200 made every TUI reply need a horizontal
+# scrollbar; 100 is close to the width a bubble actually has, so boxes and tables
+# come out whole. Ordinary command output is unaffected — it wraps at the terminal
+# width only if the program itself asks for the width.
+COLS = 100
+# Tall enough that a program drawing a couple of screens in one turn keeps the last
+# one, rather than losing everything above the fold.
+ROWS = 60
 IDLE_TIMEOUT_SECONDS = 3600
+
+# What a program asking for a secret leaves on the last line. Matched only when the
+# shell has *not* come back to its prompt, so a command that merely prints the word
+# "Password:" cannot trigger it — something has to actually be waiting.
+_SECRET_PROMPTS = (
+    re.compile(r"\[sudo\]\s+password\s+for\s+(?P<who>[^:]+):\s*$", re.IGNORECASE),
+    re.compile(r"enter\s+passphrase\s+for\s+key\s*'?(?P<who>[^':]*)'?\s*:\s*$", re.IGNORECASE),
+    re.compile(r"(?P<who>\S+@\S+)'s\s+password:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?:password|passphrase)\s*:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?:verification\s+code|one-?time\s+code|2fa\s+code)\s*:\s*$", re.IGNORECASE),
+)
+
+
+def secret_prompt(reply: str) -> str:
+    """The prompt line, if the output ends by asking for a secret. Else "".
+
+    Only the last non-empty line is considered: a `sudo` prompt is the last thing
+    written before the program blocks, and looking further back would match the
+    word wherever it appeared in a log.
+    """
+    for line in reversed((reply or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        for pattern in _SECRET_PROMPTS:
+            if pattern.search(line):
+                return line
+        return ""
+    return ""
+
 
 _ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -344,6 +380,9 @@ class _Session:
                 "error": f"No prompt came back within {timeout:g}s. The command may still be running; "
                          "send an empty message to collect more output, or Stop to end it.",
             }
+        # Only while something is still running: the shell being back at its prompt
+        # means nothing is waiting for a secret, whatever the output happens to say.
+        prompt = secret_prompt(reply) if ended == "quiet" else ""
         return {
             "success": True,
             "status": "completed",
@@ -352,7 +391,54 @@ class _Session:
             # `quiet` means a program is still on screen and has not returned to a
             # prompt — the next message will be read by *it*, not by the shell.
             "awaitingProgram": ended == "quiet",
+            # Set when that program is asking for a password or passphrase, so the
+            # UI can collect it in a field that does not echo and does not become
+            # part of the transcript.
+            "awaitingSecret": prompt,
             "truncated": truncated,
+        }
+
+    def send_secret(self, secret: str, timeout: float) -> dict:
+        """Answer a password prompt.
+
+        Separate from `turn` so that nothing on this path can put the secret into a
+        transcript, a log line or an echoed reply. It is written straight to the
+        terminal, which is not echoing while it asks.
+        """
+        self.last_active = time.time()
+        if not self.pty.write(secret + "\r"):
+            return {"success": False, "status": "closed", "error": "The remote shell has ended."}
+        collected: list[str] = []
+        deadline = time.time() + timeout
+        ended = "timeout"
+        while time.time() < deadline:
+            chunk = self._take()
+            if chunk:
+                collected.append(chunk)
+                if TURN_MARK in "".join(collected):
+                    ended = "prompt"
+                    break
+            if self.closed_code is not None:
+                ended = "closed"
+                break
+            if collected and self._peek_quiet_for() >= QUIET_SECONDS:
+                ended = "quiet"
+                break
+            time.sleep(0.05)
+
+        reply = render_terminal_text("".join(collected), COLS, ROWS)
+        if TURN_MARK in reply:
+            reply = reply.split(TURN_MARK)[0]
+        reply = reply.strip("\n")
+        self.last_active = time.time()
+        return {
+            "success": ended in ("prompt", "quiet"),
+            "status": "completed" if ended in ("prompt", "quiet") else ended,
+            "response": reply or "(no output)",
+            "error": "" if ended in ("prompt", "quiet") else f"The shell did not answer ({ended}).",
+            "awaitingProgram": ended == "quiet",
+            # A wrong password is usually followed by the same prompt again.
+            "awaitingSecret": secret_prompt(reply) if ended == "quiet" else "",
         }
 
     def interrupt(self) -> bool:
@@ -402,6 +488,21 @@ class SshChatSessions:
         # Outside the registry lock: a long turn in one chat must not block another.
         with session.lock:
             return session.turn(text, timeout or DEFAULT_TURN_TIMEOUT)
+
+    def send_secret(self, target: str, secret: str, timeout: float | None = None) -> dict:
+        """Answer a prompt in an existing chat. Never opens a session: a secret is
+        only ever an answer to something already asking for one."""
+        with self._lock:
+            session = self._sessions.get(target)
+        if session is None or not session.alive:
+            return {
+                "success": False,
+                "status": "no_session",
+                "response": "",
+                "error": "That chat has no live shell any more. Send the command again.",
+            }
+        with session.lock:
+            return session.send_secret(secret, timeout or DEFAULT_TURN_TIMEOUT)
 
     def interrupt(self, target: str) -> bool:
         with self._lock:

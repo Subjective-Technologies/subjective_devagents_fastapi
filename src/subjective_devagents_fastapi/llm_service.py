@@ -947,6 +947,58 @@ class LlmService:
         self.log("info", "LLM conversation renamed", {"target": key, "label": clean, "local": bool(local)})
         return {"ok": True, "conversation": self.find_conversation(key)}
 
+    def send_ssh_secret(self, target: str, secret: str) -> dict:
+        """Answer a password prompt in an SSH chat.
+
+        Deliberately not a path through `send_message`. That records what was sent,
+        which is exactly what must not happen here: the transcript gets a masked
+        placeholder, the logs get the fact and not the value, and the secret itself
+        only ever travels to the terminal that asked for it.
+        """
+        from . import ssh_chat
+
+        conversation = next((item for item in self.local if item["target"] == target), None)
+        source = self.find_conversation(target, include_messages=False)
+        if not conversation or not source:
+            return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+        if provider_key(source.get("provider")) != "ssh":
+            return {"ok": False, "status": "read_only", "error": "That is not an SSH chat."}
+        if not secret:
+            return {"ok": False, "status": "invalid_request", "error": "No input was provided."}
+        if target in self.busy:
+            return {"ok": False, "status": "busy", "error": "That chat is already responding."}
+
+        self.busy.add(target)
+        try:
+            result = ssh_chat.sessions.send_secret(target, secret, timeout=AGENT_TURN_TIMEOUT_SECONDS)
+        finally:
+            self.busy.discard(target)
+
+        if not result.get("success"):
+            self.log("error", "SSH secret send failed", {
+                "target": target, "status": result.get("status") or "", "error": result.get("error") or "",
+            })
+            return {"ok": False, **{key: value for key, value in result.items() if key != "response"},
+                    "error": result.get("error") or "Could not send that input."}
+
+        now = time.time() * 1000
+        # A masked stand-in, so the transcript still reads as a conversation
+        # without holding the secret.
+        user_message = {"role": "user", "text": "••••••••", "time": now, "secretInput": True}
+        assistant_message = {"role": "assistant", "text": str(result.get("response") or ""), "time": now + 1}
+        if result.get("awaitingSecret"):
+            assistant_message["awaitingSecret"] = str(result["awaitingSecret"])
+        conversation["messages"].extend([user_message, assistant_message])
+        conversation["updatedAt"] = conversation["sortAt"] = assistant_message["time"]
+        self._save_state()
+        self.log("info", "SSH secret sent", {"target": target, "chars": len(secret)})
+        return {
+            "ok": True,
+            "conversation": self._hydrate_local_conversation(conversation),
+            "userMessage": user_message,
+            "assistantMessage": assistant_message,
+        }
+
     def cancel_ssh_chat(self, target: str) -> bool:
         """Ctrl-C an SSH chat's running command.
 
@@ -1777,6 +1829,11 @@ class LlmService:
                 return failure
             conversation["sessionId"] = original_session_id or str(result.get("session_id") or conversation.get("sessionId") or "")
             assistant_message = {"role": "assistant", "text": str(result.get("response") or ""), "time": time.time() * 1000}
+            # An SSH turn that ended with something asking for a password says so,
+            # and the UI collects it in a field that does not echo instead of the
+            # composer, which would put it in the transcript.
+            if result.get("awaitingSecret"):
+                assistant_message["awaitingSecret"] = str(result["awaitingSecret"])
             conversation["messages"].append(assistant_message)
             conversation["updatedAt"] = assistant_message["time"]
             conversation["sortAt"] = assistant_message["time"]

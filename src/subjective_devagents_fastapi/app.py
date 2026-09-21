@@ -39,7 +39,7 @@ from .system_users import is_valid_username, list_system_users
 
 # Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
 # with the live git SHA so View Source proves which build the browser loaded.
-WEB_UI_RELEASE = "20260920c"
+WEB_UI_RELEASE = "20260920d"
 
 MAX_BODY_BYTES = 32 * 1024 * 1024  # room for a handful of base64 image/file attachments
 
@@ -1472,6 +1472,26 @@ async def api_test_ssh_connection(body: dict = Body(default={})) -> Response:
         "status": status.get("status") or "",
         "error": status.get("error") or "",
     })
+
+
+@app.post("/api/llm/ssh-secret")
+async def api_send_ssh_secret(body: dict = Body(default={})) -> Response:
+    """Answer a password prompt in an SSH chat.
+
+    A separate route from send-message because the secret must not be recorded:
+    the transcript gets a masked placeholder and the logs get the length, never the
+    value. Nothing here echoes it back either — the reply returned is whatever the
+    remote said next.
+    """
+    instance = core()
+    result = await asyncio.to_thread(
+        instance.llm_service.send_ssh_secret,
+        str(body.get("target") or ""),
+        str(body.get("secret") or ""),
+    )
+    if result.get("ok"):
+        state.hub.publish({"type": "llm-message", **result})
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
 @app.get("/api/ssh/sessions")
