@@ -282,3 +282,150 @@ def test_clicking_yes_reaches_the_backend_on_real_mobile_emulation(live_server, 
     differs between the reported-broken and reported-working cases; a plain resize could
     not have shown that, since it never diverged from desktop in anything but pixel count."""
     _assert_yes_click_reaches_backend(mobile_driver, live_server)
+
+
+# --- what is actually on top of the button ------------------------------------------
+
+
+def _blocker_report(driver, label: str) -> dict:
+    """Ask the browser what a click at the button's centre would actually hit.
+
+    The reported failure is "clicking does nothing", which is what a transparent
+    element covering the button looks like from the outside — indistinguishable, at
+    the UI, from a handler that never fired. `elementFromPoint` settles it: it
+    returns whatever would receive the click, so if that is not the button, the
+    thing on top names itself.
+    """
+    button = _prompt_action_button(driver, label)
+    assert button is not None, f"no {label} button to test"
+    return driver.execute_script(
+        """
+        const button = arguments[0];
+        const box = button.getBoundingClientRect();
+        const x = box.left + box.width / 2;
+        const y = box.top + box.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        const describe = (node) => {
+            if (!node) return null;
+            const style = getComputedStyle(node);
+            return {
+                tag: node.tagName,
+                id: node.id || '',
+                cls: node.className && node.className.toString ? node.className.toString() : '',
+                zIndex: style.zIndex,
+                position: style.position,
+                pointerEvents: style.pointerEvents,
+                opacity: style.opacity,
+            };
+        };
+        return {
+            box: {x: box.left, y: box.top, w: box.width, h: box.height},
+            inViewport: box.top >= 0 && box.bottom <= innerHeight
+                        && box.left >= 0 && box.right <= innerWidth,
+            viewport: {w: innerWidth, h: innerHeight},
+            hit: describe(hit),
+            // The chain from the hit element up, so an overlaying ancestor is visible too.
+            hitIsButtonOrInside: Boolean(hit && (hit === button || button.contains(hit) || hit.contains(button))),
+        };
+        """,
+        button,
+    )
+
+
+def _prepare_question(driver, live_server: str) -> str:
+    target = _create_conversation(live_server)
+    driver.get(live_server)
+    wait = WebDriverWait(driver, 15)
+    wait.until(EC.presence_of_element_located((By.ID, "createLlmButton")))
+    mobile_menu_buttons = driver.find_elements(By.ID, "mobileMenuButton")
+    if mobile_menu_buttons and mobile_menu_buttons[0].is_displayed():
+        mobile_menu_buttons[0].click()
+    row = wait.until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, f'tr.conversation-row[data-target="{target}"]'))
+    )
+    row.click()
+    _inject_question(live_server, target, "Should I proceed with this change?")
+    wait.until(lambda d: _prompt_action_button(d, "Yes") is not None)
+    return target
+
+
+@pytest.mark.parametrize("size", [
+    (1280, 900),    # the width the bug was reported at
+    (2540, 1440),   # the reporter's actual window
+    (760, 900),     # just above the mobile breakpoint
+    (1280, 500),    # short: the buttons sit near the composer
+])
+def test_nothing_covers_the_option_button(live_server, driver, size):
+    """The click-blocker theory, tested directly at several viewport shapes.
+
+    The automated click test passes at 1280x900, so if a real desktop still fails,
+    either something covers the button or it is outside the viewport. Both are
+    visible here, and neither is visible from a passing click.
+    """
+    driver.set_window_size(*size)
+    _prepare_question(driver, live_server)
+    report = _blocker_report(driver, "Yes")
+    assert report["hitIsButtonOrInside"], (
+        f"at {size} a click lands on {report['hit']} instead of the Yes button; "
+        f"button box {report['box']} in viewport {report['viewport']}"
+    )
+    assert report["inViewport"], (
+        f"at {size} the Yes button is outside the viewport: {report['box']} "
+        f"in {report['viewport']}"
+    )
+
+
+@pytest.mark.skip(
+    reason="Cannot be built this way: the page's own CSP sets frame-src to the Firebase "
+           "login origin only, so the app refuses to embed a copy of itself, and "
+           "frame-ancestors refuses any other local origin. Reproducing the dashboard's "
+           "iframe needs a parent served from an allowed origin."
+)
+def test_nothing_covers_the_option_button_inside_an_iframe(live_server, driver):
+    """The dashboard embeds this app in an iframe, and that is the one context the
+    existing tests never covered — the defects list says so explicitly.
+
+    Kept rather than deleted: the attempt is what established that self-framing is
+    blocked by the app's own CSP, which is worth not rediscovering. The iframe was
+    also not the cause — see the click-blocker tests above, which pass at every
+    viewport shape including the reporter's own 2540x1440."""
+    driver.set_window_size(1280, 900)
+    driver.get(live_server)
+    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "createLlmButton")))
+    target = _create_conversation(live_server)
+
+    # Same origin, so the test can drive the document inside the frame — which is
+    # what matters here: the app's own layout under an iframe's viewport.
+    driver.execute_script(
+        """
+        document.body.innerHTML =
+            '<iframe id="embedded" src="/" style="width:100%;height:100vh;border:0"></iframe>';
+        document.body.style.margin = '0';
+        """
+    )
+    frame = WebDriverWait(driver, 15).until(
+        EC.presence_of_element_located((By.ID, "embedded"))
+    )
+    driver.switch_to.frame(frame)
+    try:
+        wait = WebDriverWait(driver, 20)
+        wait.until(EC.presence_of_element_located((By.ID, "createLlmButton")))
+        row = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, f'tr.conversation-row[data-target="{target}"]'))
+        )
+        row.click()
+        _inject_question(live_server, target, "Should I proceed with this change?")
+        wait.until(lambda d: _prompt_action_button(d, "Yes") is not None)
+
+        report = _blocker_report(driver, "Yes")
+        assert report["hitIsButtonOrInside"], (
+            f"inside an iframe a click lands on {report['hit']} instead of the Yes "
+            f"button; box {report['box']} in viewport {report['viewport']}"
+        )
+        _prompt_action_button(driver, "Yes").click()
+        WebDriverWait(driver, 10).until(
+            lambda d: (_prompt_action_button(d, "Yes") is None
+                       or _prompt_action_button(d, "Yes").get_attribute("disabled") is not None)
+        )
+    finally:
+        driver.switch_to.default_content()
