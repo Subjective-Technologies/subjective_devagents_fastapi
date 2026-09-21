@@ -15,6 +15,10 @@ Three sources feed the picker, and only one of them is stored here:
 - **Keys in `~/.ssh`.** Offered by path so a connection can name one. Key *contents*
   are never read here — the datasource hands the path to ssh, which is what a
   passphrase-protected key in an agent needs anyway.
+- **Keys uploaded from a browser.** The server's own `~/.ssh` is the *server's*, not
+  the operator's laptop, so on a deployed instance it holds nothing useful. An
+  uploaded key is written into a private directory beside the store and then behaves
+  exactly like one already in `~/.ssh`: named by path, contents never read again.
 - **Connections saved here.** Everything else: a host and account typed in once.
 
 **Secrets at rest.** A stored password or passphrase is a plaintext secret on the
@@ -84,6 +88,71 @@ def store_path(app_home: str) -> Path:
 def ssh_dir() -> Path:
     """The service account's own ~/.ssh — whose keys and config it can actually use."""
     return Path(os.environ.get("SUBJECTIVE_DEVAGENTS_SSH_DIR") or (Path.home() / ".ssh"))
+
+
+def uploaded_keys_dir(app_home: str) -> Path:
+    """Where keys sent from a browser live. Private, and beside the store."""
+    return Path(app_home) / "ssh-keys"
+
+
+# What a private key file starts with. Checked so an upload cannot quietly turn this
+# directory into a general-purpose file drop, and so that pasting the *public* key —
+# the easiest mistake to make — is caught here rather than as an ssh failure later.
+_PRIVATE_KEY_HEADER = re.compile(
+    r"^-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|^PuTTY-User-Key-File-\d"
+)
+MAX_KEY_BYTES = 64 * 1024
+_SAFE_KEY_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _key_display_name(name: str) -> str:
+    """A browser's filename is untrusted input that becomes part of a path."""
+    cleaned = _SAFE_KEY_NAME.sub("-", str(name or "").strip()).strip("-.")
+    return (cleaned or "key")[:64]
+
+
+def save_uploaded_key(app_home: str, name: str, content: str) -> dict:
+    """Store a private key sent from a browser and return how to refer to it."""
+    text = str(content or "")
+    if len(text.encode("utf-8", "replace")) > MAX_KEY_BYTES:
+        raise ValueError("That file is too large to be a private key.")
+    stripped = text.strip()
+    if not _PRIVATE_KEY_HEADER.match(stripped):
+        raise ValueError(
+            "That does not look like a private key. Choose the key file itself "
+            "(id_ed25519), not the .pub next to it."
+        )
+
+    directory = uploaded_keys_dir(app_home)
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(stat.S_IRWXU)
+    # The filename is ours, not the browser's: a generated id keeps two uploads of
+    # the same name apart and keeps any path trickery out of it entirely.
+    display = _key_display_name(name)
+    path = directory / f"{uuid.uuid4().hex}-{display}"
+    # ssh refuses a key others can read, so it is written private from the start
+    # rather than chmod'ed after a moment of being readable.
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(handle, "w", encoding="utf-8") as file:
+        file.write(stripped + "\n")
+    return {"path": str(path), "name": display, "source": "uploaded"}
+
+
+def delete_uploaded_key(app_home: str, path: str) -> bool:
+    """Remove an uploaded key. Only ever a file this module wrote."""
+    directory = uploaded_keys_dir(app_home).resolve()
+    try:
+        target = Path(path).resolve()
+        # Anything outside the upload directory is not ours to delete, however the
+        # caller spelled the path.
+        target.relative_to(directory)
+    except (OSError, ValueError):
+        return False
+    try:
+        target.unlink()
+    except OSError:
+        return False
+    return True
 
 
 # --- reading and writing the store ----------------------------------------------------
@@ -222,29 +291,46 @@ def delete(app_home: str, connection_id: str) -> bool:
 # --- what the operator's own ~/.ssh already knows ---------------------------------------
 
 
-def list_keys() -> list[dict]:
-    """Private keys in the service account's ~/.ssh, by path. Contents are never read.
+def list_keys(app_home: str = "") -> list[dict]:
+    """Private keys this server can use, by path. Contents are never read.
 
-    A key is identified by exclusion — everything that is not config, known_hosts, a
-    public key or a backup — because key files have no required naming beyond the
-    id_* convention, and an operator's key may be called anything.
+    Two places: the service account's `~/.ssh`, and the uploads directory. In
+    `~/.ssh` a key is identified by exclusion — everything that is not config,
+    known_hosts, a public key or a backup — because key files have no required
+    naming beyond the id_* convention and an operator's key may be called anything.
+    Uploads need no such guessing: everything in that directory was put there as a
+    key and was checked when it arrived.
     """
-    directory = ssh_dir()
     keys: list[dict] = []
-    try:
-        entries = sorted(directory.iterdir())
-    except OSError:
-        return keys
-    for entry in entries:
-        if not entry.is_file() or _NOT_A_KEY.search(entry.name):
-            continue
+    sources = [(ssh_dir(), "ssh_dir")]
+    if app_home:
+        sources.append((uploaded_keys_dir(app_home), "uploaded"))
+    for directory, source in sources:
         try:
-            mode = stat.S_IMODE(entry.stat().st_mode)
+            entries = sorted(directory.iterdir())
         except OSError:
             continue
-        keys.append({
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            if source == "ssh_dir" and _NOT_A_KEY.search(entry.name):
+                continue
+            try:
+                mode = stat.S_IMODE(entry.stat().st_mode)
+            except OSError:
+                continue
+            keys.append(_key_entry(entry, mode, source))
+    keys.sort(key=lambda key: (key["source"] != "uploaded", not key["hasPublicKey"], key["name"]))
+    return keys
+
+
+def _key_entry(entry: Path, mode: int, source: str) -> dict:
+    return {
             "path": str(entry),
-            "name": entry.name,
+            # An uploaded file is named `<id>-<display>`; the id is bookkeeping and
+            # would only clutter the picker.
+            "name": entry.name.split("-", 1)[-1] if source == "uploaded" else entry.name,
+            "source": source,
             # A private key almost always has a sibling .pub, so this sorts the
             # likely keys to the top without reading a single byte of any of them.
             # ssh refuses a key others can read, and saying so here beats a failed
@@ -252,9 +338,7 @@ def list_keys() -> list[dict]:
             "tooOpen": bool(mode & 0o077),
             "hasPublicKey": entry.with_suffix(entry.suffix + ".pub").exists()
             or entry.with_name(entry.name + ".pub").exists(),
-        })
-    keys.sort(key=lambda key: (not key["hasPublicKey"], key["name"]))
-    return keys
+    }
 
 
 def list_config_hosts() -> list[dict]:

@@ -200,6 +200,16 @@ keep in step.
 `POST /api/ssh/connections`, `.../update`, `.../delete` manage the saved ones, and
 `.../test` opens a status check without starting a chat.
 
+`POST /api/ssh/keys` takes a private key from the browser and writes it `0600` into
+`<app home>/ssh-keys/`, after which it appears in the same picker and is used exactly
+like one already in `~/.ssh` — by path, never read back. This is what makes a
+deployed instance usable at all: the server's `~/.ssh` holds the *box's* keys, not
+the operator's. The upload is refused unless it starts with a private-key header, so
+the directory cannot become a general file drop and the commonest mistake (sending
+the `.pub`) is caught with that advice. `POST /api/ssh/keys/delete` removes one, and
+resolves the path against the upload directory so it can never reach a key in
+`~/.ssh`.
+
 A saved password or key passphrase is a plaintext secret on this server's disk. The
 store is written `0600` atomically, `get()` is the only path that returns a secret
 and is not reachable from the API, and every listing reports `hasPassword` /

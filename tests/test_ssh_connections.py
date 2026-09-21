@@ -236,3 +236,94 @@ def test_a_reference_describes_itself_for_the_ui(home):
     assert ssh_connections.describe_reference(home, f"saved:{created['id']}") == "Box (deploy@h)"
     assert ssh_connections.describe_reference(home, "deploy@h") == "deploy@h"
     assert ssh_connections.describe_reference(home, "saved:gone") == "(deleted connection)"
+
+
+# --- keys uploaded from a browser ----------------------------------------------------
+
+
+VALID_KEY = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt\n"
+    "-----END OPENSSH PRIVATE KEY-----"
+)
+
+
+def test_an_uploaded_key_is_stored_private(home):
+    """ssh refuses a key others can read, so it is never briefly readable either."""
+    saved = ssh_connections.save_uploaded_key(home, "id_ed25519", VALID_KEY)
+    path = Path(saved["path"])
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert path.read_text(encoding="utf-8").startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
+
+
+def test_an_uploaded_key_joins_the_picker(home, fake_ssh_dir):
+    ssh_connections.save_uploaded_key(home, "id_ed25519", VALID_KEY)
+    uploaded = [key for key in ssh_connections.list_keys(home) if key["source"] == "uploaded"]
+    assert [key["name"] for key in uploaded] == ["id_ed25519"]
+
+
+def test_uploads_are_listed_before_the_servers_own_keys(home, fake_ssh_dir):
+    """The uploaded one is the one the operator just chose; it should be reachable."""
+    (fake_ssh_dir / "id_server").write_text("x", encoding="utf-8")
+    ssh_connections.save_uploaded_key(home, "id_mine", VALID_KEY)
+    assert ssh_connections.list_keys(home)[0]["source"] == "uploaded"
+
+
+def test_a_public_key_is_refused_with_the_obvious_advice(home):
+    """The easiest mistake to make, and worth catching before ssh fails on it."""
+    with pytest.raises(ValueError) as caught:
+        ssh_connections.save_uploaded_key(home, "id_ed25519.pub", "ssh-ed25519 AAAAC3Nz user@host")
+    assert ".pub" in str(caught.value)
+
+
+def test_something_that_is_not_a_key_is_refused(home):
+    """Otherwise this becomes a general-purpose file drop."""
+    with pytest.raises(ValueError):
+        ssh_connections.save_uploaded_key(home, "notes.txt", "just some text")
+
+
+def test_an_oversized_upload_is_refused(home):
+    with pytest.raises(ValueError) as caught:
+        ssh_connections.save_uploaded_key(home, "big", "x" * (ssh_connections.MAX_KEY_BYTES + 1))
+    assert "too large" in str(caught.value)
+
+
+def test_a_hostile_filename_cannot_escape_the_directory(home):
+    saved = ssh_connections.save_uploaded_key(home, "../../etc/authorized_keys", VALID_KEY)
+    path = Path(saved["path"]).resolve()
+    assert path.parent == ssh_connections.uploaded_keys_dir(home).resolve()
+    assert "/" not in saved["name"]
+
+
+def test_two_uploads_of_the_same_name_stay_separate(home, fake_ssh_dir):
+    first = ssh_connections.save_uploaded_key(home, "id_ed25519", VALID_KEY)
+    second = ssh_connections.save_uploaded_key(home, "id_ed25519", VALID_KEY)
+    assert first["path"] != second["path"]
+    assert len(ssh_connections.list_keys(home)) == 2
+
+
+def test_deleting_an_uploaded_key(home, fake_ssh_dir):
+    saved = ssh_connections.save_uploaded_key(home, "id_ed25519", VALID_KEY)
+    assert ssh_connections.delete_uploaded_key(home, saved["path"]) is True
+    assert ssh_connections.list_keys(home) == []
+
+
+def test_a_key_outside_the_upload_directory_is_never_deleted(home, tmp_path):
+    """The delete path takes a path from a browser; it must not reach anything else."""
+    outsider = tmp_path / "precious_id_ed25519"
+    outsider.write_text(VALID_KEY, encoding="utf-8")
+    assert ssh_connections.delete_uploaded_key(home, str(outsider)) is False
+    assert ssh_connections.delete_uploaded_key(
+        home, str(ssh_connections.uploaded_keys_dir(home) / ".." / ".." / outsider.name)
+    ) is False
+    assert outsider.exists()
+
+
+def test_an_uploaded_key_works_as_a_connections_key(home):
+    saved = ssh_connections.save_uploaded_key(home, "id_ed25519", VALID_KEY)
+    created = ssh_connections.create(home, {
+        "host": "h", "auth_method": "private_key_path", "private_key_path": saved["path"],
+    })
+    settings = ssh_connections.connection_settings(home, f"saved:{created['id']}")
+    assert settings["private_key_path"] == saved["path"]

@@ -1329,7 +1329,7 @@ async def api_ssh_connections() -> dict:
     home = _ssh_app_home()
     connections, keys, hosts = await asyncio.gather(
         asyncio.to_thread(ssh_connections.list_connections, home),
-        asyncio.to_thread(ssh_connections.list_keys),
+        asyncio.to_thread(ssh_connections.list_keys, home),
         asyncio.to_thread(ssh_connections.list_config_hosts),
     )
     return {
@@ -1380,6 +1380,51 @@ async def api_delete_ssh_connection(body: dict = Body(default={})) -> Response:
     if not removed:
         return JSONResponse({"ok": False, "error": "No such connection."}, status_code=404)
     default_log("info", "SSH connection deleted", {"id": str(body.get("id") or "")})
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/ssh/keys")
+async def api_upload_ssh_key(body: dict = Body(default={})) -> Response:
+    """Take a private key from the browser and keep it for future connections.
+
+    The server's own ~/.ssh is the *server's*: on a deployed instance it holds the
+    box's keys, not the operator's, so without this there is no way to reach a
+    machine the box was never set up for. The uploaded key is written private and
+    then behaves exactly like one already in ~/.ssh — named by path, never read
+    back, never returned.
+    """
+    from . import ssh_connections
+
+    try:
+        saved = await asyncio.to_thread(
+            ssh_connections.save_uploaded_key,
+            _ssh_app_home(),
+            str(body.get("name") or ""),
+            str(body.get("content") or ""),
+        )
+    except ValueError as error:
+        return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
+    except OSError as error:
+        return JSONResponse({"ok": False, "error": f"Could not store the key: {error}"}, status_code=500)
+    # The name, never the key. This line goes to a log file.
+    default_log("info", "SSH key uploaded", {"name": saved["name"]})
+    return JSONResponse({"ok": True, "key": saved})
+
+
+@app.post("/api/ssh/keys/delete")
+async def api_delete_ssh_key(body: dict = Body(default={})) -> Response:
+    """Delete an uploaded key. Keys in the server's own ~/.ssh are never touched."""
+    from . import ssh_connections
+
+    removed = await asyncio.to_thread(
+        ssh_connections.delete_uploaded_key, _ssh_app_home(), str(body.get("path") or "")
+    )
+    if not removed:
+        return JSONResponse(
+            {"ok": False, "error": "No such uploaded key. Keys from the server's own "
+                                   "~/.ssh cannot be deleted from here."},
+            status_code=404,
+        )
     return JSONResponse({"ok": True})
 
 
