@@ -951,6 +951,63 @@ class LlmService:
         self.log("info", "LLM conversation renamed", {"target": key, "label": clean, "local": bool(local)})
         return {"ok": True, "conversation": self.find_conversation(key)}
 
+    def delete_conversation(self, target: str) -> dict:
+        """Remove a chat created here, and everything that still refers to it.
+
+        Only chats created here can go. The others in the list are transcripts the
+        agent CLIs wrote on disk and this service merely reads: deleting one would
+        mean deleting Claude's or Codex's own history behind its back, which is not
+        this tool's to do and is not what "delete this chat" is asking for.
+
+        A chat is more than its row. It may have a turn in flight, a registered
+        canceller, an entry in the active list, a renamed label, and — for an SSH
+        chat — a live shell on another machine. Leaving any of those behind would
+        keep the conversation half-alive after its row had gone.
+        """
+        key = str(target or "")
+        if not key:
+            return {"ok": False, "status": "invalid_request", "error": "Missing conversation target."}
+
+        conversation = next((item for item in self.local if item["target"] == key), None)
+        if conversation is None:
+            if self.find_conversation(key):
+                return {
+                    "ok": False,
+                    "status": "read_only",
+                    "error": "That chat is a CLI transcript on disk, not one created here. "
+                             "Deleting it would delete the agent's own history; remove it "
+                             "with the CLI that owns it.",
+                }
+            return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+
+        # A turn still running would otherwise write to a conversation that no
+        # longer exists, and its CLI would keep going unwatched.
+        if key in self.busy:
+            self.cancel_message(key)
+
+        from . import ssh_chat
+
+        # An SSH chat holds a shell on another machine for as long as it lives.
+        ssh_chat.sessions.close(key)
+
+        self.local = [item for item in self.local if item["target"] != key]
+        self.label_overrides.pop(key, None)
+        self.active_targets = [item for item in self.active_targets if item != key]
+        with self._cancel_lock:
+            self._cancellers.pop(key, None)
+            self._cancelled_targets.discard(key)
+        self.busy.discard(key)
+        # Both caches are keyed by the whole list, so a stale one would keep serving
+        # the deleted chat until something else happened to invalidate it.
+        self._history_cache = None
+        self._sorted_cache = None
+        self._save_state()
+        self.log("info", "LLM conversation deleted", {
+            "target": key, "provider": conversation.get("provider"),
+            "messages": len(conversation.get("messages") or []),
+        })
+        return {"ok": True, "target": key}
+
     def send_ssh_secret(self, target: str, secret: str) -> dict:
         """Answer a password prompt in an SSH chat.
 

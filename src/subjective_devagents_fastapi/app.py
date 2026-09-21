@@ -540,6 +540,28 @@ async def api_llm_rename_conversation(body: dict = Body(default={})) -> dict:
         return {"ok": False, "error": str(error)}
 
 
+@app.post("/api/llm/delete-conversation")
+async def api_llm_delete_conversation(body: dict = Body(default={})) -> dict:
+    """Delete a chat created here.
+
+    The browser has called this since the Node server it replaced; the FastAPI port
+    never had it, so every delete returned 405 and the UI said only "Could not
+    delete this conversation."
+    """
+    instance = core()
+    try:
+        result = await asyncio.to_thread(
+            instance.llm_service.delete_conversation, str(body.get("target") or "")
+        )
+        if result.get("ok"):
+            # Every connected tab drops the row, not just the one that clicked —
+            # the same path rename uses.
+            instance.broadcast("llm-conversation-deleted", {"target": result["target"]})
+        return result
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "error": str(error)}
+
+
 @app.post("/api/llm/activate-conversation")
 async def api_llm_activate_conversation(body: dict = Body(default={})) -> dict:
     instance = core()
