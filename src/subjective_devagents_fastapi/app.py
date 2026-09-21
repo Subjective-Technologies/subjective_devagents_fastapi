@@ -39,7 +39,7 @@ from .system_users import is_valid_username, list_system_users
 
 # Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
 # with the live git SHA so View Source proves which build the browser loaded.
-WEB_UI_RELEASE = "20260920d"
+WEB_UI_RELEASE = "20260921a"
 
 MAX_BODY_BYTES = 32 * 1024 * 1024  # room for a handful of base64 image/file attachments
 

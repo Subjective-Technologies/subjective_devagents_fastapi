@@ -161,3 +161,23 @@ def test_an_unreachable_machine_fails_rather_than_running_here(service, monkeypa
     assert outcome["status"] == "configuration_required"
     assert "another machine" in outcome["error"]
     assert ran == []
+
+
+def test_a_chat_cannot_be_both_another_user_and_another_machine(service):
+    """send_message checks osUser before anything else, so a chat carrying both
+    never reaches its SSH connection — it fails with "reconnect as <user>" and
+    looks like SSH is broken. Refused at creation instead."""
+    with pytest.raises(ValueError) as caught:
+        service.create_conversation(
+            provider="claude", name="Both", os_user="someone-else", ssh_connection="abc123",
+        )
+    assert "not both" in str(caught.value)
+
+
+def test_running_on_another_machine_needs_no_local_account(service):
+    """The service account's own name is not a "run as" — it is the absence of one."""
+    conversation = service.create_conversation(
+        provider="claude", name="Remote", ssh_connection="abc123",
+    )
+    assert conversation["osUser"] is None
+    assert conversation["sshConnection"] == "abc123"

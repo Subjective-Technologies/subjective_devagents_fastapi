@@ -1054,6 +1054,16 @@ class LlmService:
         owner = str(os_user or "").strip() or me
         if owner != me and not is_valid_username(owner):
             raise ValueError("Invalid username.")
+        if ssh_connection and owner != me:
+            # send_message checks osUser before anything else, so a chat carrying
+            # both never reaches its SSH connection: it fails with "reconnect as
+            # <user>" and looks like SSH is broken. The two answer different
+            # questions — a local account, and a different computer — and only one
+            # of them can be true of a single turn.
+            raise ValueError(
+                "A chat runs either as another local user or on another machine, not both. "
+                "Clear 'Run as' to use the SSH connection."
+            )
         conversation = self._normalize_conversation(
             {
                 "target": f"llm:{key}:local:{uuid.uuid4()}",
