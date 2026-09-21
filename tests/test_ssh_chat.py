@@ -346,3 +346,57 @@ def test_the_diagnostic_does_not_quote_our_own_setup_commands(tmp_path):
     result = say("t", {"host": "h", "ssh_path": str(failing)}, "hostname")
     assert "Permission denied" in result["error"]
     assert "SUBJECTIVE_SSH" not in result["error"]
+
+
+# --- reading back what the terminal drew ------------------------------------------------
+
+
+def test_ordinary_output_keeps_its_columns():
+    """`ls` lines up with runs of spaces; anything that reflows them destroys it."""
+    listing = "AGENTS.md    libs         README.md\nartifacts    pipelines    run.sh\n"
+    assert ssh_chat.render_terminal_text(listing) == listing
+
+
+def test_colour_is_removed_without_disturbing_the_layout():
+    coloured = "\x1b[34mdir\x1b[0m        \x1b[32mfile\x1b[0m\n"
+    assert ssh_chat.render_terminal_text(coloured) == "dir        file\n"
+
+
+def test_long_output_is_never_truncated_to_a_screen():
+    """A build log is not a screen; emulating it would drop everything that scrolled."""
+    long_output = "".join(f"line {index}\n" for index in range(500))
+    rendered = ssh_chat.render_terminal_text(long_output, cols=80, rows=24)
+    assert rendered.count("\n") == 500
+    assert "line 0" in rendered and "line 499" in rendered
+
+
+def test_positioned_text_is_drawn_rather_than_concatenated():
+    """The bug this fixes: stripping the escapes ran the words together, so a
+    prompt arrived as `Doyoutrustthecontentsofthisdirectory?`."""
+    drawn = "\x1b[2J\x1b[1;1HDo you trust\x1b[3;3Hthe contents\x1b[5;1H1. Yes"
+    rendered = ssh_chat.render_terminal_text(drawn, cols=40, rows=10)
+    assert rendered.splitlines() == ["Do you trust", "", "  the contents", "", "1. Yes"]
+
+
+def test_text_overwritten_in_place_shows_its_final_state():
+    """A TUI redraws the same cell; the last write is what was on screen."""
+    redrawn = "\x1b[2J\x1b[1;1Hloading\x1b[1;1Hdone   "
+    assert ssh_chat.render_terminal_text(redrawn, cols=20, rows=5).strip() == "done"
+
+
+def test_the_alternate_screen_counts_as_drawing():
+    full_screen = "\x1b[?1049h\x1b[2;4Hinside the full-screen app"
+    rendered = ssh_chat.render_terminal_text(full_screen, cols=40, rows=6)
+    assert "inside the full-screen app" in rendered
+
+
+def test_blank_padding_around_a_drawn_screen_is_dropped():
+    """Most of a drawn screen is the terminal's empty rows, not the program's."""
+    drawn = "\x1b[2J\x1b[4;1Honly this line"
+    assert ssh_chat.render_terminal_text(drawn, cols=30, rows=20) == "only this line"
+
+
+def test_malformed_output_still_produces_a_reply():
+    """A turn must not be lost to a byte sequence no terminal would emit."""
+    broken = "\x1b[2J\x1b[999999999999;1Hstill here\x1b[\x1b[\x1b"
+    assert "still here" in ssh_chat.render_terminal_text(broken, cols=40, rows=10)

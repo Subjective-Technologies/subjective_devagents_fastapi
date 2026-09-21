@@ -71,15 +71,72 @@ _ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ANSI_OTHER = re.compile(r"\x1b[()#][0-9A-Za-z]|\x1b[=>]|\x1b[PX^_][^\x1b]*\x1b\\")
 
 
-def clean_terminal_text(text: str) -> str:
-    """Turn raw terminal output into something a chat bubble can show.
+# Sequences that place text somewhere other than "after the last character":
+# cursor addressing, relative cursor motion, erases, and the alternate screen a
+# full-screen program switches to. Their presence is what decides whether output
+# can simply have its escapes removed or has to be *drawn*.
+_POSITIONING = re.compile(
+    r"\x1b\[\?(?:1049|47|1047)[hl]"      # alternate screen
+    r"|\x1b\[[0-9;]*[HfABDEFGd]"          # cursor addressing and motion
+    r"|\x1b\[[0-2]?J"                    # erase display
+    r"|\x1b[78M]"                         # save/restore cursor, reverse index
+)
 
-    Escape sequences are removed rather than interpreted: reproducing cursor motion
-    would mean implementing a terminal emulator, and for the command output that
-    makes up almost every turn, stripping is both correct and enough. A full-screen
-    program's redraws survive as repeated text — ugly, but honest, and the pty
-    console at /ssh renders those properly.
+
+def render_terminal_text(text: str, cols: int = 0, rows: int = 0) -> str:
+    """Turn raw terminal output into what the screen actually looked like.
+
+    Two paths, because the two kinds of output need opposite treatment.
+
+    Ordinary command output only ever appends: `ls`, a build log, a diff. Its
+    escapes are colour, and removing them leaves exactly the right text — every
+    line, in order, however long the output ran.
+
+    A full-screen program does not append, it *positions*: it clears the screen and
+    writes each fragment at a row and column. Removing those escapes concatenates
+    everything that was spread across the screen, which is how "Do you trust the
+    contents of this directory?" arrived as `Doyoutrustthecontentsofthisdirectory?`
+    with box-drawing debris around it. The only way to read that back is to run the
+    sequences against a screen and see where the text lands, so that is what happens
+    here — the same job xterm.js does for the /ssh console, done server-side for a
+    chat bubble that cannot run one.
+
+    Emulation is not the default because a screen has a fixed height: output longer
+    than it scrolls off, which for a 10,000-line log would be a catastrophe and for
+    a full-screen program is simply what the operator sees.
     """
+    if _POSITIONING.search(text or ""):
+        return _draw(text, cols or COLS, rows or ROWS)
+    return clean_terminal_text(text)
+
+
+def _draw(text: str, cols: int, rows: int) -> str:
+    """Replay the output against a virtual screen and read the result back."""
+    try:
+        import pyte
+    except ImportError:  # pragma: no cover - pyte is a declared dependency
+        return clean_terminal_text(text)
+
+    # Taller than the real session: a program that drew a few screens in one turn
+    # then keeps the last one, rather than losing everything above the fold.
+    screen = pyte.Screen(max(20, cols), max(10, rows))
+    stream = pyte.Stream(screen)
+    try:
+        stream.feed(text)
+    except Exception:  # noqa: BLE001 — malformed output must not lose the turn
+        return clean_terminal_text(text)
+    lines = [line.rstrip() for line in screen.display]
+    # A drawn screen is mostly padding; the blank rows below the content are the
+    # terminal's, not the program's.
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def clean_terminal_text(text: str) -> str:
+    """Strip escapes from output that only ever appended. See render_terminal_text."""
     text = _ANSI_OSC.sub("", text)
     text = _ANSI_CSI.sub("", text)
     text = _ANSI_OTHER.sub("", text)
@@ -261,7 +318,7 @@ class _Session:
             time.sleep(0.05)
 
         raw = "".join(collected)
-        reply = clean_terminal_text(raw)
+        reply = render_terminal_text(raw, COLS, ROWS)
         # The marker is the boundary, not content. Everything after the last one is
         # the shell redrawing its prompt for the next turn.
         if TURN_MARK in reply:
