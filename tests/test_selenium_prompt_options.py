@@ -36,6 +36,7 @@ uvicorn = pytest.importorskip("uvicorn")
 from selenium import webdriver  # noqa: E402
 from selenium.webdriver.chrome.options import Options  # noqa: E402
 from selenium.webdriver.chrome.service import Service  # noqa: E402
+from selenium.webdriver.common.action_chains import ActionChains  # noqa: E402
 from selenium.webdriver.common.by import By  # noqa: E402
 from selenium.webdriver.support import expected_conditions as EC  # noqa: E402
 from selenium.webdriver.support.ui import WebDriverWait  # noqa: E402
@@ -429,3 +430,67 @@ def test_nothing_covers_the_option_button_inside_an_iframe(live_server, driver):
         )
     finally:
         driver.switch_to.default_content()
+
+
+def _switch_to_two_panes(driver) -> None:
+    """Put the UI into the 1x2 grid the reporter was using."""
+    driver.find_element(By.ID, "frameLayoutToggle").click()
+    WebDriverWait(driver, 5).until(
+        lambda d: d.find_element(By.ID, "frameLayoutPopover").is_displayed()
+    )
+    cell = driver.find_element(
+        By.CSS_SELECTOR, '.frame-layout-cell[data-row="1"][data-col="2"]'
+    )
+    cell.click()
+    WebDriverWait(driver, 5).until(
+        lambda d: d.find_element(By.ID, "chatFrames").get_attribute("data-layout") == "1x2"
+    )
+
+
+def test_clicking_an_option_works_in_the_two_pane_layout(live_server, driver):
+    """The case every earlier test missed, and the one the bug was reported in.
+
+    In a grid, each pane focused itself on `pointerdown` — which re-rendered its
+    transcript. The element under the cursor was therefore replaced between the
+    press and the release, so the browser never raised a click on the button: the
+    only request the network panel showed was the activate-conversation that the
+    focus itself had sent, and the option appeared dead.
+
+    Everything about this reproduction matters: single-pane mode does not focus
+    anything, and a synthetic dispatchEvent would sail past the problem because it
+    does not involve a press and a release at all.
+    """
+    driver.set_window_size(1600, 1000)
+    target = _create_conversation(live_server)
+    driver.get(live_server)
+    wait = WebDriverWait(driver, 15)
+    wait.until(EC.presence_of_element_located((By.ID, "createLlmButton")))
+    _switch_to_two_panes(driver)
+
+    row = wait.until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, f'tr.conversation-row[data-target="{target}"]'))
+    )
+    row.click()
+    _inject_question(live_server, target, "Should I proceed with this change?")
+    wait.until(lambda d: _prompt_action_button(d, "Yes") is not None)
+
+    # A *held* press, not Selenium's instant click. The pane re-renders itself on a
+    # scheduled frame, so an instant press-and-release finishes before the rebuild
+    # lands and survives it — which is precisely why every earlier automated test
+    # passed while people kept reporting dead buttons. A human holds the mouse down
+    # for a tenth of a second, the rebuild happens underneath, and the release lands
+    # on a replaced element, so no click is ever raised.
+    yes_button = _prompt_action_button(driver, "Yes")
+    ActionChains(driver).move_to_element(yes_button).click_and_hold().pause(0.25) \
+        .release().perform()
+
+    # The click must reach the handler. Before the fix this waited forever: the
+    # button was never clicked, so nothing was ever disabled and no send was sent.
+    WebDriverWait(driver, 10).until(
+        lambda d: (_prompt_action_button(d, "Yes") is None
+                   or _prompt_action_button(d, "Yes").get_attribute("disabled") is not None)
+    )
+    # And the answer must be visible, which is the part a reader actually judges by.
+    WebDriverWait(driver, 10).until(
+        lambda d: "Yes" in d.find_element(By.CSS_SELECTOR, ".chat-frame .transcript").text
+    )
