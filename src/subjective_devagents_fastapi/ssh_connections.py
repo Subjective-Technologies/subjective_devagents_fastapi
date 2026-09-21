@@ -52,6 +52,7 @@ EDITABLE_FIELDS = frozenset({
     "key_passphrase",
     "known_hosts_path",
     "host_key_fingerprint",
+    "host_key_policy",
     "strict_host_key_checking",
     "working_directory",
     "shell",
@@ -60,6 +61,10 @@ EDITABLE_FIELDS = frozenset({
 # Never returned by any read, and never logged.
 SECRET_FIELDS = frozenset({"password", "key_passphrase"})
 AUTH_METHODS = ("agent", "private_key_path", "password")
+# accept-new trusts a machine's key the first time and refuses it if it ever
+# changes. strict cannot reach a machine this server has never met, which is every
+# new machine; off verifies nothing.
+HOST_KEY_POLICIES = ("accept-new", "strict", "off")
 
 # Long enough for a descriptive name, short enough to stay a label.
 MAX_NAME = 120
@@ -244,7 +249,14 @@ def _clean(payload: dict, existing: dict | None = None) -> dict:
         if field in (payload or {}) and not payload[field]:
             result.pop(field, None)
 
-    if "strict_host_key_checking" in result:
+    policy = str(result.get("host_key_policy") or "").strip()
+    if policy and policy not in HOST_KEY_POLICIES:
+        raise ValueError(f"Host key checking must be one of: {', '.join(HOST_KEY_POLICIES)}.")
+    if policy:
+        result["host_key_policy"] = policy
+        # The boolean this replaced would otherwise keep overriding the choice.
+        result.pop("strict_host_key_checking", None)
+    elif "strict_host_key_checking" in result:
         result["strict_host_key_checking"] = bool(result["strict_host_key_checking"])
     return result
 

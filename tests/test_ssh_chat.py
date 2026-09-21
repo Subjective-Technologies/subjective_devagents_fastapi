@@ -306,3 +306,43 @@ class TestAgainstARealHost:
         say("live", connection, "cd /tmp && MARKER=kept")
         assert say("live", connection, "echo $MARKER; pwd")["response"] == "kept\n/tmp"
         assert "No such file" in say("live", connection, "ls /nonexistent")["response"]
+
+
+# --- what a failure says --------------------------------------------------------------
+
+
+def test_a_refused_connection_reports_what_ssh_said(tmp_path):
+    """A generic "did not respond" threw away the one thing worth knowing.
+
+    ssh has almost always already explained itself — a rejected key, an unknown host
+    key, a refused port — and reporting a timeout instead left nothing to act on.
+    Production hit exactly this: the real message was "Host key verification failed"
+    and the operator saw "The remote shell did not respond."
+    """
+    failing = tmp_path / "failing-ssh"
+    failing.write_text(
+        "#!/bin/sh\n"
+        "echo 'No ED25519 host key is known for 10.0.0.1 and you have requested strict checking.' >&2\n"
+        "echo 'Host key verification failed.' >&2\n"
+        "exit 255\n",
+        encoding="utf-8",
+    )
+    failing.chmod(0o755)
+    result = say("t", {"host": "10.0.0.1", "ssh_path": str(failing)}, "hostname")
+    assert result["status"] == "connection_failed"
+    assert "Host key verification failed" in result["error"]
+    assert "did not respond" not in result["error"]
+
+
+def test_the_diagnostic_does_not_quote_our_own_setup_commands(tmp_path):
+    """Echo is on during setup, so the transcript contains the marker commands the
+    shell was sent — as split spellings no whole-marker filter would catch."""
+    failing = tmp_path / "failing-ssh"
+    failing.write_text(
+        "#!/bin/sh\nread line\necho \"$line\"\necho 'Permission denied (publickey).' >&2\nexit 255\n",
+        encoding="utf-8",
+    )
+    failing.chmod(0o755)
+    result = say("t", {"host": "h", "ssh_path": str(failing)}, "hostname")
+    assert "Permission denied" in result["error"]
+    assert "SUBJECTIVE_SSH" not in result["error"]

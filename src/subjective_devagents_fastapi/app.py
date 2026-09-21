@@ -1338,6 +1338,7 @@ async def api_ssh_connections() -> dict:
         "keys": keys,
         "configHosts": hosts,
         "authMethods": list(ssh_connections.AUTH_METHODS),
+        "hostKeyPolicies": list(ssh_connections.HOST_KEY_POLICIES),
     }
 
 

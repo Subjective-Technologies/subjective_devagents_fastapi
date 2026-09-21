@@ -48,6 +48,8 @@ READY_MARK = "__SUBJECTIVE_SSH_READY__"
 # real output ever contain the whole marker.
 _TURN_MARK_TYPED = '"__SUBJECTIVE_SSH""_TURN__"'
 _READY_MARK_TYPED = '"__SUBJECTIVE_SSH""_READY__"'
+# What every spelling of both markers has in common, split or whole.
+_MARK_PREFIX = "__SUBJECTIVE_SSH"
 
 
 # A turn ends when output has been this quiet, for programs that never return to a
@@ -149,8 +151,12 @@ class _Session:
         # round trip first.
         self.pty.write(f"echo {_READY_MARK_TYPED}\r")
         if not self._await(READY_MARK, SETUP_TIMEOUT):
+            detail = self._diagnostic()
             self.close()
-            raise RuntimeError("The remote shell did not respond.")
+            # ssh has usually already said exactly what went wrong — "Host key
+            # verification failed", "Permission denied (publickey)" — and reporting a
+            # generic timeout instead threw that away and left nothing to act on.
+            raise RuntimeError(detail or "The remote shell did not respond.")
         self._take()
 
         # PS1 is what makes a turn boundary exact instead of guessed. The rest keeps
@@ -163,8 +169,9 @@ class _Session:
             f"PS1={_TURN_MARK_TYPED}; PS2=''\r"
         )
         if not self._await(TURN_MARK, SETUP_TIMEOUT):
+            detail = self._diagnostic()
             self.close()
-            raise RuntimeError("The remote shell did not accept its configuration.")
+            raise RuntimeError(detail or "The remote shell did not accept its configuration.")
         self._settle()
 
     def close(self) -> None:
@@ -187,6 +194,29 @@ class _Session:
                 break
             time.sleep(0.05)
         self._take()
+
+    def _diagnostic(self) -> str:
+        """Whatever ssh said before giving up, as the reason to show the operator.
+
+        A failure to connect is almost always self-explaining on the stream — a
+        rejected key, an unknown host key, a refused port — and that text is worth
+        far more than anything this module could infer from the fact of the timeout.
+        """
+        with self.buffer_lock:
+            text = clean_terminal_text("".join(self.buffer))
+        # Filter on the shared prefix, not the whole markers: echo is still on
+        # during setup, so the transcript contains the *split* spellings the shell
+        # was sent, which no whole-marker test matches.
+        lines = [
+            line.strip() for line in text.splitlines()
+            if line.strip() and _MARK_PREFIX not in line
+        ]
+        if not lines:
+            return ""
+        detail = " ".join(lines[-4:])[:400]
+        if self.closed_code is not None:
+            return f"{detail} (ssh exited with code {self.closed_code})"
+        return detail
 
     def _await(self, marker: str, timeout: float) -> bool:
         """Wait for a marker during setup, leaving the buffer intact."""

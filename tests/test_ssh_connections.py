@@ -327,3 +327,35 @@ def test_an_uploaded_key_works_as_a_connections_key(home):
     })
     settings = ssh_connections.connection_settings(home, f"saved:{created['id']}")
     assert settings["private_key_path"] == saved["path"]
+
+
+# --- host key policy -------------------------------------------------------------------
+
+
+def test_the_default_policy_trusts_a_new_host_once(home):
+    """Strict cannot reach a machine this server has never met — which is every new
+    machine — so it cannot be the default for a feature whose point is reaching them."""
+    created = ssh_connections.create(home, {"host": "h"})
+    settings = ssh_connections.connection_settings(home, f"saved:{created['id']}")
+    assert settings.get("host_key_policy", "accept-new") == "accept-new"
+
+
+def test_a_policy_can_be_chosen(home):
+    created = ssh_connections.create(home, {"host": "h", "host_key_policy": "strict"})
+    assert created["host_key_policy"] == "strict"
+
+
+def test_an_unknown_policy_is_refused(home):
+    with pytest.raises(ValueError) as caught:
+        ssh_connections.create(home, {"host": "h", "host_key_policy": "maybe"})
+    assert "Host key checking" in str(caught.value)
+
+
+def test_choosing_a_policy_clears_the_boolean_it_replaced(home):
+    """Otherwise the old field keeps overriding the new choice."""
+    created = ssh_connections.create(home, {
+        "host": "h", "strict_host_key_checking": True, "host_key_policy": "off",
+    })
+    stored = ssh_connections.get(home, created["id"])
+    assert stored["host_key_policy"] == "off"
+    assert "strict_host_key_checking" not in stored
