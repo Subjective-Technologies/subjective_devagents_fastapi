@@ -30,6 +30,7 @@ serves history when a plugin is absent.
 """
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import re
@@ -224,6 +225,28 @@ def run(
     if not isinstance(result, dict):
         return {"success": True, "status": "completed", "result": result}
     return result
+
+
+def ssh_runner_for(app_home: str, connection_id: str):
+    """A CommandRunner that puts an agent CLI on another machine.
+
+    This is the join between two plugins that know nothing about each other: the
+    SSH datasource supplies the transport, the CLI datasource consumes a runner,
+    and the wiring happens here because the service is the only layer that knows
+    both exist. Returns None when the pieces are missing, so a chat degrades to an
+    honest failure rather than silently running the agent on the wrong machine.
+    """
+    from . import ssh_connections, ssh_terminal
+
+    ssh_terminal.ensure_available()
+    settings = ssh_connections.connection_settings(app_home, f"saved:{connection_id}")
+    datasource = instantiate(load("ssh"), settings)
+    module = sys.modules.get("subjective_devagents_ds_ssh")
+    runner_module = importlib.import_module("ssh_runner") if module else None
+    if runner_module is None:
+        raise LookupError("The SSH datasource is not loaded, so its runner is unavailable.")
+    label = settings.get("host") or connection_id
+    return runner_module.SshCommandRunner(datasource, label=label)
 
 
 def connection_for(provider: str, workspace: str = "", session_id: str = "", timeout: int | None = None,

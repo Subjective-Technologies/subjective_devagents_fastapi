@@ -694,6 +694,10 @@ class LlmService:
             # Which OS user this conversation's CLI calls run as. None means the OS user
             # currently running the service — purely additive "Continue as…" field.
             "osUser": str(payload["osUser"]) if payload.get("osUser") else None,
+            # Which saved SSH connection this chat's agent runs on, if any. Part of
+            # the returned shape because this function defines it: a key missing
+            # from here is dropped on every load and every save.
+            "sshConnection": str(payload["sshConnection"]) if payload.get("sshConnection") else None,
             "sourceUser": resolve_source_user(payload, source_file, origin),
             "icon": provider_icon(provider),
             "participants": [
@@ -1023,9 +1027,17 @@ class LlmService:
         return self.codex_runtime
 
     def create_conversation(
-        self, provider: Any = None, name: str = "", workspace: str = "", os_user: str = ""
+        self, provider: Any = None, name: str = "", workspace: str = "", os_user: str = "",
+        ssh_connection: str = "",
     ) -> dict:
         """`os_user` picks whose CLI login answers this chat.
+
+        `ssh_connection` names a saved SSH connection, and makes this an agent chat
+        whose CLI runs on that machine instead of this one. It is stored rather than
+        resolved now, so the credentials it points at can change without the chat
+        having to be recreated. It is orthogonal to `os_user`: one picks a local
+        account, the other picks a different computer, and setting both is refused
+        by send_message rather than silently preferring one.
 
         Each agent's credentials live in a home directory, so "Codex" is really "Codex as
         <someone>" — and which logins exist differs per user. Naming the account at
@@ -1052,6 +1064,7 @@ class LlmService:
                     else f"{label} CLI conversation"
                 ),
                 "workspace": str(workspace or self.root).strip() or self.root,
+                "sshConnection": str(ssh_connection or "").strip() or None,
                 "sourceUser": owner,
                 # Only tag a chat with an owner when it is not the service account's own:
                 # send_message treats a set osUser as "route through that user's session".
@@ -1709,7 +1722,16 @@ class LlmService:
                 pass
             runtime_path = self._runtime_for(source["provider"])
 
+            # An agent chat bound to a saved SSH connection runs its CLI on that
+            # machine. The runner is built per turn and torn down after: its
+            # multiplexed socket lingers briefly on its own, so a following turn
+            # still skips the handshake, and nothing holds a connection open
+            # between messages that may be hours apart.
+            ssh_connection_id = str(conversation.get("sshConnection") or "")
+            remote_runner = None
+
             def run_once() -> dict:
+                nonlocal remote_runner
                 if provider["bundle"] == "ssh":
                     # An SSH chat is not a datasource turn. Its shell has to outlive
                     # the message so `cd`, `export` and a half-answered `sudo` prompt
@@ -1737,8 +1759,17 @@ class LlmService:
                     return self._run_pipeline_for_user(
                         conversation["osUser"], runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
                     )
+                extra = None
+                if ssh_connection_id:
+                    from . import datasources as datasources_module
+
+                    if remote_runner is None:
+                        remote_runner = datasources_module.ssh_runner_for(
+                            self.app_home, ssh_connection_id
+                        )
+                    extra = {"command_runner": remote_runner}
                 return self._run_datasource(
-                    source["provider"], request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
+                    source["provider"], request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS, extra=extra
                 ) or self._run_pipeline(runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS)
 
             # A turn can block for a long time inside run_once() with no visible sign of
@@ -1777,9 +1808,28 @@ class LlmService:
                     })
                     time.sleep(10.0 * (attempt + 1))
                     pipeline_response = run_once()
+            except LookupError as error:
+                # The saved connection is gone, or SSH is switched off on this
+                # service. Either way the agent must not quietly run here instead.
+                self.log("error", "Remote agent turn could not start", {
+                    "target": target, "provider": source["provider"], "error": str(error),
+                })
+                rollback_user_message()
+                return {
+                    "ok": False,
+                    "status": "configuration_required",
+                    "error": f"This chat runs on another machine, and that is not reachable: {error}",
+                }
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=1)
+                if remote_runner is not None:
+                    try:
+                        remote_runner.cleanup()
+                    except Exception as error:  # noqa: BLE001
+                        self.log("warn", "Remote runner cleanup failed", {
+                            "target": target, "error": str(error),
+                        })
             result = self._pipeline_result(pipeline_response)
             if not result.get("success"):
                 # A turn the operator stopped is not a failure. Keep the prompt they sent
@@ -1897,7 +1947,9 @@ class LlmService:
             return result
         return {"success": True, "status": "completed", "result": result}
 
-    def _run_datasource(self, provider: str, payload: dict, timeout_seconds: float) -> dict | None:
+    def _run_datasource(
+        self, provider: str, payload: dict, timeout_seconds: float, extra: dict | None = None
+    ) -> dict | None:
         """Call the datasource module directly, or return None to fall back to the bundle.
 
         These are the same `subjective_*_datasource` packages the monolithic web app uses,
@@ -1936,6 +1988,7 @@ class LlmService:
                 workspace=str(payload.get("working_directory") or ""),
                 session_id=str(payload.get("session_id") or ""),
                 timeout=int(timeout_seconds),
+                extra=extra,
             )
             target = str(payload.get("target") or "")
 
