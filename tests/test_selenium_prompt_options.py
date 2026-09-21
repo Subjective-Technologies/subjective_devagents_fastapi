@@ -494,3 +494,41 @@ def test_clicking_an_option_works_in_the_two_pane_layout(live_server, driver):
     WebDriverWait(driver, 10).until(
         lambda d: "Yes" in d.find_element(By.CSS_SELECTOR, ".chat-frame .transcript").text
     )
+
+
+def test_the_composer_keeps_focus_after_sending(live_server, driver):
+    """Enter sends, and the cursor must still be in the box afterwards.
+
+    It was not: sending marks the conversation busy, busy disabled the textarea,
+    and a disabled control cannot hold focus — so every message had to be followed
+    by clicking back into the box before the next could be typed.
+    """
+    driver.set_window_size(1280, 900)
+    target = _create_conversation(live_server)
+    driver.get(live_server)
+    wait = WebDriverWait(driver, 15)
+    wait.until(EC.presence_of_element_located((By.ID, "createLlmButton")))
+    row = wait.until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, f'tr.conversation-row[data-target="{target}"]'))
+    )
+    row.click()
+
+    # The live composer is the focused pane's own, not the outer one: the frame
+    # layout gives every pane a composer and rebinds the renderer's `input` to it.
+    composer = wait.until(EC.element_to_be_clickable((
+        By.CSS_SELECTOR, ".chat-frame.is-focused textarea, #composer textarea"
+    )))
+    composer.click()
+    composer.send_keys("first message")
+    composer.send_keys("")  # Enter
+
+    WebDriverWait(driver, 10).until(lambda d: composer.get_attribute("value") == "")
+    assert driver.switch_to.active_element == composer, (
+        "the composer lost focus after sending; the next message cannot be typed "
+        "without clicking back into it"
+    )
+    # And it must accept the next message straight away, rather than being disabled
+    # for as long as the agent takes.
+    assert composer.is_enabled(), "the composer is disabled while the agent works"
+    composer.send_keys("second message")
+    assert composer.get_attribute("value") == "second message"
