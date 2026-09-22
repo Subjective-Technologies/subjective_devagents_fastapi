@@ -29,11 +29,16 @@ chat to the same host is a genuinely separate shell.
 """
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
 
 from . import datasources, ssh_terminal
+
+_log = logging.getLogger(__name__)
+# Set once the missing-dependency warning has been given; see _draw.
+_warned_about_pyte = False
 
 # The prompt this module installs. Distinctive enough that ordinary output will not
 # contain it, and stripped before the reply is shown.
@@ -151,6 +156,18 @@ def _draw(text: str, cols: int, rows: int) -> str:
     try:
         import pyte
     except ImportError:  # pragma: no cover - pyte is a declared dependency
+        # Falling back is right — losing the turn over a missing dependency would
+        # be worse — but doing it quietly is not: what comes back is the
+        # concatenated text this function exists to prevent, and it looks like a
+        # rendering bug rather than an install that skipped a dependency. Said
+        # once, because a chatty agent would otherwise repeat it every turn.
+        global _warned_about_pyte
+        if not _warned_about_pyte:
+            _warned_about_pyte = True
+            _log.error(
+                "pyte is not installed, so a full-screen program's output will be "
+                "concatenated instead of drawn. Reinstall this service's dependencies."
+            )
         return clean_terminal_text(text)
 
     # Taller than the real session: a program that drew a few screens in one turn
