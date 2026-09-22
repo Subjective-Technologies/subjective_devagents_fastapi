@@ -1611,6 +1611,11 @@ def _stamp_api_base(html: str) -> str:
                 lambda match: match.group(0) if match.group(0).strip() in {
                     "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com",
                     "https://www.googleapis.com", "https://subjectivetechnologies-login.firebaseapp.com",
+                    # Cloudflare injects its Web Analytics beacon into every HTML response on
+                    # the zone; the beacon posts its measurements to this origin. Dropping it
+                    # here would leave script-src allowing the script and connect-src blocking
+                    # what it sends, which is the CSP violation the browser logs complain about.
+                    "https://cloudflareinsights.com",
                 } else "", directive_match.group(1),
             ).rstrip()
             return f"{directive} {base};" if base else f"{directive};"

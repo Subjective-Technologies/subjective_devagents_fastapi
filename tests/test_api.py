@@ -451,7 +451,19 @@ def test_stamping_rewrites_the_real_pages_policy_not_its_prose(monkeypatch):
     same_origin = _stamp_api_base(html)
     policy = re.search(r'<meta\s+http-equiv="Content-Security-Policy"[^>]*>', same_origin).group(0)
     connect = re.search(r"connect-src[^;\"]*;", policy).group(0)
-    assert "http" not in connect, f"same-origin policy still names a host: {connect}"
+    # Same-origin means the page names no *API* host. The fixed allowlist the page needs
+    # whatever the deployment is — Firebase auth, and the Cloudflare Web Analytics beacon
+    # the zone injects into every HTML response — is kept on purpose, so assert on which
+    # hosts survive rather than on "no host at all".
+    allowed = {
+        "https://identitytoolkit.googleapis.com",
+        "https://securetoken.googleapis.com",
+        "https://www.googleapis.com",
+        "https://subjectivetechnologies-login.firebaseapp.com",
+        "https://cloudflareinsights.com",
+    }
+    hosts = set(re.findall(r"https?://[^\s;]+", connect))
+    assert hosts <= allowed, f"same-origin policy names an API host: {sorted(hosts - allowed)}"
     assert '<meta name="devagents-api" content="">' in same_origin
 
 
