@@ -757,7 +757,7 @@ async def api_llm_providers() -> dict:
 @app.get("/api/llm/status")
 async def api_llm_status(provider: str = Query(default="codex")) -> dict:
     result = await asyncio.to_thread(core().llm_service.status, provider)
-    return {"ok": bool(result.get("success")), **result}
+    return {"ok": bool(result.get("success") or result.get("status") == "ready"), **result}
 
 
 @app.get("/api/llm/sessions")
@@ -1708,4 +1708,9 @@ async def serve_static(path: str) -> Response:
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, error: Exception) -> JSONResponse:
     default_log("error", "API handler failed", {"route": str(request.url.path), "message": str(error)})
-    return JSONResponse(status_code=400, content={"ok": False, "error": str(error)})
+    response = JSONResponse(status_code=400, content={"ok": False, "error": str(error)})
+    response.headers.setdefault("X-DevAgents-Version", state.deploy_version)
+    response.headers.setdefault("X-DevAgents-Backend-Version", state.backend_version)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response

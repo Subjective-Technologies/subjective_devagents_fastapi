@@ -873,6 +873,7 @@ class LlmService:
                         "osUser": conversation["osUser"],
                         "sourceUser": conversation["sourceUser"],
                         "workspace": conversation["workspace"],
+                        "sshConnection": conversation["sshConnection"],
                         "ircChannel": conversation["ircChannel"],
                         "exportPath": conversation["exportPath"],
                         "historyExportPath": conversation["historyExportPath"],
