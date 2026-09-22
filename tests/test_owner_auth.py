@@ -60,15 +60,34 @@ def test_owner_uid_or_verified_email(owner_client, signer, changes):
     assert owner_client.get('/api/auth/session', headers={'Authorization': 'Bearer '+signer(**changes)}).status_code == 200
 
 
+class Relative:
+    """A claim time expressed as an offset, resolved when the test runs.
+
+    A parametrize list is built once, at import. `int(time.time()) + 120` written
+    there freezes "two minutes from now" at collection, so the future auth_time
+    case stopped being in the future as soon as a full run took longer than two
+    minutes to reach it — and the test then failed, having quietly stopped
+    testing what it claims some time before that.
+    """
+
+    def __init__(self, seconds: int):
+        self.seconds = seconds
+
+    def resolve(self) -> int:
+        return int(time.time()) + self.seconds
+
+
 @pytest.mark.parametrize('changes', [
     {'sub': 'other', 'email': 'other@example.com', 'email_verified': True},
     {'sub': 'other', 'email': auth.OWNER_EMAIL, 'email_verified': False},
-    {'exp': int(time.time()) - 120},
+    {'exp': Relative(-120)},
     {'aud': 'wrong-project'},
     {'iss': 'https://securetoken.google.com/wrong-project'},
-    {'auth_time': int(time.time()) + 120},
+    {'auth_time': Relative(+120)},
 ])
 def test_invalid_identity_and_claims_rejected(owner_client, signer, changes):
+    changes = {key: value.resolve() if isinstance(value, Relative) else value
+               for key, value in changes.items()}
     assert owner_client.get('/api/config', headers={'Authorization': 'Bearer '+signer(**changes)}).status_code == 401
 
 

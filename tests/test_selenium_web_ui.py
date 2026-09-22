@@ -29,10 +29,9 @@ import pytest
 
 SERVICE_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(SERVICE_ROOT / "src"))
-CLIENT_ROOT = Path(os.environ.get(
-    "SUBJECTIVE_DEVAGENTS_TEST_CLIENT_ROOT",
-    str(SERVICE_ROOT.parent.parent / "clients" / "desktop" / "subjective_chat"),
-))
+from browser_support import resolve_client_root  # noqa: E402
+
+CLIENT_ROOT = resolve_client_root()
 
 selenium = pytest.importorskip("selenium", reason="pip install selenium to run the browser E2E tests")
 requests = pytest.importorskip("requests")
