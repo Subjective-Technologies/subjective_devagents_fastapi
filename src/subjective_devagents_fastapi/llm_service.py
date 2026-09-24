@@ -328,14 +328,15 @@ def prefer_conversation_label(existing: Any, incoming: Any, provider: Any) -> st
     return nxt
 
 
-def _with_prompt_options(messages: list) -> list:
+def _with_prompt_options(messages: list, provider: str | None = None) -> list:
     """Attach promptOptions to the trailing assistant message — the only one the UI offers
-    choices for. A copy, so the stored transcript is never touched."""
+    choices for. A copy, so the stored transcript is never touched. The provider decides
+    what an answer must look like; see prompt_options.annotate_message."""
     from . import prompt_options
 
     if not messages or messages[-1].get("role") != "assistant":
         return messages
-    annotated = prompt_options.annotate_message(messages[-1])
+    annotated = prompt_options.annotate_message(messages[-1], provider)
     if annotated is messages[-1]:
         return messages
     return [*messages[:-1], annotated]
@@ -346,13 +347,13 @@ def tail_conversation_for_client(conversation: dict | None, limit: int = HYDRATE
         return conversation
     total = len(conversation["messages"])
     if total <= limit:
-        annotated = _with_prompt_options(conversation["messages"])
+        annotated = _with_prompt_options(conversation["messages"], conversation.get("provider"))
         if annotated is conversation["messages"]:
             return conversation
         return {**conversation, "messages": annotated}
     return {
         **conversation,
-        "messages": _with_prompt_options(conversation["messages"][-limit:]),
+        "messages": _with_prompt_options(conversation["messages"][-limit:], conversation.get("provider")),
         "messageCount": int(conversation.get("messageCount") or total),
         "truncated": True,
         "hiddenBefore": total - limit,

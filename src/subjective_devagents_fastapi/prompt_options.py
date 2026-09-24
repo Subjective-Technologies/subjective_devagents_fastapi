@@ -94,25 +94,180 @@ def _detect_enumerated(prose: str, tail: str) -> list[dict]:
     return []
 
 
-def extract_prompt_options(text: Any) -> dict:
+def _slug(value: str, fallback: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return slug[:40] or fallback
+
+
+def _option_item(line: str) -> tuple[str, str] | None:
+    """A list item as (marker, text) — "- Brief" -> ("", "Brief"), "2) Ubuntu" -> ("2",
+    "Ubuntu") — or None when the line is not a list item at all. The marker matters over
+    SSH: a shell `select` menu is answered with the number it printed, not with the word."""
+    match = re.match(r"^[ \t]*(?:([0-9]{1,2}|[A-Za-z])[.)]|[-*•‣▪])[ \t]+(\S.*)$", line)
+    if not match:
+        return None
+    return (match.group(1) or "", match.group(2).strip())
+
+
+def _question_text(line: str) -> str | None:
+    """The question a line asks, with any list/step numbering stripped ("2. Which style?"),
+    or None when the line does not end in a question mark."""
+    head, mark, rest = line.strip().rpartition("?")
+    if not mark:
+        return None
+    # "Which style? Optional: add context." — agents often put a short aside after the
+    # question on the same line. Anything longer than an aside means the "?" was somewhere
+    # in the middle of a paragraph, and the list below it is not its menu.
+    if len(rest.strip()) > 80:
+        return None
+    # Only the closing sentence is the question: "I can do that in three ways. Which one?"
+    sentence = re.split(r"(?<=[.!])\s+", f"{head}?")[-1]
+    without_marker = re.sub(r"^(?:[-*•‣▪]|\*{0,2}\d{1,2}[.)]\*{0,2})[ \t]+", "", sentence)
+    return re.sub(r"^\*+|\*+$", "", without_marker).strip() or None
+
+
+def _menu_options(items: list[tuple[str, str]], answer_with_marker: bool = False) -> list[dict]:
+    """Turn the collected list items into options. The item text is both the label and the
+    reply: an agent that wrote "Detailed" as a choice understands "Detailed" as the answer,
+    which no mapping table can improve on.
+
+    `answer_with_marker` is the SSH case. There the other end is a program, not a model:
+    `select` and "1) Debian 2) Ubuntu #?" read the number they printed and nothing else, so
+    the reply is the marker while the label still shows the operator what it means.
+    """
+    options: list[dict] = []
+    seen: set[str] = set()
+    for index, (marker, item) in enumerate(items):
+        # "Brief — short answers" / "Brief: short answers": the head is the choice, the
+        # rest explains it, which is exactly the label/description split the UI draws.
+        split = re.match(r"^(.{1,60}?)\s*(?:[—–:-]\s+|\s+[—–]\s*)(\S.*)$", item)
+        label = (split.group(1) if split else item).strip().rstrip(".").strip()
+        description = split.group(2).strip() if split else ""
+        if not label or label.lower() in seen:
+            continue
+        seen.add(label.lower())
+        if answer_with_marker and marker:
+            reply = marker
+        elif split:
+            reply = label[:60]
+        else:
+            reply = item.strip()[:200]
+        options.append({
+            "id": _slug(label, f"opt-{index + 1}"),
+            "label": label[:60],
+            "description": description[:120],
+            "reply": reply,
+        })
+    return options
+
+
+def _detect_question_blocks(prose: str, answer_with_marker: bool = False) -> list[dict]:
+    """Questions whose choices are spelled out as a list underneath them.
+
+    This is what agents actually write when asked for a menu:
+
+        Which response style?
+        - Brief
+        - Detailed
+        - Step by step
+
+    The lettered form ("A. ...", answered with "A") is handled by _detect_enumerated, which
+    reads options written *before* a closing question. This one reads options written
+    *after* the question they belong to, keeps their own words as the reply, and collects
+    every such block so one message can ask several questions at once.
+
+    The list has to sit directly under the question, or an unrelated list of findings that
+    happens to follow a question would become a menu. Items must be short and none of them
+    may be a question itself, for the same reason.
+    """
+    lines = prose.splitlines()
+    blocks: list[dict] = []
+    index = 0
+    while index < len(lines):
+        question = _question_text(lines[index])
+        if not question:
+            index += 1
+            continue
+        cursor = index + 1
+        # One blank line between the question and its list is normal formatting; two mean
+        # the list has stopped belonging to the question.
+        if cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        items: list[tuple[str, str]] = []
+        while cursor < len(lines):
+            line = lines[cursor]
+            if not line.strip():
+                # A blank line inside the list is only a gap if more items follow it.
+                following = cursor + 1
+                if following < len(lines) and _option_item(lines[following]) and items:
+                    cursor += 1
+                    continue
+                break
+            item = _option_item(line)
+            if item is None or len(item[1]) > 80 or item[1].endswith("?"):
+                break
+            items.append(item)
+            cursor += 1
+        options = _menu_options(items, answer_with_marker) if len(items) >= 2 else []
+        if len(options) >= 2 and len(options) <= 8:
+            blocks.append({"question": question, "options": options})
+            index = cursor
+            continue
+        index += 1
+    return blocks
+
+
+def is_shell_provider(provider: Any) -> bool:
+    """An SSH chat is a shell, not a model. Its replies must be what a program reads."""
+    return str(provider or "").strip().lower() == "ssh"
+
+
+def extract_prompt_options(text: Any, provider: Any = None) -> dict:
     """Return the structured choices an assistant reply is offering, or {asks_question: False}.
 
     The shape the UI consumes:
       {
         "asks_question": bool,
-        "kind": "enumerated" | "keep_revert" | "allow_deny" | "run" | "yes_no",
+        "kind": "menu" | "enumerated" | "keep_revert" | "allow_deny" | "run" | "yes_no",
+        "groups": [{"id", "question", "kind", "options", "allows_other"}],
         "options": [{"id", "label", "description", "reply"}],
         "allows_other": bool,
         "other_hint": str,
+        "free_text": {"enabled", "label", "placeholder"},
       }
+
+    `groups` is the real shape: a message may ask several questions, each with its own
+    choices. `kind`/`options` mirror the first group so a client written against the
+    single-question shape keeps working unchanged.
     """
-    empty = {"asks_question": False, "options": [], "allows_other": False}
+    empty = {"asks_question": False, "groups": [], "options": [], "allows_other": False}
     prose = prose_only(text)
     if not prose:
         return empty
+    shell = is_shell_provider(provider)
+
+    # A message that lays out questions with their choices underneath is asking, whatever
+    # its closing sentence looks like. The tail test below cannot see that: agents often
+    # end such a message with a statement ("3 questions ready."), and demanding a trailing
+    # "?" there is what left multi-question messages with no buttons at all.
+    blocks = _detect_question_blocks(prose, answer_with_marker=shell)
+    if blocks:
+        return _result_groups([
+            {"question": block["question"], "kind": "menu", "options": block["options"]}
+            for block in blocks
+        ])
+
     tail = prose[-900:]
     if not _ASKS_QUESTION_RE.search(tail):
         return empty
+
+    if shell:
+        # Everything below sends an English sentence, which a shell would only echo back as
+        # a command-not-found. A prompt waiting on a shell is waiting for y or n.
+        return _result("yes_no", [
+            {"id": "yes", "label": "Yes", "description": "Answer the prompt with y.", "reply": "y"},
+            {"id": "no", "label": "No", "description": "Answer the prompt with n.", "reply": "n"},
+        ])
 
     enumerated = _detect_enumerated(prose, tail)
     if enumerated:
@@ -139,25 +294,56 @@ def extract_prompt_options(text: Any) -> dict:
     ])
 
 
-def annotate_message(message: dict | None) -> dict | None:
+def annotate_message(message: dict | None, provider: Any = None) -> dict | None:
     """Return the message with `promptOptions` attached when an assistant reply asks the
     user something. A shallow copy, so this never mutates or persists the stored transcript
-    — the options are a client-facing view, recomputed each time the message is served."""
+    — the options are a client-facing view, recomputed each time the message is served.
+
+    `provider` decides what an answer has to look like: a model reads words, a shell over
+    SSH reads the number or letter it printed."""
     if not message or message.get("role") != "assistant":
         return message
-    options = extract_prompt_options(message.get("text"))
+    options = extract_prompt_options(message.get("text"), provider)
     if not options.get("asks_question"):
         return message
     return {**message, "promptOptions": options}
 
 
+OTHER_HINT = "Answer in your own words"
+FREE_TEXT_LABEL = "Add anything else (optional)"
+
+
 def _result(kind: str, options: list[dict]) -> dict:
+    return _result_groups([{"question": "", "kind": kind, "options": options}])
+
+
+def _result_groups(groups: list[dict]) -> dict:
+    """One envelope for both shapes. The first group is repeated at the top level because
+    that is where a client written before multi-question support looks for it."""
+    numbered = [
+        {
+            "id": group.get("id") or f"q{index + 1}",
+            "question": group.get("question") or "",
+            "kind": group.get("kind") or "menu",
+            "options": group["options"],
+            # Always offer a way out of the detected set: the heuristic can only guess, and
+            # the user may want to answer something none of these cover.
+            "allows_other": True,
+        }
+        for index, group in enumerate(groups)
+    ]
     return {
         "asks_question": True,
-        "kind": kind,
-        "options": options,
-        # Always offer a way out of the detected set: the heuristic can only guess, and the
-        # user may want to answer something none of these cover.
+        "kind": numbered[0]["kind"],
+        "groups": numbered,
+        "options": numbered[0]["options"],
         "allows_other": True,
-        "other_hint": "Answer in your own words",
+        "other_hint": OTHER_HINT,
+        # The free-text box sits beside the buttons rather than replacing them: picking an
+        # option and adding a sentence of context is one answer, not two turns.
+        "free_text": {
+            "enabled": True,
+            "label": FREE_TEXT_LABEL,
+            "placeholder": OTHER_HINT,
+        },
     }

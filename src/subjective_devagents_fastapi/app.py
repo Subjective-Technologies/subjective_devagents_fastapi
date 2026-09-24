@@ -619,7 +619,7 @@ async def api_llm_test_inject_assistant_message(body: dict = Body(default={})) -
         provider = (result.get("conversation") or {}).get("provider") or ""
         instance.broadcast("llm-message", {
             "target": target,
-            "message": annotate_message(result["assistantMessage"]),
+            "message": annotate_message(result["assistantMessage"], provider),
             "provider": provider,
         })
     return result

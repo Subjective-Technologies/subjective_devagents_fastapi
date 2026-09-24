@@ -38,6 +38,7 @@ uvicorn = pytest.importorskip("uvicorn")
 from selenium import webdriver  # noqa: E402
 from selenium.webdriver.chrome.options import Options  # noqa: E402
 from selenium.webdriver.chrome.service import Service  # noqa: E402
+from selenium.common.exceptions import StaleElementReferenceException  # noqa: E402
 from selenium.webdriver.common.action_chains import ActionChains  # noqa: E402
 from selenium.webdriver.common.by import By  # noqa: E402
 from selenium.webdriver.support import expected_conditions as EC  # noqa: E402
@@ -197,7 +198,11 @@ def test_prompt_options_render_for_a_yes_no_question(live_server, driver):
 
     wait.until(lambda d: _prompt_action_button(d, "Yes") is not None)
     assert _prompt_action_button(driver, "No") is not None
-    assert _prompt_action_button(driver, "Other…") is not None
+    # An answer outside the offered set is given in the free-text box beside the buttons.
+    # It replaced the "Other…" pill, which could only hand focus back to the composer and
+    # could not be combined with a choice.
+    assert driver.find_elements(By.CSS_SELECTOR, ".prompt-free-text-input")
+    assert _prompt_action_button(driver, "Other…") is None
 
 
 def _assert_yes_click_reaches_backend(driver, live_server: str) -> None:
@@ -534,3 +539,91 @@ def test_the_composer_keeps_focus_after_sending(live_server, driver):
     assert composer.is_enabled(), "the composer is disabled while the agent works"
     composer.send_keys("second message")
     assert composer.get_attribute("value") == "second message"
+
+
+MULTI_QUESTION_REPLY = """1. Should we proceed?
+
+- Yes
+- No
+- Need more details
+
+2. Which response style?
+
+- Brief - short answers
+- Detailed
+- Step by step
+
+3 questions ready. Use free-text input for "Other."
+"""
+
+
+def _open_conversation(driver, live_server: str, target: str):
+    driver.get(live_server)
+    wait = WebDriverWait(driver, 15)
+    wait.until(EC.presence_of_element_located((By.ID, "createLlmButton")))
+    mobile_menu_buttons = driver.find_elements(By.ID, "mobileMenuButton")
+    if mobile_menu_buttons and mobile_menu_buttons[0].is_displayed():
+        mobile_menu_buttons[0].click()
+    row = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, f'tr.conversation-row[data-target="{target}"]')))
+    row.click()
+    return wait
+
+
+def test_a_reply_asking_several_questions_draws_a_group_for_each(live_server, driver):
+    """The reported gap: an agent offering choices as a bulleted list under each question
+    drew no buttons at all — the detection only understood "A./B." labels, and a message
+    ending in a statement was not even considered a question."""
+    target = _create_conversation(live_server)
+    wait = _open_conversation(driver, live_server, target)
+    _inject_question(live_server, target, MULTI_QUESTION_REPLY)
+
+    wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, ".prompt-group")) == 2)
+    groups = driver.find_elements(By.CSS_SELECTOR, ".prompt-group")
+    questions = [g.find_element(By.CSS_SELECTOR, ".prompt-group-question").text for g in groups]
+    assert questions == ["Should we proceed?", "Which response style?"]
+    first = [b.find_element(By.CSS_SELECTOR, ".prompt-action-label").text for b in groups[0].find_elements(By.CSS_SELECTOR, ".prompt-action")]
+    assert first == ["Yes", "No", "Need more details"]
+    # The gloss after the dash becomes the description, not part of the choice.
+    assert groups[1].find_elements(By.CSS_SELECTOR, ".prompt-action-description")[0].text == "short answers"
+    assert driver.find_elements(By.CSS_SELECTOR, ".prompt-free-text-input"), "the optional free-text box must be rendered"
+
+
+def test_answering_every_question_sends_one_turn_naming_each_answer(live_server, driver):
+    """Several questions cannot each send on click — the first would send a turn and the
+    rest would have nowhere to go. They select, and one Send carries all of them."""
+    target = _create_conversation(live_server)
+    wait = _open_conversation(driver, live_server, target)
+    _inject_question(live_server, target, MULTI_QUESTION_REPLY)
+    wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, ".prompt-group")) == 2)
+
+    for group in driver.find_elements(By.CSS_SELECTOR, ".prompt-group"):
+        group.find_elements(By.CSS_SELECTOR, ".prompt-action")[0].click()
+    driver.find_element(By.CSS_SELECTOR, ".prompt-free-text-input").send_keys("and keep it short")
+
+    chosen = driver.find_elements(By.CSS_SELECTOR, ".prompt-action.chosen")
+    assert len(chosen) == 2, "a picked answer must stay visibly picked until Send"
+
+    send = driver.find_element(By.CSS_SELECTOR, ".prompt-action-send")
+    assert "Send" in send.text
+    send.click()
+
+    # The echo the composer draws for any sent message is the proof it left the page, and
+    # it carries the composed text. A real CLI turn is not needed, and would need creds.
+    def _sent_echo(d):
+        # The transcript re-renders while the turn starts, so an entry read a moment ago
+        # can be gone by the time its text is asked for. Retry rather than fail on that.
+        try:
+            texts = [e.text for e in d.find_elements(By.CSS_SELECTOR, ".entry.message")]
+        except StaleElementReferenceException:
+            return None
+        matches = [text for text in texts if "Should we proceed?" in text]
+        return matches[-1] if matches else None
+
+    echo = wait.until(_sent_echo)
+    # One turn carries every answer, each next to the question it belongs to. The numbering
+    # the reply is composed with is markdown, so the echo renders it as a list rather than
+    # literal "1." text — what matters here is that no answer was dropped or transposed.
+    assert "Should we proceed? Yes" in echo
+    assert "Which response style? Brief" in echo
+    assert "and keep it short" in echo
+    assert echo.index("Should we proceed?") < echo.index("Which response style?")
