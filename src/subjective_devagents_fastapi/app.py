@@ -1568,6 +1568,7 @@ def _static_files() -> dict[str, Path]:
         "/styles.css": src / "styles.css",
         "/terminal.css": src / "terminal.css",
         "/messageRenderer.js": src / "messageRenderer.js",
+        "/taggyClient.js": src / "taggyClient.js",
         "/renderer.js": src / "renderer.js",
         "/terminal-renderer.js": src / "terminal-renderer.js",
     }
