@@ -10,6 +10,7 @@ fallback) rather than any provider's behaviour.
 """
 from __future__ import annotations
 
+import base64
 import sys
 import time
 from pathlib import Path
@@ -127,15 +128,15 @@ def test_a_failed_send_with_an_attachment_is_kept_and_marked(service):
     target = conversation["target"]
     stub_datasource(service, {"success": False, "status": "runtime_error", "error": "boom"})
 
-    service.send_message(target, "look at this", files=[
-        {"filename": "shot.png", "mime_type": "image/png", "content": "aGk="},
-    ])
+    image = {"filename": "shot.png", "mime_type": "image/png", "content": "aGk="}
+    service.send_message(target, "look at this", files=[image])
 
     stored = service.find_conversation(target, include_messages=True)
     kept = [m for m in stored["messages"] if m["text"] == "look at this"]
     assert len(kept) == 1
     assert kept[0]["sendFailed"] is True
     assert kept[0]["error"]
+    assert kept[0]["attachments"] == [image]
 
 
 def test_a_successful_turn_appends_both_sides(service):
@@ -253,6 +254,61 @@ def test_codex_gets_a_sandbox_mode_instead(service):
     payload = calls[0]["payload"]
     assert payload["sandbox_mode"] == "workspace-write"
     assert "permission_mode" not in payload
+
+
+def _dashboard_file(filename: str, mime_type: str, raw: bytes) -> dict:
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "content": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def _user_message(service, target: str, text: str) -> dict:
+    stored = service.find_conversation(target, include_messages=True)
+    matches = [message for message in stored["messages"] if message["text"] == text]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_image_and_text_files_reach_the_pipeline_request(service):
+    """The datasource request keeps every file. Stored attachments keep only image/*."""
+    calls: list[dict] = []
+    conversation = service.create_conversation(provider="claude", name="Files")
+    target = conversation["target"]
+    image = _dashboard_file("pixel.png", "image/png", b"\x89PNG\r\n\x1a\nfake-image")
+    notes = _dashboard_file("notes.txt", "text/plain", b"not an image")
+    files = [image, notes]
+    stub_datasource(service, {"success": True, "response": "seen", "session_id": "s-files"}, record=calls)
+
+    result = service.send_message(target, "see these", files)
+
+    assert result["ok"] is True
+    request = calls[0]["payload"]
+    assert request["files"] == files
+    assert [item["mime_type"] for item in request["files"]] == ["image/png", "text/plain"]
+    stored = _user_message(service, target, "see these")
+    assert stored["text"] == "see these"
+    assert stored["attachments"] == [image]
+    assert notes not in stored["attachments"]
+
+
+def test_a_pdf_reaches_the_pipeline_request_but_not_message_attachments(service):
+    calls: list[dict] = []
+    conversation = service.create_conversation(provider="claude", name="PDF")
+    target = conversation["target"]
+    pdf = _dashboard_file("spec.pdf", "application/pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    stub_datasource(service, {"success": True, "response": "seen", "session_id": "s-pdf"}, record=calls)
+
+    result = service.send_message(target, "read the spec", [pdf])
+
+    assert result["ok"] is True
+    request = calls[0]["payload"]
+    assert request["files"] == [pdf]
+    stored = _user_message(service, target, "read the spec")
+    assert stored["text"] == "read the spec"
+    assert pdf not in stored.get("attachments", [])
+    assert all(item.get("mime_type") != "application/pdf" for item in stored.get("attachments", []))
 
 
 def test_the_bundle_runs_when_the_datasource_module_is_unavailable(service):

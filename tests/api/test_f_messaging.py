@@ -10,6 +10,7 @@ pin the difference between "still working" and "failed".
 """
 from __future__ import annotations
 
+import base64
 import time
 
 import pytest
@@ -122,6 +123,68 @@ def test_f1_attachments_are_passed_through(client, chats, spy_send):
 
     wait_for(lambda: sent, what="the send reaching the backend")
     assert sent[0]["files"] == files
+
+
+def _dashboard_file(filename: str, mime_type: str, raw: bytes) -> dict:
+    """The dashboard body: filename, mime_type, and standard base64 content."""
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "content": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def test_f1_dashboard_image_and_pdf_reach_send_llm_message(client, chats, spy_send):
+    """POST /api/llm/send-message must hand the dashboard files list to the pipeline
+    as the third argument, image and non-image together, unchanged."""
+    sent, _ = spy_send
+    conversation = chats(provider="claude", name="f1-dashboard-files")
+    files = [
+        _dashboard_file("pixel.png", "image/png", b"\x89PNG\r\n\x1a\nfake-image"),
+        _dashboard_file("spec.pdf", "application/pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"),
+    ]
+
+    body = envelope(client.post("/api/llm/send-message", json={
+        "target": conversation["target"], "text": "Look at both", "files": files,
+    }), ok=True)
+
+    assert body["pending"] is True
+    assert body["ok"] is True
+    wait_for(lambda: sent, what="the send reaching the backend")
+    assert sent[0]["files"] == files
+    assert [item["mime_type"] for item in sent[0]["files"]] == ["image/png", "application/pdf"]
+    assert all(isinstance(item, dict) and "content" in item for item in sent[0]["files"])
+
+
+@pytest.mark.parametrize("text", ["", " ", "   ", "\n", "\t\n", "\t\n  \r\n"])
+def test_f7_whitespace_text_with_files_is_rejected_before_the_backend(client, chats, spy_send, text):
+    sent, _ = spy_send
+    conversation = chats(provider="claude", name="f7-files-empty")
+    files = [_dashboard_file("pixel.png", "image/png", b"\x89PNG\r\n\x1a\nfake-image")]
+
+    body = envelope(client.post("/api/llm/send-message", json={
+        "target": conversation["target"], "text": text, "files": files,
+    }), ok=False)
+
+    assert body["status"] == "invalid_request"
+    assert sent == [], f"{text!r} with files reached the agent"
+
+
+def test_f6_an_unknown_target_with_files_is_not_found(client, spy_send):
+    sent, _ = spy_send
+    files = [
+        _dashboard_file("pixel.png", "image/png", b"\x89PNG\r\n\x1a\nfake-image"),
+        _dashboard_file("spec.pdf", "application/pdf", b"%PDF-1.4"),
+    ]
+
+    body = envelope(client.post("/api/llm/send-message", json={
+        "target": "llm:claude:local:not-a-real-chat",
+        "text": "Look at both",
+        "files": files,
+    }), ok=False)
+
+    assert body["status"] == "not_found"
+    assert sent == [], "files for a missing chat reached the backend"
 
 
 # --- F2/F3/F4: pending is not failed --------------------------------------------------------------
