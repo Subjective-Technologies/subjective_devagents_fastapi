@@ -11,6 +11,10 @@ from .contracts import Identity, ModelError
 
 def image_support(identity: Identity) -> bool:
     """Mirrors strategies.CliDriver.images: Codex needs local image files, Claude takes them inline."""
+    if identity.strategy == "api_agent":
+        # Inline base64 image content parts, same request regardless of ssh_host/os_user;
+        # unlike CodexCli there is no local-file-path step that an SSH identity would break.
+        return True
     if identity.strategy != "cli":
         return False
     return identity.provider == "claude" or (identity.provider == "codex" and not identity.ssh_host)

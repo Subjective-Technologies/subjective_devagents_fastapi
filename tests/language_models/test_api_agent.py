@@ -161,12 +161,37 @@ def test_missing_credential_fails_before_any_request(request_data, monkeypatch):
     assert result.status == "failed" and result.error_code == "authentication_required"
 
 
-def test_attachments_are_refused_without_running(request_data, monkeypatch):
+def test_attachments_are_sent_as_inline_image_content_parts(request_data, monkeypatch):
+    import base64
     from subjective_devagents_fastapi.language_models.contracts import Attachment
     monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
-    request = replace(request_data, attachments=(Attachment("a.png", "image/png", b"\x89PNG-fixture"),))
-    result = ApiAgent().run(request, lambda *_: None, lambda: False)
-    assert result.status == "failed" and result.error_code == "unsupported_attachments"
+    png = b"\x89PNG-fixture"
+    with ScriptedProxy([completion(content="I see the image.")]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url),
+                          attachments=(Attachment("a.png", "image/png", png),))
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+    assert result.status == "completed" and result.text == "I see the image."
+    user_message = proxy.requests[0][2]["messages"][-1]
+    assert user_message["content"][0] == {"type": "text", "text": "please help"}
+    image_part = user_message["content"][1]
+    assert image_part["type"] == "image_url"
+    assert image_part["image_url"]["url"] == f"data:image/png;base64,{base64.b64encode(png).decode()}"
+
+
+def test_registry_reports_attachment_support_for_api_agent(identity):
+    from subjective_devagents_fastapi.language_models.registry import image_support
+    assert image_support(identity) is True
+
+
+def test_context_size_check_ignores_image_bytes(request_data, monkeypatch):
+    from subjective_devagents_fastapi.language_models.contracts import Attachment
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    big_image = b"\x89PNG" + b"x" * 400_000  # well over MAX_CONTEXT_BYTES once base64-inflated
+    with ScriptedProxy([completion(content="ok")]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url),
+                          attachments=(Attachment("big.png", "image/png", big_image),))
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+    assert result.status == "completed"
 
 
 def test_cancellation_mid_tool_call_stops_the_loop(request_data, monkeypatch):

@@ -530,6 +530,30 @@ def agent_tool_set(identity) -> dict[str, dict]:
     return {name: AGENT_TOOLS[name] for name in names}
 
 
+def agent_image_block(attachment) -> dict:
+    encoded = base64.b64encode(attachment.data).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{attachment.mime_type};base64,{encoded}"}}
+
+
+def agent_text_bytes(messages: list) -> int:
+    """Context-size accounting that counts prompt/history/tool-result text, not image bytes.
+
+    MAX_CONTEXT_BYTES bounds the conversation, not attachments: those already have their own
+    per-image and per-turn caps (contracts.MAX_ATTACHMENT_BYTES / MAX_ATTACHMENTS) enforced
+    before a request ever reaches a strategy.
+    """
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content.encode())
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += len(str(part.get("text") or "").encode())
+    return total
+
+
 def agent_system_prompt(identity) -> str:
     lines = [
         "You are a coding assistant with tool access to one real workspace. Use tools to inspect or "
@@ -654,15 +678,17 @@ class ApiAgent(ModelStrategy):
         if cancelled():
             return ModelResult("cancelled", error_code="cancelled_before_start")
         identity = request.identity
-        if request.attachments:
-            return ModelResult("failed", error_code="unsupported_attachments")
         token = os.environ.get(identity.api_key_env, "")
         if not token:
             return ModelResult("failed", error_code="authentication_required")
         tools = agent_tool_set(identity)
         messages = [{"role": "system", "content": agent_system_prompt(identity)}]
         messages += [{"role": m.role, "content": m.content} for m in request.history]
-        messages.append({"role": "user", "content": request.prompt})
+        if request.attachments:
+            content = [{"type": "text", "text": request.prompt}] + [agent_image_block(a) for a in request.attachments]
+        else:
+            content = request.prompt
+        messages.append({"role": "user", "content": content})
         transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
                                        if identity.ssh_host else LocalProcess())
         deadline = time.monotonic() + request.timeout
@@ -670,7 +696,7 @@ class ApiAgent(ModelStrategy):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return ModelResult("timed_out", error_code="timed_out")
-            if len(json.dumps(messages).encode()) > MAX_CONTEXT_BYTES:
+            if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                 return ModelResult("failed", error_code="context_too_large")
             outcome = await self._call(identity, token, messages, tools, remaining, cancelled)
             if isinstance(outcome, ModelResult):

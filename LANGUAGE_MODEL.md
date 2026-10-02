@@ -31,7 +31,10 @@ Consequences worth knowing operationally:
 - No native session: the proxy is stateless, so `ApiAgent` never returns a
   `session_id` and resends the full prior transcript (user/assistant pairs only,
   not intermediate tool calls) on every turn, same as the pre-existing `Api` class.
-- Images are refused (`unsupported_attachments`), same as `Api` today.
+- Images are sent inline as OpenAI-style `image_url` content parts (base64 data URL), the
+  same per-image/per-turn limits as everywhere else (`contracts.MAX_ATTACHMENT_BYTES`,
+  `MAX_ATTACHMENTS`). Whether the selected model actually understands them is between it and
+  the proxy; an unsupported combination surfaces as a normal provider error code, not a crash.
 - A tool call outside the effective set (sandbox + `allowed_tools`) is not fatal:
   the model is told it is not permitted and can continue without it.
 - `api_agent`'s URL validation is deliberately looser than `api`'s: it allows plain
