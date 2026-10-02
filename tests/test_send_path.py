@@ -415,6 +415,27 @@ def test_a_slow_turn_emits_heartbeat_progress(service, monkeypatch):
     assert len(events) == count_after_return
 
 
+def test_real_steps_suppress_the_heartbeat_and_reach_the_progress_feed(service, monkeypatch):
+    """While the agent reports what it is doing, timer rows would only interleave noise."""
+    from subjective_devagents_fastapi import llm_service
+
+    monkeypatch.setattr(llm_service, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+    def busy(conversation, source, request, register, clear, progress):
+        for index in range(8):
+            progress({"target": conversation["target"], "text": f"Running: step {index}"})
+            time.sleep(0.02)
+        return {"success": True, "response": "done"}
+
+    monkeypatch.setattr(service.backend, "send", busy)
+    events: list[dict] = []
+    service.on_progress = events.append
+
+    conversation = service.create_conversation(provider="codex", name="Steps")
+    assert service.send_message(conversation["target"], "work")["ok"] is True
+    assert [event["text"] for event in events] == [f"Running: step {index}" for index in range(8)]
+
+
 def test_an_ordinary_error_is_not_retried(service, monkeypatch):
     """Ordinary execution errors also fail once without replay."""
     attempts = {"n": 0}

@@ -1775,7 +1775,7 @@ class LlmService:
                     return {"success": True, "result": outcome}
                 outcome = self.backend.send(
                     conversation, source, request, self._register_canceller,
-                    self._clear_canceller, self.on_progress,
+                    self._clear_canceller, report_step,
                 )
                 return {"success": True, "result": outcome}
 
@@ -1786,11 +1786,21 @@ class LlmService:
             # turn is still in flight, so it reaches the same llm-progress/"thinking steps"
             # UI a real per-tool-call event would, rather than the UI looking frozen.
             heartbeat_stop = threading.Event()
+            last_step = [time.monotonic()]
+
+            def report_step(progress: dict) -> None:
+                last_step[0] = time.monotonic()
+                if callable(self.on_progress):
+                    self.on_progress(progress)
 
             def _emit_heartbeat() -> None:
+                # Only fills silences: while the agent reports real steps, a timer row
+                # between them is noise in the step list.
                 elapsed = 0.0
                 while not heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
                     elapsed += HEARTBEAT_INTERVAL_SECONDS
+                    if time.monotonic() - last_step[0] < HEARTBEAT_INTERVAL_SECONDS:
+                        continue
                     if callable(self.on_progress):
                         self.on_progress({
                             "target": target,

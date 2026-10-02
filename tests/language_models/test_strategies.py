@@ -312,3 +312,73 @@ def test_strategies_that_cannot_take_images_refuse_without_running(request_data,
         chosen.transport = NeverRun()
     result = chosen.run(with_image(request_data, **identity), lambda *_: None, lambda: False)
     assert result.status == "failed" and result.error_code == "unsupported_attachments"
+
+
+# --- live step list -------------------------------------------------------------------------
+
+
+def steps_from(driver, events):
+    emitted = []
+    state = {"session_id": None, "text": "", "completed": False, "error": None}
+    for event in events:
+        driver.consume(event, state, lambda kind, data: emitted.append((kind, data.get("text"))))
+    return emitted
+
+
+def test_codex_reports_commands_edits_reasoning_and_plan_as_steps():
+    item = lambda kind, **fields: {"type": kind, "item": fields}
+    emitted = steps_from(CodexCli(), [
+        item("item.completed", type="reasoning", text="Need to inspect\nthe tests first"),
+        item("item.started", type="command_execution", command="pytest -q", status="in_progress"),
+        item("item.completed", type="command_execution", command="pytest -q", exit_code=1, status="failed"),
+        item("item.completed", type="command_execution", command="ls", exit_code=0, status="completed"),
+        item("item.completed", type="file_change", changes=[{"path": "app.py", "kind": "update"},
+                                                           {"path": "new.py", "kind": "add"}]),
+        item("item.updated", type="todo_list", items=[{"text": "fix", "completed": True},
+                                                      {"text": "test", "completed": False}]),
+        item("item.started", type="web_search", query="codex json events"),
+        item("item.completed", type="agent_message", text="Done."),
+    ])
+    assert emitted == [
+        ("activity", "Thinking: Need to inspect the tests first"),
+        ("activity", "Running: pytest -q"),
+        ("activity", "Command failed (exit 1): pytest -q"),
+        ("activity", "Edited app.py; Created new.py"),
+        ("activity", "Plan 1/2 — next: test"),
+        ("activity", "Searching the web: codex json events"),
+        ("message", "Done."),
+    ]
+
+
+def test_claude_reports_tool_calls_and_thoughts_but_not_subagent_noise():
+    emitted = steps_from(ClaudeCli(), [
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "Check the config"},
+            {"type": "text", "text": "Let me look."},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git   status"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/repo/app.py"}},
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "/repo/app.py"}},
+            {"type": "tool_use", "name": "TodoWrite", "input": {"todos": [
+                {"content": "a", "status": "completed"},
+                {"content": "b", "activeForm": "Running tests", "status": "in_progress"}]}},
+            {"type": "tool_use", "name": "mcp__x__y", "input": {}},
+        ]}},
+        {"type": "assistant", "parent_tool_use_id": "sub", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "hidden"}}]}},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "Le"}}},
+    ])
+    assert emitted == [
+        ("activity", "Thinking: Check the config"),
+        ("message", "Let me look."),
+        ("activity", "Running: git status"),
+        ("activity", "Reading /repo/app.py"),
+        ("activity", "Editing /repo/app.py"),
+        ("activity", "Plan 1/2 — Running tests"),
+        ("activity", "Using mcp__x__y"),
+        ("text_delta", "Le"),
+    ]
+
+
+def test_long_commands_are_cut_to_one_line():
+    from subjective_devagents_fastapi.language_models.strategies import short
+    assert short("a\n" + "b" * 300, 20) == "a " + "b" * 17 + "…"

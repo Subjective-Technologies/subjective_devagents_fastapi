@@ -146,7 +146,9 @@ class LegacyLanguageModel:
                     events = self.model.store.events(turn["id"], cursor)
                     for event in events:
                         cursor = event["sequence"]
-                        if event["kind"] in {"message", "text_delta"} and progress:
+                        # Whole steps only. Deltas are word fragments; the UI lists each
+                        # progress text as its own row, so they stay in the event log.
+                        if event["kind"] in {"activity", "message"} and progress:
                             progress({"target": conversation["target"], "text": event["data"].get("text", "")})
                     turn = self.model.store.turn(turn["id"])
                     if turn["status"] in TERMINAL:

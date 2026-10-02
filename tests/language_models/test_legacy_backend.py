@@ -227,3 +227,21 @@ def test_remote_identity_uses_remote_user_not_service_user(tmp_path, monkeypatch
         assert identity.ssh_host == 'server-alias'
     finally:
         adapter.close()
+
+
+def test_only_whole_steps_reach_the_live_progress_feed(backend, conversation):
+    class Chatty(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            emit("text_delta", {"text": "Hel"})
+            emit("activity", {"text": "Running: ls"})
+            emit("text_delta", {"text": "lo"})
+            emit("message", {"text": "Hello"})
+            return ModelResult("completed", "Hello", "session")
+
+    backend.model.strategies = {"cli:codex": Chatty()}
+    seen = []
+    result = backend.send(conversation, {}, {"prompt": "q", "timeout": 5},
+                          lambda target, cancel: None, lambda target: None, seen.append)
+    assert result["success"] is True
+    assert [item["text"] for item in seen] == ["Running: ls", "Hello"]
+    assert {item["target"] for item in seen} == {conversation["target"]}

@@ -34,6 +34,12 @@ def provider_error_code(event: dict) -> str:
     return "provider_error"
 
 
+def short(value, limit: int = 160) -> str:
+    """One line for the live step list: whitespace collapsed, long values cut."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def isolated_environment(request: ModelRequest) -> dict[str, str]:
     identity = request.identity
     # Deliberately do not inherit API keys, OAuth tokens, proxy variables or provider
@@ -107,15 +113,47 @@ class CodexCli(CliDriver):
         kind = event.get("type")
         if kind == "thread.started":
             state["session_id"] = event.get("thread_id")
-        elif kind == "item.completed":
+        elif kind in {"item.started", "item.updated", "item.completed"}:
             item = event.get("item") or {}
-            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            if kind == "item.completed" and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                 state["text"] = item["text"]
                 emit("message", {"text": item["text"]})
+            step = self.step(kind, item)
+            if step:
+                emit("activity", {"text": step})
         elif kind == "turn.completed":
             state["completed"] = True
         elif kind in {"turn.failed", "error"}:
             state["error"] = provider_error_code(event)
+
+
+    @staticmethod
+    def step(kind: str, item: dict) -> str:
+        """What the agent is doing, from Codex's item events, as one readable line."""
+        kind_of = item.get("type")
+        if kind_of == "command_execution":
+            if kind == "item.started":
+                return f"Running: {short(item.get('command'))}"
+            code = item.get("exit_code")
+            if kind == "item.completed" and code not in (0, None):
+                return f"Command failed (exit {code}): {short(item.get('command'))}"
+        elif kind_of == "file_change" and kind == "item.completed":
+            verbs = {"add": "Created", "delete": "Deleted"}
+            changes = [f"{verbs.get(change.get('kind'), 'Edited')} {change.get('path')}"
+                       for change in item.get("changes") or [] if isinstance(change, dict)]
+            return short("; ".join(changes)) if changes else ""
+        elif kind_of == "reasoning" and kind == "item.completed":
+            return f"Thinking: {short(item.get('text'))}" if item.get("text") else ""
+        elif kind_of == "mcp_tool_call" and kind == "item.started":
+            return f"Calling {item.get('server')}.{item.get('tool')}"
+        elif kind_of == "web_search" and kind == "item.started":
+            return f"Searching the web: {short(item.get('query'))}"
+        elif kind_of == "todo_list":
+            items = [entry for entry in item.get("items") or [] if isinstance(entry, dict)]
+            done = sum(1 for entry in items if entry.get("completed"))
+            upcoming = next((entry.get("text") for entry in items if not entry.get("completed")), "")
+            return short(f"Plan {done}/{len(items)}" + (f" — next: {upcoming}" if upcoming else "")) if items else ""
+        return ""
 
 
 class ClaudeCli(CliDriver):
@@ -158,6 +196,18 @@ class ClaudeCli(CliDriver):
             delta = (event.get("event") or {}).get("delta") or {}
             if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
                 emit("text_delta", {"text": delta["text"]})
+        elif kind == "assistant":
+            # Complete content blocks, unlike the deltas above: one step per tool call,
+            # thought or paragraph, which is what the live step list can show.
+            for block in (event.get("message") or {}).get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    emit("activity", {"text": self.tool_step(block.get("name"), block.get("input") or {})})
+                elif block.get("type") == "thinking" and block.get("thinking"):
+                    emit("activity", {"text": f"Thinking: {short(block['thinking'])}"})
+                elif block.get("type") == "text" and str(block.get("text") or "").strip():
+                    emit("message", {"text": block["text"]})
         elif kind == "result":
             state["completed"] = True
             state["text"] = event.get("result") if isinstance(event.get("result"), str) else ""
@@ -165,6 +215,37 @@ class ClaudeCli(CliDriver):
                 state["error"] = provider_error_code(event)
             if event.get("permission_denials"):
                 state["error"] = "approval_required"
+
+
+    @staticmethod
+    def tool_step(name, arguments: dict) -> str:
+        name = str(name or "tool")
+        path = arguments.get("file_path") or arguments.get("notebook_path") or arguments.get("path") or ""
+        if name == "Bash":
+            return f"Running: {short(arguments.get('command'))}"
+        if name == "Read":
+            return f"Reading {short(path)}"
+        if name in {"Edit", "MultiEdit", "NotebookEdit"}:
+            return f"Editing {short(path)}"
+        if name == "Write":
+            return f"Writing {short(path)}"
+        if name == "Grep":
+            return f"Searching for {short(arguments.get('pattern'))}" + (f" in {short(path)}" if path else "")
+        if name == "Glob":
+            return f"Finding files {short(arguments.get('pattern'))}"
+        if name == "WebSearch":
+            return f"Searching the web: {short(arguments.get('query'))}"
+        if name == "WebFetch":
+            return f"Fetching {short(arguments.get('url'))}"
+        if name in {"Task", "Agent"}:
+            return f"Delegating: {short(arguments.get('description') or arguments.get('prompt'))}"
+        if name == "TodoWrite":
+            todos = [item for item in arguments.get("todos") or [] if isinstance(item, dict)]
+            done = sum(1 for item in todos if item.get("status") == "completed")
+            current = next((item.get("activeForm") or item.get("content") for item in todos
+                            if item.get("status") == "in_progress"), "")
+            return short(f"Plan {done}/{len(todos)}" + (f" — {current}" if current else ""))
+        return f"Using {name}"
 
 
 class CursorCli(ClaudeCli):
