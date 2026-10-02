@@ -164,7 +164,8 @@ class LegacyLanguageModel:
     def status(self, provider: str) -> dict:
         candidates = [item for item in self.model.identities.public() if item["provider"] == provider]
         return {"provider": provider, "success": True, "status": "configured" if candidates else "not_checked",
-                "backend": "language-model", "identities": candidates}
+                "backend": "language-model", "identities": candidates,
+                **({} if candidates else {"error": f"No configured {provider} identity."})}
 
     def close(self):
         self.model.close()

@@ -138,7 +138,20 @@ class SshShellSession:
         # connect, not as a silent session that answers nothing.
         probe = self.send_command(":")
         if not probe:
-            return {"type": "error", "error": "Could not write to the remote shell."}
+            # A fast ssh failure can close stdin before the probe write. Drain its
+            # diagnostics so auth/DNS/host-key reasons reach the operator.
+            deadline = time.time() + min(float(timeout), 1.0)
+            transcript: list[str] = []
+            while time.time() < deadline:
+                event = self.next_event(timeout=max(0.0, deadline - time.time()))
+                if event is None:
+                    continue
+                if event["type"] == "output":
+                    transcript.append(event.get("data", ""))
+                if event["type"] == "closed":
+                    break
+            detail = "".join(transcript).strip()
+            return {"type": "error", "error": detail or "Could not write to the remote shell."}
         deadline = time.time() + timeout
         transcript: list[str] = []
         while time.time() < deadline:

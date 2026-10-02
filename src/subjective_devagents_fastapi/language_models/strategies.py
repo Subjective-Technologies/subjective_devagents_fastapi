@@ -16,6 +16,21 @@ from .transports import Command, LocalProcess, ProcessTransport, SshTunnel
 MAX_CONTEXT_BYTES = 512 * 1024
 
 
+def provider_error_code(event: dict) -> str:
+    """Map provider diagnostics to stable codes without persisting provider text."""
+    try:
+        blob = json.dumps(event, ensure_ascii=False).lower()
+    except (TypeError, ValueError):
+        blob = str(event).lower()
+    if "usage limit" in blob or "out of credits" in blob or "quota" in blob:
+        return "usage_limit"
+    if "rate limit" in blob or "rate_limit" in blob or "too many requests" in blob:
+        return "rate_limited"
+    if "authentication" in blob or "not logged in" in blob or "login required" in blob:
+        return "authentication_required"
+    return "provider_error"
+
+
 def isolated_environment(request: ModelRequest) -> dict[str, str]:
     identity = request.identity
     # Deliberately do not inherit API keys, OAuth tokens, proxy variables or provider
@@ -84,7 +99,7 @@ class CodexCli(CliDriver):
         elif kind == "turn.completed":
             state["completed"] = True
         elif kind in {"turn.failed", "error"}:
-            state["error"] = "provider_error"
+            state["error"] = provider_error_code(event)
 
 
 class ClaudeCli(CliDriver):
@@ -115,7 +130,7 @@ class ClaudeCli(CliDriver):
             state["completed"] = True
             state["text"] = event.get("result") if isinstance(event.get("result"), str) else ""
             if event.get("is_error") or event.get("subtype") not in (None, "success"):
-                state["error"] = "provider_error"
+                state["error"] = provider_error_code(event)
             if event.get("permission_denials"):
                 state["error"] = "approval_required"
 
@@ -155,7 +170,7 @@ class GrokCli(CliDriver):
             state["session_id"] = event.get("sessionId")
             state["completed"] = event.get("stopReason") == "end_turn"
         elif kind == "error":
-            state["error"] = "provider_error"
+            state["error"] = provider_error_code(event)
 
 
 class Cli(ModelStrategy):

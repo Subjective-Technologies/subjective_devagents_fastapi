@@ -775,15 +775,33 @@ async def api_llm_send_message(body: dict = Body(default={})) -> dict:
 
 @app.get("/api/datasources")
 async def api_datasources() -> dict:
-    """Preserve the diagnostics envelope while reporting standalone execution."""
+    """Preserve datasource diagnostics while making execution backend explicit."""
+    from . import datasources
     from .llm_service import WRITABLE_PROVIDERS
-    report = {key: {"loaded": f"cli:{key}" in core().llm_service.backend.model.strategies,
-                    "backend": "language-model", "error": ""}
-              for key in WRITABLE_PROVIDERS if key != "ssh"}
+
+    # Keep legacy plugin visibility for operators and older clients. These modules are
+    # diagnostics/readers only after cutover; turns route through LanguageModel.
+    report = datasources.available()
+    model = core().llm_service.backend.model
+    model_path = str(Path(__file__).with_name("language_models") / "strategies.py")
+    for key in WRITABLE_PROVIDERS:
+        entry = report.setdefault(key, {"package": f"language-model:{key}", "found": True})
+        entry.update({
+            "found": True,
+            "loaded": f"cli:{key}" in model.strategies or key == "ssh",
+            "path": model_path,
+            "backend": "language-model",
+            "execution": "language-model",
+            "error": "",
+        })
+    for key in ("localchats", "ssh"):
+        if key in report:
+            report[key]["backend"] = "history-reader" if key == "localchats" else "language-model"
+            report[key]["execution"] = "read-only" if key == "localchats" else "language-model"
     return {
         "ok": True,
         "datasources": report,
-        "pluginRoots": [],
+        "pluginRoots": [str(root) for root in datasources.plugin_roots()],
         "usingModules": False,
         "backend": "language-model",
     }

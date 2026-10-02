@@ -82,6 +82,21 @@ for event in [
     assert result.status == "completed" and result.session_id == "codex-session"
 
 
+@pytest.mark.parametrize("message,code", [
+    ("You’ve hit your usage limit. Try again later.", "usage_limit"),
+    ("authentication required", "authentication_required"),
+])
+def test_codex_provider_failures_keep_actionable_stable_codes(request_data, tmp_path, message, code):
+    cli = executable(tmp_path, f'''import json,sys
+sys.stdin.read()
+print(json.dumps({{"type":"error", "message": {message!r}}}))
+print(json.dumps({{"type":"turn.failed", "error": {{"message": {message!r}}}}}))
+''')
+    identity = replace(request_data.identity, provider="codex", executable=cli)
+    result = Cli(CodexCli()).run(replace(request_data, identity=identity), lambda *_: None, lambda: False)
+    assert result.status == "failed" and result.error_code == code
+
+
 def test_handoff_prompt_keeps_roles_and_never_silently_truncates(request_data):
     history = (Message("user", "old task"), Message("assistant", "old reply"))
     prompt = cli_prompt(replace(request_data, history=history))
