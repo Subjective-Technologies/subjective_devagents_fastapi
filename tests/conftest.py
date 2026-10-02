@@ -94,3 +94,19 @@ def make_turn(connection: sqlite3.Connection, conversation_id: str, session_id: 
 def explicit_test_auth_mode(monkeypatch):
     """Credential-free unit fixtures opt into development mode, never production."""
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_AUTH_MODE", "development")
+
+
+@pytest.fixture(autouse=True)
+def no_implicit_live_model_calls(monkeypatch):
+    """A stale mock must fail loudly rather than consume a real CLI subscription."""
+    import os
+    from subjective_devagents_fastapi.language_models.transports import LocalProcess
+    if os.environ.get("SUBJECTIVE_LANGUAGE_MODELS_LIVE_URL"):
+        return
+    original = LocalProcess.run
+    def guarded(self, command, **kwargs):
+        binaries = {"codex", "claude", "cursor-agent", "grok"}
+        if any(Path(arg).name in binaries for arg in command.argv):
+            raise AssertionError("Real model invocation requires the explicit live acceptance gate")
+        return original(self, command, **kwargs)
+    monkeypatch.setattr(LocalProcess, "run", guarded)

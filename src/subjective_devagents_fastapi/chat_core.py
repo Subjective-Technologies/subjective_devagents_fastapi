@@ -438,6 +438,7 @@ class ChatCore:
 
     def shutdown(self) -> None:
         self.shutting_down = True
+        self.llm_service.backend.close()
         self._cancel_timer("reconnect_timer")
         self._cancel_timer("nick_retry_timer")
         self.su_session_manager.disconnect_all()
@@ -1078,7 +1079,6 @@ class ChatCore:
         self.broadcast("llm-busy", {"target": target, "busy": True})
         self.log("info", "LLM answer start", {
             "target": target, "provider": provider, "from": sender, "promptChars": len(str(text or "")),
-            "promptPreview": re.sub(r"\s+", " ", str(text or "")).strip()[:120],
         })
         try:
             response = self.llm_service.send_message(target, text, [])
@@ -1171,14 +1171,6 @@ class ChatCore:
             self.broadcast("llm-switch-user", {
                 "sourceTarget": target, "target": sibling["target"], "osUser": username, "provider": sibling["provider"],
             })
-            if cross_provider:
-                # Fire and forget: an agent turn can run for minutes and the caller (a
-                # context-menu click) already got its response. The UI switched to the
-                # sibling above and picks up the handoff reply like any llm-message.
-                source = self.llm_service.find_conversation(target, include_messages=True)
-                handoff = format_transcript_for_handoff(source) if source else ""
-                if handoff:
-                    threading.Thread(target=self._handoff_in_background, args=(sibling["target"], handoff), daemon=True).start()
             return {"conversation": sibling}
         except Exception as error:  # noqa: BLE001
             self.log("error", "Failed to create sibling conversation for OS user", {

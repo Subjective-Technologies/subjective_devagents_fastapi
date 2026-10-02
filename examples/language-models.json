@@ -1,0 +1,35 @@
+{
+  "identities": [
+    {
+      "id": "claude-alice",
+      "provider": "claude",
+      "home": "/srv/devagents/accounts/claude-alice",
+      "config_dir": "/srv/devagents/accounts/claude-alice/.claude",
+      "workspace": "/srv/workspaces/project",
+      "executable": "/usr/local/bin/claude",
+      "os_user": "alice",
+      "allowed_tools": ["Read", "Glob", "Grep"]
+    },
+    {
+      "id": "claude-bob",
+      "provider": "claude",
+      "home": "/srv/devagents/accounts/claude-bob",
+      "config_dir": "/srv/devagents/accounts/claude-bob/.claude",
+      "workspace": "/srv/workspaces/project",
+      "executable": "/usr/local/bin/claude",
+      "os_user": "bob",
+      "allowed_tools": ["Read", "Glob", "Grep"]
+    },
+    {
+      "id": "codex-remote",
+      "provider": "codex",
+      "home": "/srv/devagents/accounts/codex",
+      "config_dir": "/srv/devagents/accounts/codex/.codex",
+      "workspace": "/srv/workspaces/project",
+      "executable": "/usr/local/bin/codex",
+      "ssh_host": "devagents-worker",
+      "os_user": "worker",
+      "sandbox": "read-only"
+    }
+  ]
+}

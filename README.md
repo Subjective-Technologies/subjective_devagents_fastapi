@@ -9,6 +9,13 @@ It is a port of the Node backend that used to live inside the client at
 and the `/ws` event stream are **identical** to the old `webServer.js`, so the existing
 browser UI runs against this unchanged — no frontend edits were needed.
 
+## LanguageModel replacement engine
+
+The `/api/language-model` API and existing `/api/llm/*` routes share one execution
+engine. It provides independent CLI/API strategies, isolated accounts, local/SSH
+execution, durable turns, and explicit account/provider handoffs. See
+[LANGUAGE_MODEL.md](LANGUAGE_MODEL.md) for configuration and capabilities.
+
 ## Checkout
 
 The datasources and shared packages are git submodules, laid out the same way as the
@@ -29,24 +36,12 @@ git submodule update --init --recursive
 | `libs/dependencies/brainboost_configuration_package` | Config the datasources import |
 | `libs/dependencies/brainboost_data_source_logger_package` | Logger the datasources import |
 
-## Reusing the existing datasources
+## Standalone execution
 
-This service does not reimplement agent-CLI handling. It loads the same
-`subjective_*_datasource` packages the monolithic web app uses and calls them **in-process**
-(`datasources.py`), which skips a Python interpreter start and a bundle unpack per turn and
-turns a plugin crash into a real traceback instead of parsed stderr.
-
-Two things it deliberately does not change:
-
-- **"Continue as \<other user\>" stays a subprocess** through the `su` bridge. Running under
-  a different uid is the entire point, and an import cannot change this process's uid.
-- **The exported bundles remain a fallback.** If a datasource is missing or fails to import,
-  `_run_datasource` returns `None` and the bundle path runs instead, so the service keeps
-  answering. `GET /api/datasources` reports which path is live.
-
-Set `SUBJECTIVE_DEVAGENTS_USE_BUNDLES=1` to force the bundle path, or
-`SUBJECTIVE_DEVAGENTS_PLUGIN_PATH=/path/to/plugins` to load datasources from a working copy
-instead of the pinned submodules.
+Legacy datasource and exported-pipeline execution is no longer part of send paths.
+Provider drivers own CLI/API command grammar and parsing; transports own local and SSH
+processes. `GET /api/datasources` remains as a compatibility diagnostic and reports the
+standalone backend. Shell and terminal SSH paths use the service-owned SSH runtime.
 
 ### ⚠️ The pinned submodules are behind the code in production
 

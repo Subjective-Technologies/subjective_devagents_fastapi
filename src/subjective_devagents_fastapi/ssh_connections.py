@@ -407,9 +407,7 @@ def connection_settings(app_home: str, reference: str) -> dict:
             if key in EDITABLE_FIELDS and key != "name" and value not in (None, "")
         }
 
-    from . import datasources
-
-    settings = datasources.ssh_connection_from_workspace(reference)
+    settings = ssh_connection_from_workspace(reference)
     if not settings.get("host"):
         raise ValueError(
             "This SSH chat has no host. Set its workspace to a saved connection, or to "
@@ -428,3 +426,53 @@ def describe_reference(app_home: str, reference: str) -> str:
         account = f"{connection.get('username')}@" if connection.get("username") else ""
         return f"{connection.get('name')} ({account}{connection.get('host')})"
     return reference
+
+
+_SSH_WORKSPACE_RE = re.compile(
+    r"""^
+    (?:(?P<username>[^@/\s]+)@)?
+    (?P<host>\[[0-9A-Fa-f:]+\]|[^@:/\s]+)
+    (?::(?P<port>\d+))?
+    (?::?(?P<path>/\S*))?
+    $""",
+    re.VERBOSE,
+)
+
+
+def ssh_connection_from_workspace(workspace: str) -> dict:
+    """Read an SSH target out of a conversation's workspace string.
+
+    The SSH runtime needs a host and an account, and a conversation has exactly one
+    free-text field that can carry them: its workspace. So an SSH chat's workspace is
+    written `deploy@server.example.com:/srv/app` (or `ssh://deploy@server:2222/srv/app`)
+    and is split here into the runtime's connection fields.
+
+    This reaches only the fields that fit in one line, which means agent
+    authentication — the default, and the only method that stores no secret. Keys,
+    passwords and pinned fingerprints need somewhere to be entered and stored per
+    connection; until that exists they can be supplied through `extra`.
+
+    An unparseable workspace yields `{}` rather than a guess: the runtime then
+    reports `configuration_required` naming what is missing, which is a better failure
+    than connecting somewhere unintended.
+    """
+    text = str(workspace or "").strip()
+    if not text:
+        return {}
+    if text.startswith("ssh://"):
+        text = text[len("ssh://"):]
+    # A plain local path is a workspace for the CLI runtimes, not an SSH target.
+    if text.startswith(("/", ".", "~")):
+        return {}
+    match = _SSH_WORKSPACE_RE.match(text)
+    if not match:
+        return {}
+    connection: dict[str, Any] = {"host": match.group("host").strip("[]")}
+    if match.group("username"):
+        connection["username"] = match.group("username")
+    if match.group("port"):
+        connection["port"] = int(match.group("port"))
+    # The runtime's own `working_directory`, not the raw workspace string that
+    # connection_for already put there.
+    connection["working_directory"] = match.group("path") or ""
+    return connection

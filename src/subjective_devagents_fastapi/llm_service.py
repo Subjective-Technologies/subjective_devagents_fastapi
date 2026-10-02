@@ -502,21 +502,17 @@ class LlmService:
         self.codex_runtime = str(Path(self.root) / "pipelines" / "codex" / "run.py")
         self.claude_runtime = str(Path(self.root) / "pipelines" / "claude" / "run.py")
         self.cursor_runtime = str(Path(self.root) / "pipelines" / "cursor" / "run.py")
-        # No exported grok bundle exists; its datasource is chat-capable in-process. This
-        # path is only reached if that in-process call is unavailable, and pointing it at a
-        # non-existent runtime makes the fallback report "runtime missing" rather than
-        # silently answering a grok turn with the default (codex) bundle.
+        # Retained paths support read-only historical discovery diagnostics.
         self.grok_runtime = str(Path(self.root) / "pipelines" / "grok" / "run.py")
-        # Same as grok: no exported ssh bundle exists and none is planned, so this path
-        # reports "runtime missing" rather than answering an SSH turn with Codex.
         self.ssh_runtime = str(Path(self.root) / "pipelines" / "ssh" / "run.py")
         self.history_runtime = str(Path(self.root) / "pipelines" / "history" / "run.py")
         self.reload_runtime = str(Path(self.root) / "pipelines" / "history" / "reload_one.py")
         self.pipeline_runtime = str(Path(__file__).parent / "pipeline_runtime.py")
         self.su_session_manager = su_session_manager
-        # Call the subjective_*_datasource submodules in-process instead of spawning an
-        # exported bundle. Set SUBJECTIVE_DEVAGENTS_USE_BUNDLES=1 to force the old path.
-        self.use_datasource_modules = os.environ.get("SUBJECTIVE_DEVAGENTS_USE_BUNDLES") != "1"
+        # Kept for compatibility diagnostics; send execution never consults datasource modules.
+        self.use_datasource_modules = False
+        from .language_models.legacy import LegacyLanguageModel
+        self.backend = LegacyLanguageModel(self.app_home)
         self.log = log or (lambda level, message, details=None: None)
         self.busy: set[str] = set()
         # Stop: how to abort the turn currently in flight for a target. A turn registers
@@ -643,6 +639,10 @@ class LlmService:
             }
             if attachments:
                 record["attachments"] = attachments
+            if message.get("turnId"):
+                record["turnId"] = str(message["turnId"])
+            if message.get("stopped"):
+                record["stopped"] = True
             if message.get("sendFailed"):
                 record["sendFailed"] = True
                 record["error"] = str(message.get("error") or "")
@@ -1157,12 +1157,12 @@ class LlmService:
     def create_sibling_for_user(self, source_target: str, username: str, provider: Any = None) -> dict:
         """Fresh sibling conversation for "Continue as <username>" — a sessionId created
         as one OS user cannot be resumed as another ($HOME-scoped session stores)."""
-        source = self.find_conversation(source_target, include_messages=False)
+        source = self.find_conversation(source_target, include_messages=True)
         if not source:
             raise ValueError("Conversation was not found.")
         key = provider_key(provider) if provider else provider_key(source["provider"])
         if not writable_provider(key):
-            raise ValueError(f"{key} has no writable datasource.")
+            raise ValueError(f"{key} has no writable provider driver.")
         cross_provider = key != provider_key(source["provider"])
         label = provider_label(key)
         now = time.time() * 1000
@@ -1179,7 +1179,7 @@ class LlmService:
                 "workspace": source["workspace"],
                 "osUser": username,
                 "sourceUser": username,
-                "messages": [],
+                "messages": [dict(message) for message in source.get("messages", [])],
                 "createdAt": now,
                 "updatedAt": now,
                 "loaded": True,
@@ -1319,6 +1319,29 @@ class LlmService:
         )
 
     def reload_conversation(self, target: str) -> dict | None:
+        if self.backend.is_bound(target):
+            pending = self.backend.pending(target)
+            local = next((item for item in self.local if item["target"] == target), None)
+            if pending and pending["status"] == "completed" and local is not None:
+                if not any(item.get("turnId") == pending["id"] and item.get("role") == "assistant"
+                           for item in local["messages"]):
+                    local["messages"] = [item for item in local["messages"] if item.get("turnId") != pending["id"]]
+                    # The pre-send JSON write can survive a crash before the durable
+                    # turn id was projected. Reuse that trailing user message.
+                    if (local["messages"] and local["messages"][-1].get("role") == "user"
+                            and not local["messages"][-1].get("turnId")
+                            and local["messages"][-1].get("text") == pending["prompt"]):
+                        local["messages"].pop()
+                    local["messages"].extend([
+                        {"role": "user", "text": pending["prompt"], "time": pending["created"] * 1000, "turnId": pending["id"]},
+                        {"role": "assistant", "text": pending["text"], "time": pending["updated"] * 1000, "turnId": pending["id"]},
+                    ])
+                    local["sessionId"] = pending["session_id"] or ""
+                local["updatedAt"] = pending["updated"] * 1000
+                local["sortAt"] = local["updatedAt"]
+                self._save_state()
+                self.backend.projected(target, pending["id"])
+            return self.find_conversation(target, include_messages=True)
         metadata = self.find_conversation(target, include_messages=False)
         if not metadata:
             return None
@@ -1482,9 +1505,7 @@ class LlmService:
 
     def status(self, provider: Any = DEFAULT_PROVIDER) -> dict:
         key = provider_key(provider) if writable_provider(provider) else DEFAULT_PROVIDER
-        request = {"action": "status"}
-        response = self._run_datasource(key, request, 30) or self._run_pipeline(self._runtime_for(key), request, 30)
-        return {"provider": key, **self._pipeline_result(response)}
+        return self.backend.status(key)
 
     def list_provider_sessions(self, provider: Any = "") -> dict:
         listed = list_provider_sessions()
@@ -1624,13 +1645,36 @@ class LlmService:
         if not source:
             self.log("error", "LLM send aborted: conversation not found", {"target": target, "promptChars": len(clean)})
             return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+        source = {**source, "messages": list(source.get("messages", []))}
         provider = writable_provider(source["provider"])
         if not provider:
             self.log("error", "LLM send aborted: read-only provider", {"target": target, "provider": source["provider"]})
-            return {"ok": False, "status": "read_only", "error": f"{source['provider']} history has no writable datasource."}
+            return {"ok": False, "status": "read_only", "error": f"{source['provider']} history has no writable provider driver."}
         if target in self.busy:
             self.log("warn", "LLM send aborted: already busy", {"target": target, "provider": source["provider"]})
             return {"ok": False, "status": "busy", "error": f"{provider['label']} is already responding in this conversation."}
+
+        pending = self.backend.pending(target)
+        if pending:
+            projection_pending = False
+            try:
+                recovered = self.reload_conversation(target)
+            except Exception as error:
+                projection_pending = True
+                recovered = self.find_conversation(target, include_messages=True)
+                self.log("error", "Completed turn projection pending", {
+                    "target": target, "turnId": pending["id"], "exceptionType": type(error).__name__,
+                })
+            if pending["prompt"] == clean and not files:
+                messages = (recovered or {}).get("messages", [])
+                return {"ok": True, "result": self.backend.outcome(pending),
+                        "projectionPending": projection_pending, "conversation": recovered,
+                        "userMessage": next((m for m in messages if m.get("turnId") == pending["id"] and m["role"] == "user"), None),
+                        "assistantMessage": next((m for m in messages if m.get("turnId") == pending["id"] and m["role"] == "assistant"), None),
+                        "cursorIdeHint": False}
+            if projection_pending:
+                return {"ok": False, "status": "projection_pending", "error": "Could not save the previous completed turn; retry reload before sending."}
+            source = {**recovered, "messages": list(recovered.get("messages", []))}
 
         conversation = next((item for item in self.local if item["target"] == target), None)
         if not conversation:
@@ -1642,22 +1686,6 @@ class LlmService:
                 "messages": [],
             }
             self.local.insert(0, conversation)
-
-        # "Continue as <osUser>" conversations must run through that user's own connected
-        # session. Checked before touching transcript/busy state, so a not-connected user
-        # never leaves a dangling "sent" message behind.
-        running_as_other_user = bool(conversation.get("osUser")) and conversation["osUser"] != current_username()
-        if running_as_other_user:
-            session_status = self.su_session_manager.get_status(conversation["osUser"]) if self.su_session_manager else {"status": "idle"}
-            if session_status.get("status") != "ready":
-                self.log("error", "LLM send aborted: OS user session not ready", {
-                    "target": target, "osUser": conversation["osUser"], "sessionStatus": session_status.get("status"),
-                })
-                return {
-                    "ok": False,
-                    "status": "os_user_not_connected",
-                    "error": f"Reconnect as {conversation['osUser']} first (right-click the conversation).",
-                }
 
         # Record the user's line before the turn runs — but it must not survive a turn
         # that never happened (an unsent message reads exactly like a delivered one).
@@ -1681,17 +1709,6 @@ class LlmService:
         self.busy.add(target)
         started = time.time()
         original_session_id = str(conversation.get("sessionId") or source.get("sessionId") or "").strip()
-        # IDE composer UUID vs later cursor-agent chat id differ. Resuming the CLI id
-        # talks to a fork Cursor's open tab never sees — prefer the composer id.
-        if provider["bundle"] == "cursor":
-            composer_id = composer_id_from_source(conversation.get("sourceFile") or source.get("sourceFile") or "")
-            if composer_id and composer_id != original_session_id.lower():
-                self.log("warn", "LLM send rebound Cursor session to IDE composer", {
-                    "target": target, "from": original_session_id, "to": composer_id,
-                })
-            if composer_id:
-                original_session_id = composer_id
-                conversation["sessionId"] = composer_id
         self.log("info", "LLM send start", {
             "target": target,
             "provider": source["provider"],
@@ -1700,7 +1717,6 @@ class LlmService:
             "osUser": conversation.get("osUser") or current_username(),
             "files": len(files),
             "promptChars": len(clean),
-            "promptPreview": clip_text(clean),
         })
 
         def rollback_user_message() -> None:
@@ -1714,51 +1730,6 @@ class LlmService:
             self._save_state()
 
         try:
-            composer_id = (
-                composer_id_from_source(conversation.get("sourceFile") or source.get("sourceFile") or "")
-                if provider["bundle"] == "cursor"
-                else ""
-            )
-            if composer_id:
-                injected = inject_into_cursor_dom(clean)
-                self.log("info", "Cursor DOM inject", {
-                    "target": target, "ok": injected.get("ok"), "error": injected.get("error") or "", "via": injected.get("via") or "",
-                })
-                if injected.get("ok"):
-                    waited = self._wait_for_cursor_ide_reply(target, user_message)
-                    conversation["sessionId"] = original_session_id
-                    if waited.get("ok"):
-                        self._save_state()
-                        self.log("info", "LLM send ok via Cursor DOM", {
-                            "target": target, "sessionId": conversation["sessionId"], "ms": int((time.time() - started) * 1000),
-                        })
-                        return {
-                            "ok": True,
-                            "result": {"success": True, "response": waited["assistantMessage"]["text"], "via": "cdp-dom"},
-                            "conversation": waited.get("conversation") or self._hydrate_local_conversation(conversation),
-                            "userMessage": user_message,
-                            "assistantMessage": waited["assistantMessage"],
-                            "cursorIdeHint": False,
-                            "cursorDomInjected": True,
-                        }
-                    pending = {
-                        "role": "assistant",
-                        "text": "Typed into the open Cursor tab. Click ↻ when the reply lands.",
-                        "time": time.time() * 1000,
-                    }
-                    conversation["messages"].append(pending)
-                    conversation["updatedAt"] = pending["time"]
-                    conversation["sortAt"] = pending["time"]
-                    self._save_state()
-                    return {
-                        "ok": True,
-                        "result": {"success": True, "response": pending["text"], "via": "cdp-dom-pending"},
-                        "conversation": self._hydrate_local_conversation(conversation),
-                        "userMessage": user_message,
-                        "assistantMessage": pending,
-                        "cursorIdeHint": False,
-                        "cursorDomInjected": True,
-                    }
             request = {
                 "action": "send",
                 "prompt": clean,
@@ -1770,11 +1741,8 @@ class LlmService:
                 "source_file": conversation.get("sourceFile") or source.get("sourceFile") or "",
                 "timeout": AGENT_TURN_TIMEOUT_SECONDS,
             }
-            # Let the agent actually run commands. Each CLI spells "auto-approve" its own
-            # way: Codex sandboxes per request, Claude takes a permission mode, and Cursor
-            # gates every shell command behind --force — without which its reply reads
-            # "Command blocked; no output". This is a private, single-operator tool where
-            # the whole point is the agent doing work, so all three are set to proceed.
+            # Preserve legacy request metadata while standalone drivers own execution.
+            # Each CLI has distinct headless permission syntax.
             if provider["bundle"] == "claude":
                 request["permission_mode"] = "bypassPermissions"
             elif provider["bundle"] == "codex":
@@ -1782,25 +1750,8 @@ class LlmService:
             elif provider["bundle"] == "cursor":
                 request["force_commands"] = True
             elif provider["bundle"] == "grok":
-                # Grok reads permission_mode per turn; bypassPermissions is its
-                # run-without-prompting mode, the same intent as the flags above.
                 request["permission_mode"] = "bypassPermissions"
-            elif provider["bundle"] == "ssh":
-                # Nothing to auto-approve: the message *is* the command, and the
-                # operator typed it. This request never reaches a datasource anyway.
-                pass
-            runtime_path = self._runtime_for(source["provider"])
-
-            # An agent chat bound to a saved SSH connection runs its CLI on that
-            # machine. The runner is built per turn and torn down after: its
-            # multiplexed socket lingers briefly on its own, so a following turn
-            # still skips the handshake, and nothing holds a connection open
-            # between messages that may be hours apart.
-            ssh_connection_id = str(conversation.get("sshConnection") or "")
-            remote_runner = None
-
             def run_once() -> dict:
-                nonlocal remote_runner
                 if provider["bundle"] == "ssh":
                     # An SSH chat is not a datasource turn. Its shell has to outlive
                     # the message so `cd`, `export` and a half-answered `sudo` prompt
@@ -1822,24 +1773,11 @@ class LlmService:
                     # `result`, and a bare result dict loses every key it carries —
                     # which showed up as a successful send with an empty reply.
                     return {"success": True, "result": outcome}
-                if running_as_other_user:
-                    # Must stay a subprocess: the whole point is running under a different
-                    # uid, and an import cannot change the uid of this process.
-                    return self._run_pipeline_for_user(
-                        conversation["osUser"], runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS
-                    )
-                extra = None
-                if ssh_connection_id:
-                    from . import datasources as datasources_module
-
-                    if remote_runner is None:
-                        remote_runner = datasources_module.ssh_runner_for(
-                            self.app_home, ssh_connection_id
-                        )
-                    extra = {"command_runner": remote_runner}
-                return self._run_datasource(
-                    source["provider"], request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS, extra=extra
-                ) or self._run_pipeline(runtime_path, request, AGENT_TURN_WRAPPER_TIMEOUT_SECONDS)
+                outcome = self.backend.send(
+                    conversation, source, request, self._register_canceller,
+                    self._clear_canceller, self.on_progress,
+                )
+                return {"success": True, "result": outcome}
 
             # A turn can block for a long time inside run_once() with no visible sign of
             # life — the CLI is a single blocking subprocess call, not a live stream. Until
@@ -1862,21 +1800,7 @@ class LlmService:
             heartbeat_thread = threading.Thread(target=_emit_heartbeat, daemon=True)
             heartbeat_thread.start()
             try:
-                # The Claude CLI refreshes its OAuth token in a shared file, and two claude
-                # invocations near a token's expiry collide: "another Claude Code process is
-                # refreshing it or exited mid-refresh". The CLI itself calls this transient
-                # and says to retry in about a minute, so do exactly that rather than
-                # surfacing a spurious failure. Safe to re-run: nothing in the transcript has
-                # been touched based on the result yet.
                 pipeline_response = run_once()
-                for attempt in range(3):
-                    if not _is_transient_auth_refresh(self._pipeline_result(pipeline_response)):
-                        break
-                    self.log("warn", "Transient OAuth token-refresh collision; retrying", {
-                        "target": target, "provider": source["provider"], "attempt": attempt + 1,
-                    })
-                    time.sleep(10.0 * (attempt + 1))
-                    pipeline_response = run_once()
             except LookupError as error:
                 # The saved connection is gone, or SSH is switched off on this
                 # service. Either way the agent must not quietly run here instead.
@@ -1892,13 +1816,6 @@ class LlmService:
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=1)
-                if remote_runner is not None:
-                    try:
-                        remote_runner.cleanup()
-                    except Exception as error:  # noqa: BLE001
-                        self.log("warn", "Remote runner cleanup failed", {
-                            "target": target, "error": str(error),
-                        })
             result = self._pipeline_result(pipeline_response)
             if not result.get("success"):
                 # A turn the operator stopped is not a failure. Keep the prompt they sent
@@ -1946,8 +1863,11 @@ class LlmService:
                         ]
                         failure["sessions"]["users"].sort(key=lambda user: (-int(bool(user["ready"])), user["username"]))
                 return failure
-            conversation["sessionId"] = original_session_id or str(result.get("session_id") or conversation.get("sessionId") or "")
+            conversation["sessionId"] = str(result.get("session_id") or "")
             assistant_message = {"role": "assistant", "text": str(result.get("response") or ""), "time": time.time() * 1000}
+            if result.get("turn_id"):
+                user_message["turnId"] = result["turn_id"]
+                assistant_message["turnId"] = result["turn_id"]
             # An SSH turn that ended with something asking for a password says so,
             # and the UI collects it in a field that does not echo instead of the
             # composer, which would put it in the transcript.
@@ -1956,18 +1876,28 @@ class LlmService:
             conversation["messages"].append(assistant_message)
             conversation["updatedAt"] = assistant_message["time"]
             conversation["sortAt"] = assistant_message["time"]
-            self._save_state()
+            projection_pending = False
+            try:
+                self._save_state()
+                if result.get("turn_id"):
+                    self.backend.projected(target, result["turn_id"])
+            except Exception as error:
+                if not result.get("turn_id"):
+                    raise
+                projection_pending = True
+                self.log("error", "Completed turn projection pending", {
+                    "target": target, "turnId": result["turn_id"], "exceptionType": type(error).__name__,
+                })
             self.log("info", "LLM send ok", {
                 "target": target,
                 "provider": source["provider"],
                 "sessionId": conversation["sessionId"],
                 "responseChars": len(str(result.get("response") or "")),
-                "responsePreview": clip_text(result.get("response")),
                 "ms": int((time.time() - started) * 1000),
             })
             shown = self._hydrate_local_conversation(conversation)
             try:
-                reloaded = self.reload_conversation(target)
+                reloaded = self.reload_conversation(target) if source["provider"] == "ssh" else None
                 if reloaded and isinstance(reloaded.get("messages"), list) and len(reloaded["messages"]) >= len(conversation["messages"]):
                     shown = reloaded
             except Exception as error:  # noqa: BLE001
@@ -1975,6 +1905,7 @@ class LlmService:
             return {
                 "ok": True,
                 "result": result,
+                "projectionPending": projection_pending,
                 "conversation": shown,
                 "userMessage": user_message,
                 "assistantMessage": assistant_message,
@@ -2015,91 +1946,6 @@ class LlmService:
         if isinstance(result, dict):
             return result
         return {"success": True, "status": "completed", "result": result}
-
-    def _run_datasource(
-        self, provider: str, payload: dict, timeout_seconds: float, extra: dict | None = None
-    ) -> dict | None:
-        """Call the datasource module directly, or return None to fall back to the bundle.
-
-        These are the same `subjective_*_datasource` packages the monolithic web app uses,
-        carried here as submodules under plugins/. Calling one in-process skips a Python
-        interpreter start and an exported-bundle unpack per turn, and turns a crash into a
-        real traceback instead of parsed stderr.
-
-        Returns None — never raises — when the datasource is missing or the import fails,
-        so the exported bundle stays a working fallback and the service keeps answering.
-        """
-        if not self.use_datasource_modules:
-            return None
-        try:
-            from . import datasources
-        except ImportError:
-            return None
-        # A datasource that predates the chat contract loads fine but cannot run a turn:
-        # its run() reaches the abstract base and returns a status object, so the send
-        # silently does nothing. The exported bundle can still do it, so treat "loaded but
-        # cannot chat" exactly like "not installed" and fall through to it.
-        if str(payload.get("action") or "") == "send":
-            try:
-                if not datasources.supports_chat(datasources.load(provider)):
-                    self.log("info", "Datasource module cannot run a turn; using exported bundle", {
-                        "provider": provider,
-                        "reason": "no handle_message/run of its own — datasource predates the chat contract",
-                    })
-                    return None
-            except LookupError:
-                return None
-
-        started = time.time()
-        try:
-            connection = datasources.connection_for(
-                provider,
-                workspace=str(payload.get("working_directory") or ""),
-                session_id=str(payload.get("session_id") or ""),
-                timeout=int(timeout_seconds),
-                extra=extra,
-            )
-            target = str(payload.get("target") or "")
-
-            def hold(instance) -> None:
-                # Only datasources that implement cancel() can be stopped; the rest simply
-                # run to completion, and Stop reports that it signalled nothing.
-                canceller = getattr(instance, "cancel", None)
-                if target and callable(canceller):
-                    self._register_canceller(target, canceller)
-
-            try:
-                result = datasources.run(provider, payload, connection, on_instance=hold)
-            finally:
-                if target:
-                    self._clear_canceller(target)
-        except LookupError as error:
-            # Not installed for this provider — the bundle path handles it.
-            self.log("info", "Datasource module unavailable; using exported bundle", {
-                "provider": provider, "message": str(error)[:200],
-            })
-            return None
-        except Exception as error:  # noqa: BLE001
-            self.log("error", "Datasource module call failed; using exported bundle", {
-                "provider": provider, "message": str(error)[:300],
-            })
-            return None
-        self.log("info", "Datasource module call", {
-            "provider": provider,
-            "action": str(payload.get("action") or ""),
-            "status": result.get("status") or "",
-            "ok": result.get("success") is not False,
-            "ms": int((time.time() - started) * 1000),
-        })
-        # _pipeline_result unwraps the bundle's {success, result:{pipeline_result}} envelope,
-        # but only on success — its failure branch returns the envelope untouched. Wrapping a
-        # failure would therefore bury `status` and `error` one level down where nothing looks
-        # for them, and the caller reports an empty "Unknown error" while the datasource knew
-        # exactly what went wrong. A failed datasource result already carries both fields at
-        # the top level, which is the shape that branch expects, so hand it back unwrapped.
-        if result.get("success") is False:
-            return result
-        return {"success": True, "result": result}
 
     def _run_pipeline(self, runtime_path: str, payload: dict, timeout_seconds: float) -> dict:
         action = str(payload.get("action") or "history") if isinstance(payload, dict) else "history"
@@ -2183,7 +2029,6 @@ class LlmService:
             "ok": parsed.get("success") is not False,
             "status": parsed.get("status") or "",
             "stderrChars": len(stderr),
-            "stderrPreview": clip_text(stderr, 240),
             "ms": int((time.time() - started) * 1000),
         })
         return parsed
@@ -2225,34 +2070,3 @@ class LlmService:
                 "status": "runtime_error",
                 "error": str(stderr or "").strip() or str(stdout or "").strip() or "Exported pipeline returned invalid JSON.",
             }
-
-    def _run_pipeline_for_user(self, os_user: str, runtime_path: str, payload: dict, timeout_seconds: float) -> dict:
-        """Same one-shot invocation as _run_pipeline, but through `os_user`'s
-        already-authenticated bridge session. Only called once send_message() has
-        confirmed that session is ready."""
-        if not Path(runtime_path).exists() or not Path(self.pipeline_runtime).exists():
-            missing = runtime_path if not Path(runtime_path).exists() else self.pipeline_runtime
-            return {"success": False, "status": "runtime_missing", "error": f"Pipeline runtime is missing: {missing}"}
-        started = time.time()
-        self.log("info", "LLM pipeline as OS user", {
-            "osUser": os_user,
-            "action": str(payload.get("action") or "") if isinstance(payload, dict) else "",
-            "runtime": os.path.basename(runtime_path),
-            "timeoutSeconds": timeout_seconds,
-        })
-        try:
-            argv = [self.python_path, self.pipeline_runtime, runtime_path, "--timeout", str(timeout_seconds)]
-            bridged = self.su_session_manager.run_in_session(
-                os_user, argv, json.dumps(payload), timeout_ms=int(timeout_seconds * 1000 + 10000)
-            )
-            parsed = self._parse_pipeline_output(bridged["stdout"], bridged["stderr"])
-            self.log("error" if parsed.get("success") is False else "info", "LLM pipeline as OS user done", {
-                "osUser": os_user,
-                "ok": parsed.get("success") is not False,
-                "status": parsed.get("status") or "",
-                "ms": int((time.time() - started) * 1000),
-            })
-            return parsed
-        except Exception as error:  # noqa: BLE001
-            self.log("error", "LLM pipeline as OS user failed", {"osUser": os_user, "message": str(error)})
-            return {"success": False, "status": "runtime_error", "error": str(error)}

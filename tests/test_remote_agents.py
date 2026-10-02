@@ -106,61 +106,26 @@ def test_an_ordinary_chat_is_bound_to_no_machine(service):
     assert conversation["sshConnection"] is None
 
 
-def test_the_runner_reaches_the_datasource(service, monkeypatch):
-    """End of the wiring: what connection_for passes is what the datasource gets."""
-    seen = {}
-
-    def fake_run(provider, payload, connection=None, on_instance=None):
-        seen["connection"] = connection
-        return {"success": True, "status": "completed", "response": "done"}
-
-    monkeypatch.setattr(datasources, "run", fake_run)
-    monkeypatch.setattr(datasources, "supports_chat", lambda cls: True)
-    monkeypatch.setattr(datasources, "load", lambda provider: object)
-    monkeypatch.setattr(datasources, "instantiate", lambda cls, connection=None: object())
-
-    sentinel = object()
-    monkeypatch.setattr(datasources, "ssh_runner_for", lambda home, identifier: sentinel)
-    conversation = service.create_conversation(
-        provider="claude", name="Remote", ssh_connection="abc123",
-    )
-    service.send_message(conversation["target"], "hello")
-    assert seen["connection"]["command_runner"] is sentinel
+@pytest.mark.parametrize("ssh_connection", ["abc123", ""])
+def test_machine_binding_reaches_standalone_backend(service, monkeypatch, ssh_connection):
+    seen = []
+    def send(conversation, source, request, register, clear, progress):
+        seen.append(conversation.get("sshConnection"))
+        return {"success": True, "response": "done"}
+    monkeypatch.setattr(service.backend, "send", send)
+    monkeypatch.setattr(datasources, "run", lambda *a, **k: pytest.fail("legacy datasource invoked"))
+    conversation = service.create_conversation(provider="claude", name="Machine", ssh_connection=ssh_connection)
+    assert service.send_message(conversation["target"], "hello")["ok"] is True
+    assert seen == [ssh_connection or None]
 
 
-def test_a_local_chat_is_given_no_runner(service, monkeypatch):
-    seen = {}
-    monkeypatch.setattr(datasources, "run", lambda p, payload, connection=None, on_instance=None:
-                        (seen.update(connection=connection),
-                         {"success": True, "status": "completed", "response": "done"})[1])
-    monkeypatch.setattr(datasources, "supports_chat", lambda cls: True)
-    monkeypatch.setattr(datasources, "load", lambda provider: object)
-    monkeypatch.setattr(datasources, "instantiate", lambda cls, connection=None: object())
-
-    conversation = service.create_conversation(provider="claude", name="Local")
-    service.send_message(conversation["target"], "hello")
-    assert "command_runner" not in seen["connection"]
-
-
-def test_an_unreachable_machine_fails_rather_than_running_here(service, monkeypatch):
-    """The dangerous failure: an agent silently running on the wrong computer."""
-    def unavailable(home, identifier):
-        raise LookupError("The SSH terminal is disabled.")
-
-    monkeypatch.setattr(datasources, "ssh_runner_for", unavailable)
-    monkeypatch.setattr(datasources, "supports_chat", lambda cls: True)
-    monkeypatch.setattr(datasources, "load", lambda provider: object)
-    ran = []
-    monkeypatch.setattr(datasources, "run", lambda *args, **kwargs: ran.append(args))
-
-    conversation = service.create_conversation(
-        provider="claude", name="Remote", ssh_connection="gone",
-    )
+def test_an_unconfigured_machine_fails_rather_than_running_here(service, monkeypatch):
+    monkeypatch.setattr(service.backend.model, "submit", lambda *a, **k: pytest.fail("unexpected execution"))
+    conversation = service.create_conversation(provider="claude", name="Remote", ssh_connection="gone")
     outcome = service.send_message(conversation["target"], "hello")
     assert outcome["ok"] is False
     assert outcome["status"] == "configuration_required"
-    assert "another machine" in outcome["error"]
-    assert ran == []
+    assert "SSH identity" in outcome["error"]
 
 
 def test_a_chat_cannot_be_both_another_user_and_another_machine(service):

@@ -34,7 +34,7 @@ import re
 import threading
 import time
 
-from . import datasources, ssh_terminal
+from . import ssh_connections, ssh_terminal
 
 _log = logging.getLogger(__name__)
 # Set once the missing-dependency warning has been given; see _draw.
@@ -570,7 +570,7 @@ def connection_for_conversation(conversation: dict, app_home: str = "") -> dict:
     reference = str(conversation.get("workspace") or "").strip()
     if not app_home:
         # No store to consult: only the longhand form can be resolved.
-        settings = datasources.ssh_connection_from_workspace(reference)
+        settings = ssh_connections.ssh_connection_from_workspace(reference)
         if not settings.get("host"):
             raise ValueError(
                 "This SSH chat has no host. Set its workspace to a machine — "

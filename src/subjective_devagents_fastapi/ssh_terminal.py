@@ -3,7 +3,7 @@
 The SSH datasource answers a pipeline turn: one command in, one result out. That is
 the wrong shape for a terminal, where the operator expects a connection that stays up,
 state that persists between commands, and output that appears while the command is
-still running. `SubjectiveSshDataSource.open_shell()` provides that shape; this module
+still running. `SshRuntime.open_shell()` provides that shape; this module
 is the service-side half — the interlocks, the accepted parameters, and the bookkeeping
 for the live sessions.
 
@@ -18,7 +18,7 @@ interlocks as `shell_exec`:
 
 Credentials come from the operator's own machine by default: naming a `Host` alias from
 `~/.ssh/config` is enough, and then no secret passes through this service at all. Keys
-and passwords may be supplied per session instead; they are handed to the datasource,
+and passwords may be supplied per session instead; they are handed to the SSH runtime,
 which keeps them out of argv, logs and results.
 """
 from __future__ import annotations
@@ -28,7 +28,8 @@ import threading
 import time
 from typing import Any
 
-from . import auth, datasources
+from . import auth
+from .ssh_runtime import SshRuntime
 
 # Connection fields a browser may set. Everything else in the datasource's schema is
 # either derived here or deliberately not remote-controllable.
@@ -204,7 +205,7 @@ def clamp_size(cols, rows) -> tuple[int, int]:
 
 
 def open_session(connection: dict, on_event=None, *, pty: bool = False, cols=0, rows=0):
-    """Build the datasource and open a live session on the named machine.
+    """Build the SSH runtime and open a live session on the named machine.
 
     Two shapes, chosen by the caller:
 
@@ -215,19 +216,12 @@ def open_session(connection: dict, on_event=None, *, pty: bool = False, cols=0, 
       exchange there is no framing at all: only a byte stream for a terminal
       emulator to render.
 
-    Raises LookupError when the plugin or the ssh client is missing or the connection
+    Raises LookupError when the ssh client is missing or the connection
     is incomplete, and ValueError when a pinned host key does not match.
     """
     ensure_available()
-    datasource_class = datasources.load("ssh")
-    instance = datasources.instantiate(datasource_class, connection)
-    name = "open_pty" if pty else "open_shell"
-    opener = getattr(instance, name, None)
-    if not callable(opener):
-        raise LookupError(
-            f"The installed SSH datasource has no {name}(); update the plugin to a "
-            "version that supports this session type."
-        )
+    instance = SshRuntime(connection)
+    opener = instance.open_pty if pty else instance.open_shell
     if pty:
         width, height = clamp_size(cols, rows)
         return instance, opener(cols=width, rows=height, on_event=on_event)

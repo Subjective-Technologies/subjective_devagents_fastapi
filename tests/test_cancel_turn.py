@@ -23,9 +23,7 @@ def service(tmp_path):
     return LlmService(root=str(tmp_path), app_home=str(tmp_path / "home"))
 
 
-def test_stop_reaches_the_datasource_running_the_turn(service, monkeypatch):
-    from subjective_devagents_fastapi import datasources
-
+def test_stop_reaches_the_backend_running_the_turn(service, monkeypatch):
     chat = service.create_conversation("claude", "stoppable")
     running = threading.Event()
     cancelled = threading.Event()
@@ -42,10 +40,10 @@ def test_stop_reaches_the_datasource_running_the_turn(service, monkeypatch):
             return {"success": False, "status": "cancelled", "error": "Stopped."}
 
     monkeypatch.setattr(
-        datasources, "run",
-        lambda provider, payload, connection=None, on_instance=None: (
-            on_instance(SlowDatasource()) if on_instance else None
-        ) or SlowDatasource().run(payload),
+        service.backend, "send",
+        lambda conversation, source, request, register, clear, progress: (
+            register(conversation["target"], SlowDatasource().cancel)
+        ) or SlowDatasource().run(request),
     )
 
     outcome: dict = {}
@@ -58,7 +56,7 @@ def test_stop_reaches_the_datasource_running_the_turn(service, monkeypatch):
 
     assert result["ok"] is True
     assert result["running"] is True, "the turn was in flight and should be reported as such"
-    assert result["stopped"] is True, "the datasource's cancel() was never called"
+    assert result["stopped"] is True, "the backend's cancel() was never called"
     assert cancelled.is_set()
     assert outcome.get("stopped") is True
     assert outcome.get("status") == "cancelled"
@@ -66,8 +64,6 @@ def test_stop_reaches_the_datasource_running_the_turn(service, monkeypatch):
 
 def test_the_stopped_prompt_is_kept_not_rolled_back(service, monkeypatch):
     """Rolling the message back would make Stop look like the prompt was never sent."""
-    from subjective_devagents_fastapi import datasources
-
     chat = service.create_conversation("claude", "keeps prompt")
 
     class Stopped:
@@ -78,8 +74,8 @@ def test_the_stopped_prompt_is_kept_not_rolled_back(service, monkeypatch):
             return {"success": False, "status": "cancelled", "error": "Stopped."}
 
     monkeypatch.setattr(
-        datasources, "run",
-        lambda provider, payload, connection=None, on_instance=None: Stopped().run(payload),
+        service.backend, "send",
+        lambda conversation, source, request, register, clear, progress: Stopped().run(request),
     )
 
     outcome = service.send_message(chat["target"], "remember this prompt")
@@ -108,8 +104,6 @@ def test_a_stop_racing_the_spawn_is_not_lost(service, monkeypatch):
     """Stop can land after the request is accepted but before the CLI process exists.
     Latching it means the turn is cancelled as soon as it registers, rather than running
     on unstoppable."""
-    from subjective_devagents_fastapi import datasources
-
     chat = service.create_conversation("claude", "racy")
     target = chat["target"]
     service.busy.add(target)

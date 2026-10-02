@@ -36,6 +36,7 @@ from . import auth, shell_exec, ssh_terminal
 from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
+from .language_models.api import router as language_model_router
 
 # Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
 # with the live git SHA so View Source proves which build the browser loaded.
@@ -230,6 +231,7 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    application.state.language_model = None
     loop = asyncio.get_running_loop()
     state.hub = EventHub(loop)
     state.client_root = _client_root()
@@ -270,19 +272,7 @@ async def lifespan(application: FastAPI):
         "webUiRelease": WEB_UI_RELEASE,
     })
 
-    # Report the datasource submodules at startup. A plugin that fails to import degrades
-    # silently to the exported bundle, and in a container the bundles are not present at
-    # all — so an unreported import failure surfaces much later as a failed agent turn.
-    from . import datasources
-
-    report = await asyncio.to_thread(datasources.available)
-    loaded = sorted(key for key, entry in report.items() if entry["loaded"])
-    missing = {key: entry.get("error", "")[:160] for key, entry in report.items() if not entry["loaded"]}
-    default_log("info" if loaded else "error", "Datasource modules resolved", {
-        "loaded": loaded,
-        "missing": missing,
-        "pluginRoots": [str(root) for root in datasources.plugin_roots()],
-    })
+    default_log("info", "LanguageModel backend selected", {"datasourceExecution": False})
 
     # My Agents is the LLM UI. IRC is optional and the default host is often down;
     # reconnect storms painted the status bar as errors on every send.
@@ -306,6 +296,8 @@ async def lifespan(application: FastAPI):
             await asyncio.sleep(refresh_every_ms / 1000)
             await state.refresh_history("interval")
 
+    # Both API surfaces share one durable execution engine.
+    application.state.language_model = core.llm_service.backend.model
     refresh_task = asyncio.create_task(refresh_loop())
     try:
         yield
@@ -313,9 +305,11 @@ async def lifespan(application: FastAPI):
         refresh_task.cancel()
         default_log("info", "Shutting down")
         await asyncio.to_thread(core.shutdown)
+        application.state.language_model = None
 
 
 app = FastAPI(title="Subjective DevAgents", lifespan=lifespan)
+app.include_router(language_model_router)
 
 def _serve_ui() -> bool:
     """False on the Hetzner API host. Set SUBJECTIVE_DEVAGENTS_SERVE_UI=1 to ship HTML too."""
@@ -725,32 +719,13 @@ async def api_llm_cancel_message(body: dict = Body(default={})) -> dict:
 
 @app.get("/api/llm/providers")
 async def api_llm_providers() -> dict:
-    """The agents a new chat can actually be created with.
-
-    The picker used to hard-code its options in two index.html files, which drifted from
-    the backend: Grok was creatable here but absent from the UI, while Cursor was offered
-    despite its datasource module being missing on this host. Serving the list is the only
-    way the two stay in step.
-
-    `available` reports whether the in-process datasource module imports. It is a hint, not
-    a gate — a provider whose module is missing can still run through its exported bundle,
-    so every writable provider is listed either way.
-    """
-    from . import datasources
+    """Stable provider discovery, backed by standalone drivers."""
     from .llm_service import DEFAULT_PROVIDER, WRITABLE_PROVIDERS
-
-    report = await asyncio.to_thread(datasources.available)
     return {
-        "ok": True,
-        "default": DEFAULT_PROVIDER,
-        "providers": [
-            {
-                "key": key,
-                "label": provider["label"],
-                "available": bool((report.get(key) or {}).get("loaded")),
-            }
-            for key, provider in WRITABLE_PROVIDERS.items()
-        ],
+        "ok": True, "default": DEFAULT_PROVIDER,
+        "providers": [{"key": key, "label": provider["label"],
+                       "available": key == "ssh" or f"cli:{key}" in core().llm_service.backend.model.strategies}
+                      for key, provider in WRITABLE_PROVIDERS.items()],
     }
 
 
@@ -800,19 +775,17 @@ async def api_llm_send_message(body: dict = Body(default={})) -> dict:
 
 @app.get("/api/datasources")
 async def api_datasources() -> dict:
-    """Which datasource submodules resolved, and from where.
-
-    The first thing to check when a provider misbehaves: it says whether the service is
-    calling the plugin package in-process or has fallen back to the exported bundle.
-    """
-    from . import datasources
-
-    report = await asyncio.to_thread(datasources.available)
+    """Preserve the diagnostics envelope while reporting standalone execution."""
+    from .llm_service import WRITABLE_PROVIDERS
+    report = {key: {"loaded": f"cli:{key}" in core().llm_service.backend.model.strategies,
+                    "backend": "language-model", "error": ""}
+              for key in WRITABLE_PROVIDERS if key != "ssh"}
     return {
         "ok": True,
         "datasources": report,
-        "pluginRoots": [str(root) for root in datasources.plugin_roots()],
-        "usingModules": core().llm_service.use_datasource_modules,
+        "pluginRoots": [],
+        "usingModules": False,
+        "backend": "language-model",
     }
 
 
@@ -1481,10 +1454,9 @@ async def api_test_ssh_connection(body: dict = Body(default={})) -> Response:
         return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
 
     def probe() -> dict:
-        from . import datasources
+        from .ssh_runtime import SshRuntime
 
-        instance = datasources.instantiate(datasources.load("ssh"), settings)
-        return instance.get_status()
+        return SshRuntime(settings).get_status()
 
     try:
         status = await asyncio.to_thread(probe)
