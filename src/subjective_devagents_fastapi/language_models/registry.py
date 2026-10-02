@@ -31,7 +31,7 @@ class IdentityRegistry:
                 raise ValueError("Invalid identity id")
             if identity.id in self._identities:
                 raise ValueError("Duplicate identity id")
-            if identity.strategy not in {"cli", "api"}:
+            if identity.strategy not in {"cli", "api", "api_agent"}:
                 raise ValueError("Unknown model strategy")
             if identity.os_user and not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]*[$]?", identity.os_user):
                 raise ValueError("Invalid OS user")
@@ -56,6 +56,28 @@ class IdentityRegistry:
                     SshTunnel(identity.ssh_host, identity.os_user or None)
                 if identity.api_key_env or identity.api_base_url:
                     raise ValueError("CLI subscription identities cannot select API credentials")
+            elif identity.strategy == "api_agent":
+                # Unlike "api", this strategy runs tools locally/remotely like a CLI identity
+                # does, so it shares the CLI branch's execution-target checks instead of
+                # forbidding them. The endpoint itself is inference-only (operator-trusted,
+                # often a private non-TLS proxy); only credential-in-URL and malformed-URL
+                # shapes are rejected here.
+                if identity.provider not in {"codex", "claude", "grok"}:
+                    raise ValueError("Unsupported api_agent provider")
+                if (not identity.workspace.startswith("/") or "\x00" in identity.workspace
+                        or ".." in PurePosixPath(identity.workspace).parts):
+                    raise ValueError("api_agent workspace must be an absolute path without parent traversal")
+                if identity.home and (not identity.home.startswith("/") or "\x00" in identity.home
+                                      or ".." in PurePosixPath(identity.home).parts):
+                    raise ValueError("api_agent home must be an absolute path without parent traversal")
+                url = urlsplit(identity.api_base_url)
+                if url.scheme not in {"https", "http"} or not url.hostname or url.username or url.password or url.query or url.fragment:
+                    raise ValueError("api_agent URL must be a plain http(s) origin with no embedded credentials")
+                if not identity.model or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identity.api_key_env):
+                    raise ValueError("api_agent identities require model and API-key environment variable name")
+                if identity.ssh_host:
+                    from .transports import SshTunnel
+                    SshTunnel(identity.ssh_host, identity.os_user or None)
             else:
                 url = urlsplit(identity.api_base_url)
                 if (url.scheme not in {"https", "http"} or not url.hostname or url.username or url.password

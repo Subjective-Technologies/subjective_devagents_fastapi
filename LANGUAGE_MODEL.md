@@ -1,10 +1,45 @@
 # LanguageModel replacement engine
 
-`LanguageModel` is a provider-neutral facade over `ModelStrategy`. `Cli` and `Api`
-implement that strategy; `CodexCli` and `ClaudeCli` implement the `CliDriver`
-protocol. `LocalProcess` and `SshTunnel` implement `ProcessTransport` independently
-of the provider. There are no imports from datasource plugins, pipeline bundles,
-or the abstract datasource library in this package.
+`LanguageModel` is a provider-neutral facade over `ModelStrategy`. `Cli`, `Api` and
+`ApiAgent` implement that strategy; `CodexCli` and `ClaudeCli` implement the
+`CliDriver` protocol. `LocalProcess` and `SshTunnel` implement `ProcessTransport`
+independently of the provider. There are no imports from datasource plugins,
+pipeline bundles, or the abstract datasource library in this package.
+
+## CLI vs api_agent: why there are two execution paths
+
+`Cli` spawns the vendor's own binary (`claude`, `codex`, `grok`, `cursor-agent`),
+which is itself a full coding agent: it runs Bash, edits files, and reports its own
+tool-use stream. That binary has to be installed, logged in, and kept compatible on
+every execution host, which is the main source of operational unreliability this
+strategy exists to retire.
+
+`ApiAgent` replaces it for `claude`, `codex` and `grok` by talking straight to an
+inference-only HTTP endpoint (for example the `CLIProxyAPI` described in
+`/subjective/how_to_llm.md`) using the OpenAI Chat Completions tool-calling wire
+format. That endpoint never touches the workspace — "the client runs tools, then
+sends the result back" — so `ApiAgent` *is* the tool loop and tool executor now:
+it declares `Bash`, `Read`, `Write`, `Edit`, `Grep`, `Glob` and `TodoWrite`, and runs
+them itself through the same `LocalProcess`/`SshTunnel` transports and sudo/SSH
+placement `Cli` uses, so remote and other-OS-user accounts work identically. One
+`ApiAgent` instance serves every provider behind the proxy; step naming for the live
+feed is shared with `ClaudeCli.tool_step` so the frontend did not need to change.
+Cursor has no account behind the proxy, so it stays on `Cli` unconditionally.
+
+Consequences worth knowing operationally:
+
+- No native session: the proxy is stateless, so `ApiAgent` never returns a
+  `session_id` and resends the full prior transcript (user/assistant pairs only,
+  not intermediate tool calls) on every turn, same as the pre-existing `Api` class.
+- Images are refused (`unsupported_attachments`), same as `Api` today.
+- A tool call outside the effective set (sandbox + `allowed_tools`) is not fatal:
+  the model is told it is not permitted and can continue without it.
+- `api_agent`'s URL validation is deliberately looser than `api`'s: it allows plain
+  `http://` to any host, because the documented deployment target
+  (`CLIProxyAPI`) runs TLS off by design and `api_base_url` is operator-configured,
+  never client input. Prefer the loopback or Tailscale address over a public one
+  when more than one is reachable from the execution host, since the bearer key
+  travels in the clear.
 
 The structural contract is canonical architecture v4.1.0, package
 `package.devagents-language-model`. Python `Identity` and `TurnStore` implement
@@ -93,7 +128,7 @@ and legacy conversation files. New databases are created with mode `0600`.
 Keep the database on a local filesystem supporting SQLite locking, not an object
 storage mount; all API workers must share this one database for admission control.
 
-An optional API identity uses this shape:
+An optional API identity (no tool use, single text response) uses this shape:
 
 ```json
 {
@@ -110,6 +145,52 @@ The referenced environment variable is loaded by the operator's service environm
 not copied into the JSON file. This API strategy does not consume a CLI subscription.
 Endpoints are operator-configured; HTTP clients cannot provide commands, credential
 paths, URLs or OS users in a send request.
+
+### Agentic API identity (`api_agent`): proxy-backed replacement for a CLI account
+
+An `api_agent` identity keeps the coding-agent behavior (Bash, file edits, over SSH
+or as another OS user) but gets inference from an HTTP endpoint instead of a locally
+installed, logged-in CLI binary:
+
+```json
+{
+  "id": "claude-alice",
+  "strategy": "api_agent",
+  "provider": "claude",
+  "model": "claude-sonnet-4-5",
+  "workspace": "/srv/workspaces/project",
+  "home": "/srv/devagents/accounts/claude-alice",
+  "os_user": "alice",
+  "api_base_url": "http://127.0.0.1:8317/v1",
+  "api_key_env": "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
+}
+```
+
+`provider` must be `claude`, `codex` or `grok` (the accounts `CLIProxyAPI` fronts;
+there is no Cursor account behind it). `model` must be a current id from that
+server's `GET /v1/models` — the catalog changes, so do not copy a stale id from
+this document. `api_key_env` names the environment variable holding the proxy's
+*client* key (`access.api-keys` in the proxy's config, per `/subjective/how_to_llm.md`),
+set by the operator's service environment, never written into this file.
+
+**Existing deployments with no `language-models.json` at all** (the common case —
+see `SUBJECTIVE_LANGUAGE_MODELS_CONFIG` below) get `api_agent` identities built
+automatically, per OS account, once the operator sets:
+
+```bash
+export SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL=http://127.0.0.1:8317/v1      # or the Tailscale/public address
+export SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY=...                       # the proxy's client key, never the file itself
+export SUBJECTIVE_DEVAGENTS_LLM_MODEL_CLAUDE=claude-sonnet-4-5          # a current id from GET /v1/models
+export SUBJECTIVE_DEVAGENTS_LLM_MODEL_CODEX=...
+export SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK=...
+```
+
+Until `SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL` and the relevant per-provider model
+variable are both set, that provider keeps using its existing CLI account —
+nothing changes until an operator opts in. A conversation already bound to the
+old CLI identity will not silently switch: `identity_changed` is returned until an
+explicit handoff, exactly as for any other identity-configuration edit (see
+"Configure accounts" above).
 
 ## Use the API
 

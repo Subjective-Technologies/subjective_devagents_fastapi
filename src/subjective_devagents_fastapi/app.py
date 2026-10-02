@@ -786,9 +786,11 @@ async def api_datasources() -> dict:
     model_path = str(Path(__file__).with_name("language_models") / "strategies.py")
     for key in WRITABLE_PROVIDERS:
         entry = report.setdefault(key, {"package": f"language-model:{key}", "found": True})
+        strategies = [name for name in (f"cli:{key}", f"api_agent:{key}") if name in model.strategies]
         entry.update({
             "found": True,
-            "loaded": f"cli:{key}" in model.strategies or key == "ssh",
+            "loaded": bool(strategies) or key == "ssh",
+            "strategies": strategies,
             "path": model_path,
             "backend": "language-model",
             "execution": "language-model",

@@ -19,6 +19,34 @@ from .registry import IdentityRegistry, image_support
 from .store import TurnStore, TERMINAL
 
 
+PROXY_URL_ENV = "SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL"
+PROXY_KEY_ENV = "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
+PROXY_MODEL_ENV = {"claude": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CLAUDE",
+                   "codex": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CODEX",
+                   "grok": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK"}
+
+
+def proxy_identity(provider: str, username: str, workspace: str, home: str) -> Identity | None:
+    """An ad hoc api_agent identity when the inference proxy is configured for this provider.
+
+    Returns None (caller falls back to the CLI identity below) when the operator has not set
+    SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL and the per-provider model id: this keeps every existing
+    deployment on its current CLI behavior until it explicitly opts in. Cursor has no backend
+    behind the proxy, so it is never offered one here.
+    """
+    model_env = PROXY_MODEL_ENV.get(provider)
+    if model_env is None:
+        return None
+    base_url = os.environ.get(PROXY_URL_ENV, "").strip()
+    model = os.environ.get(model_env, "").strip()
+    if not base_url or not model:
+        return None
+    key = hashlib.sha256(json.dumps(["api_agent", provider, username, workspace, base_url, model]).encode()).hexdigest()[:32]
+    return Identity(id=f"legacy-api-{key}", provider=provider, strategy="api_agent", model=model,
+                    workspace=workspace, home=home, os_user=username,
+                    api_base_url=base_url, api_key_env=PROXY_KEY_ENV, sandbox="workspace-write")
+
+
 def find_executable(binary: str, home: str) -> str:
     """Find installed code without sourcing a shell or inheriting its credentials."""
     directories = [f"{home}/.local/bin", f"{home}/.npm-global/bin", "/usr/local/bin", "/usr/bin", "/bin"]
@@ -70,6 +98,10 @@ class LegacyLanguageModel:
             raise ModelError("unsupported_provider", "No standalone driver is registered for this provider.")
         account = pwd.getpwnam(username)
         home = account.pw_dir
+        api_identity = proxy_identity(provider, username, workspace, home)
+        if api_identity is not None:
+            self.model.identities.register_legacy(api_identity)
+            return api_identity
         config_dir = str(Path(home) / {"codex": ".codex", "claude": ".claude", "cursor": ".config/cursor", "grok": ".grok"}[provider])
         binary = {"cursor": "cursor-agent"}.get(provider, provider)
         executable = find_executable(binary, home)

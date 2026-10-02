@@ -3,9 +3,9 @@ from .contracts import Identity, Message, ModelError, ModelRequest, ModelResult,
 from .model import LanguageModel
 from .registry import IdentityRegistry
 from .store import TurnStore
-from .strategies import Api, ClaudeCli, Cli, CliDriver, CodexCli
+from .strategies import Api, ApiAgent, ClaudeCli, Cli, CliDriver, CodexCli
 from .transports import LocalProcess, ProcessTransport, SshTunnel
 
-__all__ = ["LanguageModel", "ModelStrategy", "Cli", "Api", "CliDriver", "CodexCli", "ClaudeCli",
+__all__ = ["LanguageModel", "ModelStrategy", "Cli", "Api", "ApiAgent", "CliDriver", "CodexCli", "ClaudeCli",
            "ProcessTransport", "LocalProcess", "SshTunnel", "Identity", "IdentityRegistry", "Message",
            "ModelRequest", "ModelResult", "ModelError", "TurnStore"]

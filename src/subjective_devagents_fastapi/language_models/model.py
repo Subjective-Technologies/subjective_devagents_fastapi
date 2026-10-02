@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from .contracts import MAX_ATTACHMENTS, Attachment, Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
 from .registry import IdentityRegistry, image_support
 from .store import TurnStore
-from .strategies import Api, ClaudeCli, Cli, CodexCli, CursorCli, GrokCli, MAX_CONTEXT_BYTES
+from .strategies import Api, ApiAgent, ClaudeCli, Cli, CodexCli, CursorCli, GrokCli, MAX_CONTEXT_BYTES
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,10 @@ class LanguageModel:
         self.strategies = strategies if strategies is not None else {
             "cli:codex": Cli(CodexCli()), "cli:claude": Cli(ClaudeCli()),
             "cli:cursor": Cli(CursorCli()), "cli:grok": Cli(GrokCli()), "api": Api(),
+            # One ApiAgent instance serves every provider the proxy fronts: tool declarations
+            # and step naming are provider-agnostic. Cursor has no equivalent backend there,
+            # so it stays on cli: above.
+            "api_agent:codex": ApiAgent(), "api_agent:claude": ApiAgent(), "api_agent:grok": ApiAgent(),
         }
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="language-model")
         self._lock = threading.RLock()

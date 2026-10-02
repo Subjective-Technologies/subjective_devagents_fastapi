@@ -30,6 +30,17 @@
       "ssh_host": "devagents-worker",
       "os_user": "worker",
       "sandbox": "read-only"
+    },
+    {
+      "id": "claude-via-proxy",
+      "strategy": "api_agent",
+      "provider": "claude",
+      "model": "claude-sonnet-4-5",
+      "workspace": "/srv/workspaces/project",
+      "home": "/srv/devagents/accounts/claude-alice",
+      "os_user": "alice",
+      "api_base_url": "http://127.0.0.1:8317/v1",
+      "api_key_env": "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
     }
   ]
 }

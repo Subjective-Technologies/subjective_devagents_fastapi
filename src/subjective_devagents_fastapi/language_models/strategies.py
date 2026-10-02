@@ -8,6 +8,7 @@ import os
 import pwd
 import shutil
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from abc import ABC, abstractmethod
 
@@ -447,6 +448,305 @@ class Api(ModelStrategy):
         try:
             while not task.done():
                 if cancelled() or asyncio.get_running_loop().time() >= deadline:
+                    return ModelResult("interrupted", error_code="api_outcome_unknown")
+                await asyncio.wait({task}, timeout=0.1)
+            return await task
+        except httpx.HTTPError:
+            return ModelResult("interrupted", error_code="api_outcome_unknown")
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+# --- agentic tool loop over the same HTTP protocol ------------------------------------------
+#
+# The vendor CLIs do two jobs: call the model, and run the tools it asks for. An inference-only
+# HTTP endpoint only does the first job (see the proxy's own docs: "the client runs tools, then
+# sends the result back"). ApiAgent is that second job, reimplemented against the OpenAI Chat
+# Completions tool-calling wire format so one implementation serves every provider the endpoint
+# fronts. Step naming is shared with ClaudeCli.tool_step so the live-step feed does not change.
+
+TOOL_OUTPUT_LIMIT = 20_000  # characters kept per tool result; bounds context growth across rounds
+MAX_TOOL_ROUNDS = 50
+
+AGENT_TOOLS = {
+    "Bash": {"type": "function", "function": {
+        "name": "Bash", "description": "Run a shell command in the workspace and return its stdout/stderr.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "The shell command to execute."}},
+            "required": ["command"]}}},
+    "Read": {"type": "function", "function": {
+        "name": "Read", "description": "Read a text file from the workspace.",
+        "parameters": {"type": "object", "properties": {
+            "file_path": {"type": "string", "description": "Absolute or workspace-relative path."}},
+            "required": ["file_path"]}}},
+    "Write": {"type": "function", "function": {
+        "name": "Write", "description": "Create or overwrite a text file in the workspace.",
+        "parameters": {"type": "object", "properties": {
+            "file_path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["file_path", "content"]}}},
+    "Edit": {"type": "function", "function": {
+        "name": "Edit", "description": "Replace one exact, unique occurrence of old_string with new_string in a file.",
+        "parameters": {"type": "object", "properties": {
+            "file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}},
+            "required": ["file_path", "old_string", "new_string"]}}},
+    "Grep": {"type": "function", "function": {
+        "name": "Grep", "description": "Search file contents under the workspace for a regular expression.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string"}, "path": {"type": "string", "description": "Defaults to the workspace root."}},
+            "required": ["pattern"]}}},
+    "Glob": {"type": "function", "function": {
+        "name": "Glob", "description": "Find files under the workspace whose name matches a glob pattern.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string"}, "path": {"type": "string"}},
+            "required": ["pattern"]}}},
+    "TodoWrite": {"type": "function", "function": {
+        "name": "TodoWrite", "description": "Record the current task plan as a todo list.",
+        "parameters": {"type": "object", "properties": {
+            "todos": {"type": "array", "items": {"type": "object"}}},
+            "required": ["todos"]}}},
+}
+MUTATING_TOOLS = frozenset({"Bash", "Write", "Edit"})
+
+
+class ToolAbort(Exception):
+    """Raised by a tool executor to stop the whole turn immediately with a final result."""
+
+    def __init__(self, result: ModelResult):
+        self.result = result
+
+
+def agent_environment(identity) -> dict[str, str]:
+    # No OAuth/CLI credential directories to export: the model behind the endpoint never
+    # sees this process's secrets, and a tool-run shell never sees ambient ones either.
+    return {"HOME": identity.home or identity.workspace, "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+
+def agent_tool_set(identity) -> dict[str, dict]:
+    names = set(AGENT_TOOLS) if identity.sandbox == "workspace-write" else set(AGENT_TOOLS) - MUTATING_TOOLS
+    if identity.allowed_tools:
+        names &= set(identity.allowed_tools)
+    return {name: AGENT_TOOLS[name] for name in names}
+
+
+def agent_system_prompt(identity) -> str:
+    lines = [
+        "You are a coding assistant with tool access to one real workspace. Use tools to inspect or "
+        "change it instead of guessing; call one tool at a time and wait for its result.",
+        f"Workspace root: {identity.workspace}",
+    ]
+    if identity.sandbox != "workspace-write":
+        lines.append("This session is read-only: Bash, Write and Edit are unavailable.")
+    if identity.allowed_tools:
+        lines.append("Only these tools are available: " + ", ".join(sorted(identity.allowed_tools)))
+    lines.append("When no further tool call is needed, answer the user directly in plain text.")
+    return "\n".join(lines)
+
+
+def _localize(argv: tuple[str, ...], env: dict[str, str], identity) -> tuple[tuple[str, ...], str | None]:
+    """Mirrors Cli._run's sudo/cwd handling so tool execution matches CLI-era placement exactly."""
+    other_user = bool(identity.os_user and not identity.ssh_host
+                      and identity.os_user != pwd.getpwuid(os.geteuid()).pw_name)
+    if not other_user:
+        return argv, identity.workspace
+    return (("sudo", "-n", "-u", identity.os_user, "--", "sh", "-c",
+             'cd -- "$1" && shift && exec "$@"', "devagents", identity.workspace,
+             "env", "-i", *(f"{key}={value}" for key, value in env.items()), *argv), None)
+
+
+def _cap(text: str) -> str:
+    if len(text) <= TOOL_OUTPUT_LIMIT:
+        return text
+    return text[:TOOL_OUTPUT_LIMIT] + "\n[truncated]"
+
+
+def _run_bounded(argv: tuple[str, ...], stdin: str, identity, transport: ProcessTransport,
+                 cancelled: Cancelled, timeout: float) -> str:
+    env = agent_environment(identity)
+    wrapped, cwd = _localize(argv, env, identity)
+    result = transport.run(Command(argv=wrapped, stdin=stdin, cwd=cwd, env=env),
+                           timeout=timeout, cancelled=cancelled, on_stdout=lambda _chunk: None)
+    if result.status == "remote_outcome_unknown":
+        raise ToolAbort(ModelResult("interrupted", error_code="remote_outcome_unknown"))
+    if result.status in {"cancelled", "timed_out"}:
+        raise ToolAbort(ModelResult(result.status, error_code=result.status))
+    text = result.stdout
+    if result.stderr:
+        text = text + ("\n" if text else "") + result.stderr
+    if result.status == "output_limit":
+        text += "\n[output truncated: exceeded size limit]"
+    elif result.status == "unavailable":
+        text = "Error: could not start the command on this host."
+    if result.returncode not in (0, None):
+        text += f"\n[exit code {result.returncode}]"
+    return _cap(text or "(no output)")
+
+
+def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessTransport,
+                       cancelled: Cancelled, timeout: float) -> str:
+    """Runs one tool call. Raises ToolAbort when the whole turn must stop, not just this call."""
+    if name == "Bash":
+        command = str(arguments.get("command") or "").strip()
+        if not command:
+            return "Error: command is required."
+        return _run_bounded(("sh", "-c", command), "", identity, transport, cancelled, timeout)
+    if name == "Read":
+        path = str(arguments.get("file_path") or "").strip()
+        if not path:
+            return "Error: file_path is required."
+        return _run_bounded(("cat", "--", path), "", identity, transport, cancelled, timeout)
+    if name == "Write":
+        path = str(arguments.get("file_path") or "").strip()
+        if not path:
+            return "Error: file_path is required."
+        content = str(arguments.get("content") or "")
+        _run_bounded(("sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "write", path),
+                     content, identity, transport, cancelled, timeout)
+        return f"Wrote {len(content.encode())} bytes to {path}."
+    if name == "Edit":
+        path = str(arguments.get("file_path") or "").strip()
+        old = str(arguments.get("old_string") or "")
+        new = str(arguments.get("new_string") or "")
+        if not path or not old:
+            return "Error: file_path and a nonempty old_string are required."
+        current = _run_bounded(("cat", "--", path), "", identity, transport, cancelled, timeout)
+        occurrences = current.count(old)
+        if occurrences != 1:
+            return f"Error: old_string must match exactly once; found {occurrences} occurrence(s)."
+        _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), current.replace(old, new, 1),
+                     identity, transport, cancelled, timeout)
+        return f"Edited {path}."
+    if name == "Grep":
+        pattern = str(arguments.get("pattern") or "")
+        if not pattern:
+            return "Error: pattern is required."
+        path = str(arguments.get("path") or ".").strip() or "."
+        return _run_bounded(("grep", "-rn", "-E", "--", pattern, path), "", identity, transport, cancelled, timeout)
+    if name == "Glob":
+        pattern = str(arguments.get("pattern") or "")
+        if not pattern:
+            return "Error: pattern is required."
+        path = str(arguments.get("path") or ".").strip() or "."
+        return _run_bounded(("find", path, "-name", pattern), "", identity, transport, cancelled, timeout)
+    if name == "TodoWrite":
+        return "Noted."
+    return f"Error: unknown tool {name!r}."
+
+
+class ApiAgent(ModelStrategy):
+    """Provider-agnostic tool-use loop over an OpenAI-compatible chat-completions endpoint.
+
+    The endpoint only performs inference; this class is the coding-agent loop and tool
+    executor the vendor CLIs used to provide locally. One instance serves every provider
+    configured behind the same proxy: tool declarations and step naming do not depend on
+    which account answers the call. No native session: the full transcript (user/assistant
+    history, then this turn's own tool rounds) travels on every request.
+    """
+
+    def __init__(self, transport: ProcessTransport | None = None):
+        self.transport = transport
+
+    def run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
+        return asyncio.run(self._run(request, emit, cancelled))
+
+    async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
+        if cancelled():
+            return ModelResult("cancelled", error_code="cancelled_before_start")
+        identity = request.identity
+        if request.attachments:
+            return ModelResult("failed", error_code="unsupported_attachments")
+        token = os.environ.get(identity.api_key_env, "")
+        if not token:
+            return ModelResult("failed", error_code="authentication_required")
+        tools = agent_tool_set(identity)
+        messages = [{"role": "system", "content": agent_system_prompt(identity)}]
+        messages += [{"role": m.role, "content": m.content} for m in request.history]
+        messages.append({"role": "user", "content": request.prompt})
+        transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
+                                       if identity.ssh_host else LocalProcess())
+        deadline = time.monotonic() + request.timeout
+        for _ in range(MAX_TOOL_ROUNDS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ModelResult("timed_out", error_code="timed_out")
+            if len(json.dumps(messages).encode()) > MAX_CONTEXT_BYTES:
+                return ModelResult("failed", error_code="context_too_large")
+            outcome = await self._call(identity, token, messages, tools, remaining, cancelled)
+            if isinstance(outcome, ModelResult):
+                return outcome
+            message, finish_reason = outcome
+            text = message.get("content") or ""
+            if isinstance(text, str) and text.strip():
+                emit("message", {"text": text})
+            calls = message.get("tool_calls") or []
+            assistant_entry = {"role": "assistant", "content": message.get("content")}
+            if calls:
+                assistant_entry["tool_calls"] = calls
+            messages.append(assistant_entry)
+            if not calls:
+                if finish_reason != "stop" or not isinstance(text, str) or not text.strip():
+                    return ModelResult("failed", error_code="incomplete_provider_output")
+                return ModelResult("completed", text)
+            for call in calls:
+                if cancelled():
+                    return ModelResult("interrupted", error_code="cancelled_mid_tool")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ModelResult("timed_out", error_code="timed_out")
+                result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, emit)
+                if isinstance(result_text, ModelResult):
+                    return result_text
+                messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
+        return ModelResult("failed", error_code="tool_loop_limit_exceeded")
+
+    @staticmethod
+    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit):
+        name = (call.get("function") or {}).get("name") or ""
+        try:
+            arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("tool arguments must be a JSON object")
+        except ValueError:
+            return "Error: tool arguments were not valid JSON."
+        if name not in tools:
+            return f"Error: tool {name!r} is not permitted in this session."
+        step = ClaudeCli.tool_step(name, arguments)
+        if step:
+            emit("activity", {"text": step})
+        try:
+            return execute_agent_tool(name, arguments, identity, transport, cancelled, timeout)
+        except ToolAbort as abort:
+            return abort.result
+
+    async def _call(self, identity, token: str, messages: list, tools: dict, timeout: float, cancelled: Cancelled):
+        payload = {"model": identity.model, "messages": messages, "stream": False}
+        if tools:
+            payload["tools"] = list(tools.values())
+
+        async def post():
+            async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=timeout) as client:
+                response = await client.post(identity.api_base_url.rstrip("/") + "/chat/completions",
+                                             headers={"Authorization": f"Bearer {token}"}, json=payload)
+                if response.status_code != 200:
+                    code = ("authentication_required" if response.status_code in {401, 403}
+                            else "rate_limited" if response.status_code == 429 else "api_http_error")
+                    return ModelResult("failed", error_code=code)
+                try:
+                    data = response.json()
+                    choice = data["choices"][0]
+                    message = choice["message"]
+                    if not isinstance(message, dict):
+                        raise TypeError("message must be an object")
+                except (ValueError, KeyError, IndexError, TypeError):
+                    return ModelResult("failed", error_code="invalid_provider_output")
+                return message, choice.get("finish_reason")
+
+        task = asyncio.create_task(post())
+        call_deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            while not task.done():
+                if cancelled() or asyncio.get_running_loop().time() >= call_deadline:
                     return ModelResult("interrupted", error_code="api_outcome_unknown")
                 await asyncio.wait({task}, timeout=0.1)
             return await task
