@@ -217,7 +217,9 @@ def test_tool_loop_limit_is_enforced(request_data, monkeypatch):
     from subjective_devagents_fastapi.language_models.strategies import MAX_TOOL_ROUNDS
     with ScriptedProxy([completion(tool_calls=[tool_call(str(i), "Bash", command="true")])
                         for i in range(MAX_TOOL_ROUNDS + 1)]) as proxy:
-        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        # A local fake server is near-instant per round, but MAX_TOOL_ROUNDS rounds of
+        # real async/HTTP overhead still need more than request_data's 5s fixture timeout.
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url), timeout=60)
         result = ApiAgent().run(request, lambda *_: None, lambda: False)
     assert result.status == "failed" and result.error_code == "tool_loop_limit_exceeded"
 

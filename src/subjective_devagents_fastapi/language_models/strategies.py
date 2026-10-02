@@ -468,7 +468,7 @@ class Api(ModelStrategy):
 # fronts. Step naming is shared with ClaudeCli.tool_step so the live-step feed does not change.
 
 TOOL_OUTPUT_LIMIT = 20_000  # characters kept per tool result; bounds context growth across rounds
-MAX_TOOL_ROUNDS = 50
+MAX_TOOL_ROUNDS = 200
 
 AGENT_TOOLS = {
     "Bash": {"type": "function", "function": {
