@@ -12,7 +12,7 @@ import pytest
 from subjective_devagents_fastapi.language_models import (
     Api, ClaudeCli, Cli, CodexCli, Identity, IdentityRegistry, Message, ModelRequest,
 )
-from subjective_devagents_fastapi.language_models.strategies import cli_prompt, isolated_environment
+from subjective_devagents_fastapi.language_models.strategies import CursorCli, GrokCli, cli_prompt, isolated_environment
 from subjective_devagents_fastapi.language_models.transports import ProcessResult
 
 
@@ -233,3 +233,82 @@ def test_absolute_executable_directory_provides_node_without_ambient_path(reques
     env = isolated_environment(replace(request_data, identity=identity))
     assert env['PATH'].split(':')[0] == '/opt/node/bin'
     assert '/untrusted' not in env['PATH']
+
+
+# --- images -------------------------------------------------------------------------------
+
+PNG = bytes.fromhex("89504e470d0a1a0a") + b"fixture-image-bytes"
+
+
+def with_image(request_data, **identity):
+    from subjective_devagents_fastapi.language_models.contracts import Attachment
+    return replace(request_data, identity=replace(request_data.identity, **identity),
+                   attachments=(Attachment("shot.png", "image/png", PNG),))
+
+
+def test_codex_receives_images_as_files_that_exist_during_the_turn_and_are_removed_after(request_data, tmp_path):
+    seen = tmp_path / "seen.json"
+    cli = executable(tmp_path, f'''import json, os, sys
+assert sys.stdin.read() == "hello"
+paths = [sys.argv[i + 1] for i, arg in enumerate(sys.argv) if arg == "--image"]
+assert sys.argv[-1] == "-" and len(paths) == 1
+open({str(seen)!r}, "w").write(json.dumps({{"path": paths[0], "data": open(paths[0], "rb").read().hex(),
+                                           "mode": oct(os.stat(paths[0]).st_mode & 0o777)}}))
+for event in [{{"type":"thread.started","thread_id":"codex-session"}},
+              {{"type":"item.completed","item":{{"type":"agent_message","text":"saw it"}}}},
+              {{"type":"turn.completed"}}]:
+    print(json.dumps(event), flush=True)
+''')
+    request = with_image(request_data, provider="codex", executable=cli)
+    result = Cli(CodexCli()).run(request, lambda *_: None, lambda: False)
+    assert result.status == "completed" and result.text == "saw it"
+    recorded = json.loads(seen.read_text())
+    assert bytes.fromhex(recorded["data"]) == PNG and recorded["mode"] == "0o600"
+    assert not os.path.exists(recorded["path"]) and not os.path.exists(os.path.dirname(recorded["path"]))
+
+
+def test_codex_resume_attaches_images_to_the_resumed_prompt():
+    from subjective_devagents_fastapi.language_models.contracts import Attachment
+    request = ModelRequest("turn", Identity("codex-a", "codex"), "hi", session_id="sess",
+                           attachments=(Attachment("a.png", "image/png", PNG),))
+    argv = CodexCli().argv(request, ("/tmp/a.png",))
+    assert argv[argv.index("resume"):] == ("resume", "sess", "--image", "/tmp/a.png", "-")
+
+
+def test_claude_receives_images_inline_as_stream_json_content_blocks(request_data, tmp_path):
+    cli = executable(tmp_path, f'''import base64, json, sys
+assert sys.argv[sys.argv.index("--input-format") + 1] == "stream-json"
+line = json.loads(sys.stdin.read())
+assert line["type"] == "user" and line["message"]["role"] == "user"
+text, image = line["message"]["content"]
+assert text == {{"type": "text", "text": "hello"}}
+assert image["type"] == "image" and image["source"]["media_type"] == "image/png"
+assert base64.b64decode(image["source"]["data"]) == {PNG!r}
+print(json.dumps({{"type":"system", "session_id":"claude-session"}}), flush=True)
+print(json.dumps({{"type":"result", "subtype":"success", "session_id":"claude-session", "result":"saw it"}}), flush=True)
+''')
+    result = Cli(ClaudeCli()).run(with_image(request_data, executable=cli), lambda *_: None, lambda: False)
+    assert result.status == "completed" and result.text == "saw it"
+
+
+def test_text_only_claude_turns_keep_plain_stdin():
+    request = ModelRequest("turn", Identity("claude-a", "claude"), "hello")
+    assert "--input-format" not in ClaudeCli().argv(request)
+    assert ClaudeCli().stdin(request, "hello") == "hello"
+
+
+@pytest.mark.parametrize("strategy,identity", [
+    (lambda: Cli(CodexCli()), {"provider": "codex", "ssh_host": "remote-box"}),
+    (lambda: Cli(GrokCli()), {"provider": "grok"}),
+    (lambda: Cli(CursorCli()), {"provider": "cursor"}),
+    (lambda: Api(), {"provider": "codex", "strategy": "api", "api_base_url": "http://127.0.0.1:9", "api_key_env": "X"}),
+])
+def test_strategies_that_cannot_take_images_refuse_without_running(request_data, strategy, identity):
+    class NeverRun:
+        def run(self, *args, **kwargs):
+            raise AssertionError("must not start a process")
+    chosen = strategy()
+    if isinstance(chosen, Cli):
+        chosen.transport = NeverRun()
+    result = chosen.run(with_image(request_data, **identity), lambda *_: None, lambda: False)
+    assert result.status == "failed" and result.error_code == "unsupported_attachments"

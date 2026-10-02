@@ -1,6 +1,8 @@
 """Compatibility boundary for existing chat routes; execution belongs to LanguageModel."""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -11,9 +13,9 @@ import time
 import uuid
 from pathlib import Path
 
-from .contracts import Identity, Message, ModelError
+from .contracts import Attachment, Identity, Message, ModelError
 from .model import LanguageModel
-from .registry import IdentityRegistry
+from .registry import IdentityRegistry, image_support
 from .store import TurnStore, TERMINAL
 
 
@@ -84,20 +86,42 @@ class LegacyLanguageModel:
         for item in source.get("messages", []):
             if item.get("sendFailed") or item.get("stopped"):
                 continue
-            if item.get("attachments"):
-                raise ModelError("unsupported_history", "Conversation contains attachments; explicit migration is required.")
             role = item.get("role")
             if role not in {"user", "assistant"}:
                 raise ModelError("unsupported_history", "Conversation contains non-text turns; explicit migration is required.")
-            messages.append(Message(role, str(item.get("text") or item.get("content") or "")))
+            text = str(item.get("text") or item.get("content") or "")
+            images = [str((file or {}).get("filename") or "image") for file in item.get("attachments") or []]
+            if images:
+                # Earlier images are not re-sent to a new session; say so rather than
+                # letting the transcript read as though the user referred to nothing.
+                text = (text + "\n" if text else "") + f"[Attached image(s), not re-sent: {', '.join(images)}]"
+            messages.append(Message(role, text))
         return tuple(messages)
+
+    @staticmethod
+    def attachments(files: list) -> tuple[Attachment, ...]:
+        """The UI's {filename, mime_type, content: base64} images, decoded and validated."""
+        decoded = []
+        for item in files or []:
+            if not isinstance(item, dict):
+                raise ModelError("unsupported_attachments", "Attachments must be image objects.")
+            try:
+                data = base64.b64decode(str(item.get("content") or ""), validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ModelError("invalid_attachment", "An attached image is not valid base64.") from error
+            decoded.append(Attachment(str(item.get("filename") or "image")[:200],
+                                      str(item.get("mime_type") or "").lower(), data))
+        return tuple(decoded)
 
     def send(self, conversation: dict, source: dict, request: dict, register, clear, progress) -> dict:
         try:
-            if request.get("files"):
-                raise ModelError("unsupported_attachments", "This provider driver does not support attachments yet.")
+            images = self.attachments(request.get("files"))
             with self._lock:
                 identity = self.identity(conversation)
+                if images and not image_support(identity):
+                    where = " over SSH" if identity.ssh_host else ""
+                    raise ModelError("unsupported_attachments",
+                                     f"{identity.provider.title()}{where} cannot receive images; send text only.")
                 with self.model.store.connection() as db:
                     row = db.execute("SELECT conversation_id FROM legacy_bindings WHERE target=?", (conversation["target"],)).fetchone()
                 if row is None:
@@ -114,7 +138,7 @@ class LegacyLanguageModel:
                         return self.outcome(pending)
                     else:
                         raise ModelError("projection_pending", "Reload the completed previous turn before sending another prompt.")
-                turn = self.model.submit(row[0], request["prompt"], str(uuid.uuid4()), request["timeout"])
+                turn = self.model.submit(row[0], request["prompt"], str(uuid.uuid4()), request["timeout"], images)
             register(conversation["target"], lambda: bool(self.model.cancel(turn["id"])))
             cursor = 0
             try:

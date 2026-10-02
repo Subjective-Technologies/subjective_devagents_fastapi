@@ -9,6 +9,13 @@ from urllib.parse import urlsplit
 from .contracts import Identity, ModelError
 
 
+def image_support(identity: Identity) -> bool:
+    """Mirrors strategies.CliDriver.images: Codex needs local image files, Claude takes them inline."""
+    if identity.strategy != "cli":
+        return False
+    return identity.provider == "claude" or (identity.provider == "codex" and not identity.ssh_host)
+
+
 class IdentityRegistry:
     def __init__(self, identities: list[Identity]):
         self._identities: dict[str, Identity] = {}
@@ -83,6 +90,6 @@ class IdentityRegistry:
     def public(self) -> list[dict]:
         return [{"id": item.id, "provider": item.provider, "model": item.model,
                  "strategy": item.strategy, "remote": bool(item.ssh_host),
-                 "capabilities": {"text": True, "attachments": False,
+                 "capabilities": {"text": True, "attachments": image_support(item),
                                   "interactive_approvals": False, "native_resume": item.strategy == "cli"}}
                 for item in self._identities.values()]

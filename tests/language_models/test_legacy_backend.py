@@ -1,4 +1,5 @@
 """Independent compatibility checks with real storage and fake providers."""
+import base64
 import json
 import subprocess
 import threading
@@ -112,13 +113,58 @@ def test_cancel_callback_stops_execution_and_clears_registration(backend, conver
     assert cleared == [conversation["target"]]
 
 
-def test_attachments_rejected_before_execution(backend, conversation):
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
+def image_file(name="shot.png", mime_type="image/png", content=None):
+    return {"filename": name, "mime_type": mime_type,
+            "content": content if content is not None else base64.b64encode(PNG).decode()}
+
+
+def test_images_reach_the_strategy_decoded_and_only_metadata_is_stored(backend, conversation):
     strategy = RecordingStrategy()
     backend.model.strategies = {"cli:codex": strategy}
-    assert send(backend, conversation, files=["image.png"])["status"] == "unsupported_attachments"
+    assert send(backend, conversation, files=[image_file()])["success"] is True
+    [request] = strategy.requests
+    assert [(item.name, item.mime_type, item.data) for item in request.attachments] == [("shot.png", "image/png", PNG)]
+    with backend.model.store.connection() as db:
+        stored = " ".join(str(tuple(row)) for row in db.execute("SELECT * FROM events"))
+        stored += " ".join(str(tuple(row)) for row in db.execute("SELECT * FROM turns"))
+    assert "shot.png" in stored and base64.b64encode(PNG).decode() not in stored
+
+
+@pytest.mark.parametrize("files,code", [
+    ([image_file(mime_type="application/pdf")], "unsupported_attachments"),
+    ([image_file(content="not base64!")], "invalid_attachment"),
+    ([image_file(content="")], "attachment_too_large"),
+    (["image.png"], "unsupported_attachments"),
+])
+def test_invalid_attachments_are_refused_before_any_turn(backend, conversation, files, code):
+    strategy = RecordingStrategy()
+    backend.model.strategies = {"cli:codex": strategy}
+    assert send(backend, conversation, files=files)["status"] == code
     assert not strategy.requests
     with backend.model.store.connection() as db:
         assert db.execute("SELECT count(*) FROM turns").fetchone()[0] == 0
+
+
+def test_a_provider_without_image_input_refuses_before_any_turn(backend, conversation):
+    strategy = RecordingStrategy()
+    backend.model.strategies = {"cli:grok": strategy}
+    result = send(backend, {**conversation, "provider": "grok"}, files=[image_file()])
+    assert result["status"] == "unsupported_attachments" and "Grok" in result["error"]
+    assert not strategy.requests
+
+
+def test_history_with_earlier_images_continues_with_a_note_instead_of_refusing(backend, conversation):
+    strategy = RecordingStrategy()
+    backend.model.strategies = {"cli:codex": strategy}
+    source = {"messages": [{"role": "user", "text": "see this", "attachments": [image_file("old.png")]},
+                           {"role": "assistant", "text": "seen"}]}
+    assert send(backend, conversation, source)["success"] is True
+    history = strategy.requests[0].history
+    assert history[0].content == "see this\n[Attached image(s), not re-sent: old.png]"
+    assert history[1].content == "seen"
 
 
 def test_existing_binding_rejects_account_change(backend, conversation):

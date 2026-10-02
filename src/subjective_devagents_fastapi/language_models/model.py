@@ -6,8 +6,8 @@ import math
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from .contracts import Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
-from .registry import IdentityRegistry
+from .contracts import MAX_ATTACHMENTS, Attachment, Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
+from .registry import IdentityRegistry, image_support
 from .store import TurnStore
 from .strategies import Api, ClaudeCli, Cli, CodexCli, CursorCli, GrokCli, MAX_CONTEXT_BYTES
 
@@ -26,6 +26,8 @@ class LanguageModel:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="language-model")
         self._lock = threading.RLock()
         self._futures: dict[str, Future] = {}
+        # Image bytes never enter SQLite; an accepted turn's images live here until it starts.
+        self._attachments: dict[str, tuple[Attachment, ...]] = {}
         self._stopping = threading.Event()
 
     def create(self, identity_id: str, history: tuple[Message, ...] = ()) -> dict:
@@ -36,23 +38,32 @@ class LanguageModel:
     def handoff(self, conversation_id: str, identity_id: str) -> dict:
         return self.store.handoff(conversation_id, self.identities.get(identity_id))
 
-    def submit(self, conversation_id: str, prompt: str, request_id: str, timeout: float = 300) -> dict:
+    def submit(self, conversation_id: str, prompt: str, request_id: str, timeout: float = 300,
+               attachments: tuple[Attachment, ...] = ()) -> dict:
         if not prompt.strip() or len(prompt.encode()) > MAX_CONTEXT_BYTES:
             raise ModelError("invalid_request", "Prompt must be nonempty and at most 512 KiB.")
         if not request_id or len(request_id) > 128 or not math.isfinite(timeout) or not 1 <= timeout <= 1800:
             raise ModelError("invalid_request", "Request id and a timeout between 1 and 1800 seconds are required.")
+        if len(attachments) > MAX_ATTACHMENTS:
+            raise ModelError("invalid_request", f"At most {MAX_ATTACHMENTS} images can be attached to one turn.")
         with self._lock:
             if self._stopping.is_set():
                 raise ModelError("unavailable", "Language model service is shutting down.")
             conversation = self.store.conversation(conversation_id)
             identity = self.identities.get(conversation["identity"]["id"])
+            if attachments and not image_support(identity):
+                raise ModelError("unsupported_attachments", "This identity cannot receive images.")
             turn, created = self.store.reserve(conversation_id, identity, request_id, prompt, timeout)
             if created:
+                if attachments:
+                    self._attachments[turn["id"]] = tuple(attachments)
+                    self.store.event(turn["id"], "attachments", {"images": [item.metadata() for item in attachments]})
                 try:
                     future = self._executor.submit(self._execute, turn["id"])
                     self._futures[turn["id"]] = future
                     future.add_done_callback(lambda done, key=turn["id"]: self._forget(key))
                 except RuntimeError:
+                    self._attachments.pop(turn["id"], None)
                     self.store.finish(turn["id"], ModelResult("failed", error_code="dispatch_failed"))
                     raise ModelError("unavailable", "Could not dispatch the accepted turn.")
             return turn
@@ -62,6 +73,8 @@ class LanguageModel:
             self._futures.pop(identifier, None)
 
     def _execute(self, identifier: str):
+        with self._lock:
+            attachments = self._attachments.pop(identifier, ())
         if not self.store.claim(identifier):
             return
         turn = self.store.turn(identifier)
@@ -69,7 +82,8 @@ class LanguageModel:
         try:
             identity = Identity(**turn["identity"])
             history = tuple(Message(**item) for item in self.store.conversation(turn["conversation_id"])["messages"])
-            request = ModelRequest(identifier, identity, turn["prompt"], history, turn["session_id"], turn["timeout"])
+            request = ModelRequest(identifier, identity, turn["prompt"], history, turn["session_id"], turn["timeout"],
+                                   attachments)
             strategy = self.strategies.get(f"{identity.strategy}:{identity.provider}") or self.strategies.get(identity.strategy)
             if strategy is None:
                 raise ModelError("unsupported_provider", "No execution strategy is registered.")

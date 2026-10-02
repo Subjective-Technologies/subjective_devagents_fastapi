@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 
@@ -50,6 +50,29 @@ class Message:
     content: str
 
 
+IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ATTACHMENTS = 10
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """An image sent with one turn. Held in memory only; the turn store keeps metadata."""
+
+    name: str
+    mime_type: str
+    data: bytes = field(repr=False)
+
+    def __post_init__(self):
+        if self.mime_type not in IMAGE_TYPES:
+            raise ModelError("unsupported_attachments", "Only PNG, JPEG, GIF and WebP images can be attached.")
+        if not self.data or len(self.data) > MAX_ATTACHMENT_BYTES:
+            raise ModelError("attachment_too_large", "Each image must be nonempty and at most 10 MiB.")
+
+    def metadata(self) -> dict:
+        return {"name": self.name, "mime_type": self.mime_type, "bytes": len(self.data)}
+
+
 @dataclass(frozen=True)
 class ModelRequest:
     turn_id: str
@@ -58,6 +81,7 @@ class ModelRequest:
     history: tuple[Message, ...] = ()
     session_id: str | None = None
     timeout: float = 300.0
+    attachments: tuple[Attachment, ...] = ()
 
 
 @dataclass(frozen=True)

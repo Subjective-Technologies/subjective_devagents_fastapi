@@ -8,7 +8,10 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import Message, ModelError
+import base64
+import binascii
+
+from .contracts import Attachment, MAX_ATTACHMENTS, Message, ModelError
 from .model import LanguageModel
 from .registry import IdentityRegistry
 from .store import TurnStore
@@ -35,10 +38,24 @@ class Handoff(Payload):
     identity_id: str = Field(min_length=1, max_length=80)
 
 
+class Image(Payload):
+    filename: str = Field(default="image", max_length=200)
+    mime_type: str = Field(min_length=1, max_length=40)
+    content: str = Field(min_length=1, max_length=14 * 1024 * 1024, description="Base64 image bytes")
+
+    def attachment(self) -> Attachment:
+        try:
+            data = base64.b64decode(self.content, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ModelError("invalid_attachment", "An attached image is not valid base64.") from error
+        return Attachment(self.filename, self.mime_type.lower(), data)
+
+
 class Send(Payload):
     prompt: str = Field(min_length=1, max_length=512 * 1024)
     request_id: str = Field(min_length=1, max_length=128)
     timeout: float = Field(default=300, ge=1, le=1800, allow_inf_nan=False)
+    attachments: list[Image] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
 
 
 class Reconcile(Payload):
@@ -95,7 +112,8 @@ def handoff(conversation_id: str, body: Handoff, request: Request):
 
 @router.post("/conversations/{conversation_id}/turns", status_code=202)
 def send(conversation_id: str, body: Send, request: Request):
-    return invoke(model(request).submit, conversation_id, body.prompt, body.request_id, body.timeout)
+    return invoke(lambda: model(request).submit(conversation_id, body.prompt, body.request_id, body.timeout,
+                                                tuple(item.attachment() for item in body.attachments)))
 
 
 @router.get("/turns/{turn_id}")

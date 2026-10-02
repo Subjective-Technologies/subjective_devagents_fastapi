@@ -202,7 +202,32 @@ def test_http_rejects_unsupported_features_and_unknown_identity(client):
     assert client.post("/api/language-model/conversations", json={"identity_id": "unknown"}).status_code == 404
     created = client.post("/api/language-model/conversations", json={"identity_id": "claude-a"}).json()
     assert client.post(f"/api/language-model/conversations/{created['id']}/turns",
-                       json={"prompt": "x", "request_id": "x", "attachments": []}).status_code == 422
+                       json={"prompt": "x", "request_id": "x", "files": []}).status_code == 422
+
+
+def test_http_images_reach_the_turn_and_only_metadata_is_recorded(client, engine):
+    import base64
+    image = {"filename": "shot.png", "mime_type": "image/png", "content": base64.b64encode(b"\x89PNG fixture").decode()}
+    created = client.post("/api/language-model/conversations", json={"identity_id": "claude-a"}).json()
+    turn = client.post(f"/api/language-model/conversations/{created['id']}/turns",
+                       json={"prompt": "look", "request_id": "img-1", "attachments": [image]})
+    assert turn.status_code == 202
+    assert await_turn(engine.store, turn.json()["id"])["status"] == "completed"
+    events = client.get(f"/api/language-model/turns/{turn.json()['id']}/events").json()["events"]
+    [recorded] = [event for event in events if event["kind"] == "attachments"]
+    assert recorded["data"] == {"images": [{"name": "shot.png", "mime_type": "image/png", "bytes": 12}]}
+    assert image["content"] not in str(events)
+
+
+@pytest.mark.parametrize("image,code", [
+    ({"mime_type": "application/pdf", "content": "AAAA"}, "unsupported_attachments"),
+    ({"mime_type": "image/png", "content": "not base64!"}, "invalid_attachment"),
+])
+def test_http_refuses_bad_images_before_accepting_a_turn(client, image, code):
+    created = client.post("/api/language-model/conversations", json={"identity_id": "claude-a"}).json()
+    response = client.post(f"/api/language-model/conversations/{created['id']}/turns",
+                           json={"prompt": "look", "request_id": "bad", "attachments": [image]})
+    assert response.status_code == 422 and response.json()["detail"]["code"] == code
 
 
 def test_existing_application_auth_gate_protects_new_routes(monkeypatch):

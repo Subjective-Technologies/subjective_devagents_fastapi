@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import pwd
-from pathlib import PurePosixPath
+import shutil
+import tempfile
+from pathlib import Path, PurePosixPath
 from abc import ABC, abstractmethod
 
 import httpx
@@ -68,9 +71,16 @@ def cli_prompt(request: ModelRequest) -> str:
 class CliDriver(ABC):
     """Provider-specific command grammar and JSON protocol parsing."""
 
+    # How this CLI receives images: "path" (files on the execution host), "stdin"
+    # (inline in the input stream) or "" (it cannot, so attachments are refused).
+    images = ""
+
     @abstractmethod
-    def argv(self, request: ModelRequest) -> tuple[str, ...]:
+    def argv(self, request: ModelRequest, image_paths: tuple[str, ...] = ()) -> tuple[str, ...]:
         raise NotImplementedError
+
+    def stdin(self, request: ModelRequest, prompt: str) -> str:
+        return prompt
 
     @abstractmethod
     def consume(self, event: dict, state: dict, emit: Emit) -> None:
@@ -78,12 +88,18 @@ class CliDriver(ABC):
 
 
 class CodexCli(CliDriver):
-    def argv(self, request: ModelRequest) -> tuple[str, ...]:
+    images = "path"
+
+    def argv(self, request: ModelRequest, image_paths: tuple[str, ...] = ()) -> tuple[str, ...]:
         args = [request.identity.executable or "codex", "exec", "--json", "--sandbox", request.identity.sandbox]
         if request.identity.model:
             args += ["--model", request.identity.model]
         if request.session_id:
             args += ["resume", request.session_id]
+        # Placed after `resume <id>` so they attach to the resumed prompt. Codex skips a
+        # missing path without failing, so Cli.run checks the files exist first.
+        for path in image_paths:
+            args += ["--image", path]
         # Prompt travels through stdin, never process listings or remote shell text.
         return tuple(args + ["-"])
 
@@ -103,9 +119,15 @@ class CodexCli(CliDriver):
 
 
 class ClaudeCli(CliDriver):
-    def argv(self, request: ModelRequest) -> tuple[str, ...]:
+    images = "stdin"
+
+    def argv(self, request: ModelRequest, image_paths: tuple[str, ...] = ()) -> tuple[str, ...]:
         args = [request.identity.executable or "claude", "-p", "--output-format", "stream-json",
                 "--verbose", "--include-partial-messages", "--permission-mode", "dontAsk"]
+        if request.attachments and self.images:
+            # Images go inline as content blocks, so they reach the model directly instead
+            # of depending on it choosing to Read a temp file, and work over SSH and sudo.
+            args += ["--input-format", "stream-json"]
         # Never use --bare: it ignores subscription login in current Claude releases.
         if request.identity.model:
             args += ["--model", request.identity.model]
@@ -114,6 +136,16 @@ class ClaudeCli(CliDriver):
         if request.identity.allowed_tools:
             args += ["--allowedTools", ",".join(request.identity.allowed_tools)]
         return tuple(args)
+
+    def stdin(self, request: ModelRequest, prompt: str) -> str:
+        if not request.attachments or not self.images:
+            return prompt
+        content = [{"type": "text", "text": prompt}] + [
+            {"type": "image", "source": {"type": "base64", "media_type": item.mime_type,
+                                         "data": base64.b64encode(item.data).decode("ascii")}}
+            for item in request.attachments
+        ]
+        return json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
 
     def consume(self, event: dict, state: dict, emit: Emit) -> None:
         # Subagent sessions must never replace the main conversation's native session.
@@ -137,7 +169,9 @@ class ClaudeCli(CliDriver):
 
 class CursorCli(ClaudeCli):
     """Cursor's result envelope resembles Claude, but command grammar is independent."""
-    def argv(self, request: ModelRequest) -> tuple[str, ...]:
+    images = ""
+
+    def argv(self, request: ModelRequest, image_paths: tuple[str, ...] = ()) -> tuple[str, ...]:
         args = [request.identity.executable or "cursor-agent", "--print", "--output-format", "stream-json"]
         if request.identity.model:
             args += ["--model", request.identity.model]
@@ -150,7 +184,7 @@ class CursorCli(ClaudeCli):
 
 class GrokCli(CliDriver):
     """Grok does not consume piped text implicitly; prompt-file keeps prompts off argv."""
-    def argv(self, request: ModelRequest) -> tuple[str, ...]:
+    def argv(self, request: ModelRequest, image_paths: tuple[str, ...] = ()) -> tuple[str, ...]:
         args = [request.identity.executable or "grok", "--prompt-file", "/dev/stdin",
                 "--output-format", "streaming-json", "--no-auto-update"]
         if request.identity.model:
@@ -173,6 +207,25 @@ class GrokCli(CliDriver):
             state["error"] = provider_error_code(event)
 
 
+def write_images(request: ModelRequest, readable_by_others: bool) -> tuple[str, tuple[str, ...]]:
+    """Materialize attachments for a CLI that only accepts image paths; caller removes the dir.
+
+    When the CLI runs as another OS user it must read these files, so the directory is
+    traversable but not listable and each file has an unguessable name.
+    """
+    directory = tempfile.mkdtemp(prefix="devagents-images-")
+    paths = []
+    for index, item in enumerate(request.attachments):
+        suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}[item.mime_type]
+        path = Path(directory) / f"{index}-{os.urandom(8).hex()}{suffix}"
+        path.write_bytes(item.data)
+        path.chmod(0o644 if readable_by_others else 0o600)
+        paths.append(str(path))
+    if readable_by_others:
+        os.chmod(directory, 0o711)
+    return directory, tuple(paths)
+
+
 class Cli(ModelStrategy):
     def __init__(self, driver: CliDriver, transport: ProcessTransport | None = None):
         self.driver = driver
@@ -182,11 +235,30 @@ class Cli(ModelStrategy):
         if cancelled():
             return ModelResult("cancelled", error_code="cancelled_before_start")
         identity = request.identity
+        if request.attachments and (not self.driver.images or (self.driver.images == "path" and identity.ssh_host)):
+            # Refused before starting: a turn that silently dropped the image would answer
+            # a different question than the one asked.
+            return ModelResult("failed", error_code="unsupported_attachments")
+        other_user = bool(identity.os_user and not identity.ssh_host
+                          and identity.os_user != pwd.getpwuid(os.geteuid()).pw_name)
+        image_dir = None
+        try:
+            image_paths: tuple[str, ...] = ()
+            if request.attachments and self.driver.images == "path":
+                image_dir, image_paths = write_images(request, readable_by_others=other_user)
+            return self._run(request, emit, cancelled, image_paths, other_user)
+        finally:
+            if image_dir:
+                shutil.rmtree(image_dir, ignore_errors=True)
+
+    def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled,
+             image_paths: tuple[str, ...], other_user: bool) -> ModelResult:
+        identity = request.identity
         env = isolated_environment(request)
-        argv = self.driver.argv(request)
+        argv = self.driver.argv(request, image_paths)
         transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
                                        if identity.ssh_host else LocalProcess())
-        if identity.os_user and not identity.ssh_host and identity.os_user != pwd.getpwuid(os.geteuid()).pw_name:
+        if other_user:
             # sudo is deliberately noninteractive. Provision permissions outside the API.
             # The target user's workspace may not be traversable by the service user.
             argv = ("sudo", "-n", "-u", identity.os_user, "--", "sh", "-c",
@@ -215,7 +287,7 @@ class Cli(ModelStrategy):
                     continue
                 self.driver.consume(event, state, emit)
 
-        result = transport.run(Command(argv=argv, stdin=cli_prompt(request), cwd=cwd, env=env),
+        result = transport.run(Command(argv=argv, stdin=self.driver.stdin(request, cli_prompt(request)), cwd=cwd, env=env),
                                timeout=request.timeout, cancelled=cancelled, on_stdout=consume)
         emit("process_exit", {"returncode": result.returncode, "transport_status": result.status})
         if pending.strip():
@@ -253,6 +325,8 @@ class Api(ModelStrategy):
     async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
         if cancelled():
             return ModelResult("cancelled", error_code="cancelled_before_start")
+        if request.attachments:
+            return ModelResult("failed", error_code="unsupported_attachments")
         token = os.environ.get(request.identity.api_key_env, "")
         if not token:
             return ModelResult("failed", error_code="authentication_required")
