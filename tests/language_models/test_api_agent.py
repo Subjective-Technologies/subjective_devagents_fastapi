@@ -110,6 +110,31 @@ def test_read_write_and_edit_round_trip_through_the_real_filesystem(request_data
     assert open(target).read() == "hello there"
 
 
+def test_edit_on_a_file_larger_than_the_output_cap_does_not_truncate_it(request_data, monkeypatch):
+    # Regression: Edit's internal "read current content" call used to go through the same
+    # 20,000-char cap meant for what the model sees, then wrote that truncated stand-in back
+    # over the real file — silently destroying anything larger than the cap. This is exactly
+    # what happened to a real 3398-line file during a live session (truncated to ~475 lines,
+    # the literal string "[truncated]" written into the file as content).
+    from subjective_devagents_fastapi.language_models.strategies import TOOL_OUTPUT_LIMIT
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    target = request_data.identity.workspace + "/big.js"
+    original = "\n".join(f"line {i}" for i in range(3000))
+    assert len(original) > TOOL_OUTPUT_LIMIT
+    open(target, "w").write(original)
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "Edit", file_path=target, old_string="line 2999", new_string="line LAST")]),
+        completion(content="Done."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+    assert result.status == "completed"
+    final = open(target).read()
+    assert "[truncated]" not in final
+    assert final == original.replace("line 2999", "line LAST")
+    assert final.count("\n") == original.count("\n")
+
+
 def test_write_and_edit_emit_file_diff_events(request_data, monkeypatch):
     monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
     target = request_data.identity.workspace + "/note.txt"
@@ -143,6 +168,13 @@ def test_write_without_content_change_emits_no_diff(request_data, monkeypatch):
         result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
     assert result.status == "completed"
     assert not [data for kind, data in events if kind == "file_diff"]
+
+
+def test_system_prompt_warns_against_self_restart(identity):
+    from subjective_devagents_fastapi.language_models.strategies import agent_system_prompt
+    prompt = agent_system_prompt(identity)
+    assert "running inside the devagents backend service" in prompt
+    assert "Never kill or restart" in prompt
 
 
 def test_read_only_sandbox_refuses_mutating_tools_without_calling_them(request_data, monkeypatch):

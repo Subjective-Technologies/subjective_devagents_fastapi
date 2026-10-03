@@ -565,6 +565,13 @@ def agent_system_prompt(identity) -> str:
         lines.append("This session is read-only: Bash, Write and Edit are unavailable.")
     if identity.allowed_tools:
         lines.append("Only these tools are available: " + ", ".join(sorted(identity.allowed_tools)))
+    lines.append(
+        "You are running inside the devagents backend service itself. Never kill or restart "
+        "that service (its systemd unit, or its own process) with Bash: doing so terminates "
+        "your own execution immediately, mid-task, with no way to resume automatically. If a "
+        "restart is genuinely needed to see a change, make the code change, then tell the user "
+        "to restart the service themselves and stop there."
+    )
     lines.append("When no further tool call is needed, answer the user directly in plain text.")
     return "\n".join(lines)
 
@@ -587,7 +594,10 @@ def _cap(text: str) -> str:
 
 
 def _run_bounded(argv: tuple[str, ...], stdin: str, identity, transport: ProcessTransport,
-                 cancelled: Cancelled, timeout: float) -> str:
+                 cancelled: Cancelled, timeout: float, cap: bool = True) -> str:
+    """cap=False skips the model-facing TOOL_OUTPUT_LIMIT truncation: Edit's read-before-write
+    needs the file's real, complete content, never a truncated stand-in that then gets written
+    back over the original (that silently destroyed any file over the cap — see Edit below)."""
     env = agent_environment(identity)
     wrapped, cwd = _localize(argv, env, identity)
     result = transport.run(Command(argv=wrapped, stdin=stdin, cwd=cwd, env=env),
@@ -605,7 +615,8 @@ def _run_bounded(argv: tuple[str, ...], stdin: str, identity, transport: Process
         text = "Error: could not start the command on this host."
     if result.returncode not in (0, None):
         text += f"\n[exit code {result.returncode}]"
-    return _cap(text or "(no output)")
+    text = text or "(no output)"
+    return _cap(text) if cap else text
 
 
 def _read_if_exists(path: str, identity, transport: ProcessTransport, cancelled: Cancelled, timeout: float) -> str:
@@ -659,7 +670,7 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
         new = str(arguments.get("new_string") or "")
         if not path or not old:
             return "Error: file_path and a nonempty old_string are required."
-        current = _run_bounded(("cat", "--", path), "", identity, transport, cancelled, timeout)
+        current = _run_bounded(("cat", "--", path), "", identity, transport, cancelled, timeout, cap=False)
         occurrences = current.count(old)
         if occurrences != 1:
             return f"Error: old_string must match exactly once; found {occurrences} occurrence(s)."
