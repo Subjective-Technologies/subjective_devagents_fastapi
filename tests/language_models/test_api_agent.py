@@ -110,6 +110,41 @@ def test_read_write_and_edit_round_trip_through_the_real_filesystem(request_data
     assert open(target).read() == "hello there"
 
 
+def test_write_and_edit_emit_file_diff_events(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    target = request_data.identity.workspace + "/note.txt"
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "Write", file_path=target, content="hello world\n")]),
+        completion(tool_calls=[tool_call("2", "Edit", file_path=target, old_string="world", new_string="there")]),
+        completion(content="Done."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
+    assert result.status == "completed"
+    diffs = [data for kind, data in events if kind == "file_diff"]
+    assert len(diffs) == 2
+    assert diffs[0]["path"] == target and diffs[0]["status"] == "created"
+    assert "+hello world" in diffs[0]["diff"] and "-hello world" not in diffs[0]["diff"]
+    assert diffs[1]["status"] == "modified"
+    assert "-hello world" in diffs[1]["diff"] and "+hello there" in diffs[1]["diff"]
+
+
+def test_write_without_content_change_emits_no_diff(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    target = request_data.identity.workspace + "/same.txt"
+    open(target, "w").write("same content")
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "Write", file_path=target, content="same content")]),
+        completion(content="Done."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
+    assert result.status == "completed"
+    assert not [data for kind, data in events if kind == "file_diff"]
+
+
 def test_read_only_sandbox_refuses_mutating_tools_without_calling_them(request_data, monkeypatch):
     monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
     with ScriptedProxy([

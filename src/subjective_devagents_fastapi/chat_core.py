@@ -121,7 +121,10 @@ class ChatCore:
     def _on_llm_progress(self, progress: dict) -> None:
         if not progress.get("text"):
             return
-        self.broadcast("llm-progress", {"target": progress.get("target") or "", "text": progress["text"]})
+        payload = {"target": progress.get("target") or "", "text": progress["text"]}
+        if progress.get("diff"):
+            payload["diff"] = progress["diff"]
+        self.broadcast("llm-progress", payload)
 
     def log(self, level: str, message: str, details: dict | None = None) -> None:
         self.log_fn(level, message, details or {})

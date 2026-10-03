@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import json
 import os
 import pwd
@@ -607,8 +608,28 @@ def _run_bounded(argv: tuple[str, ...], stdin: str, identity, transport: Process
     return _cap(text or "(no output)")
 
 
+def _read_if_exists(path: str, identity, transport: ProcessTransport, cancelled: Cancelled, timeout: float) -> str:
+    """Best-effort prior content for diffing. Empty string for a missing/unreadable file —
+    never raises ToolAbort, since a failed "before" snapshot must not abort the whole turn."""
+    env = agent_environment(identity)
+    wrapped, cwd = _localize(("cat", "--", path), env, identity)
+    try:
+        result = transport.run(Command(argv=wrapped, cwd=cwd, env=env), timeout=timeout,
+                               cancelled=cancelled, on_stdout=lambda _chunk: None)
+    except Exception:
+        return ""
+    return result.stdout if result.status == "completed" and result.returncode == 0 else ""
+
+
+def _unified_diff(path: str, before: str, after: str) -> str:
+    # lineterm="" and plain splitlines() (no keepends) so every yielded line is newline-free;
+    # our own "\n".join adds exactly one separator, instead of doubling up on content lines.
+    diff = difflib.unified_diff(before.splitlines(), after.splitlines(), fromfile=path, tofile=path, lineterm="")
+    return _cap("\n".join(diff))
+
+
 def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessTransport,
-                       cancelled: Cancelled, timeout: float) -> str:
+                       cancelled: Cancelled, timeout: float, emit: Emit) -> str:
     """Runs one tool call. Raises ToolAbort when the whole turn must stop, not just this call."""
     if name == "Bash":
         command = str(arguments.get("command") or "").strip()
@@ -625,8 +646,12 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
         if not path:
             return "Error: file_path is required."
         content = str(arguments.get("content") or "")
+        before = _read_if_exists(path, identity, transport, cancelled, timeout)
         _run_bounded(("sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "write", path),
                      content, identity, transport, cancelled, timeout)
+        diff = _unified_diff(path, before, content)
+        if diff:
+            emit("file_diff", {"path": path, "status": "created" if not before else "modified", "diff": diff})
         return f"Wrote {len(content.encode())} bytes to {path}."
     if name == "Edit":
         path = str(arguments.get("file_path") or "").strip()
@@ -638,8 +663,11 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
         occurrences = current.count(old)
         if occurrences != 1:
             return f"Error: old_string must match exactly once; found {occurrences} occurrence(s)."
-        _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), current.replace(old, new, 1),
-                     identity, transport, cancelled, timeout)
+        updated = current.replace(old, new, 1)
+        _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), updated, identity, transport, cancelled, timeout)
+        diff = _unified_diff(path, current, updated)
+        if diff:
+            emit("file_diff", {"path": path, "status": "modified", "diff": diff})
         return f"Edited {path}."
     if name == "Grep":
         pattern = str(arguments.get("pattern") or "")
@@ -741,7 +769,7 @@ class ApiAgent(ModelStrategy):
         if step:
             emit("activity", {"text": step})
         try:
-            return execute_agent_tool(name, arguments, identity, transport, cancelled, timeout)
+            return execute_agent_tool(name, arguments, identity, transport, cancelled, timeout, emit)
         except ToolAbort as abort:
             return abort.result
 

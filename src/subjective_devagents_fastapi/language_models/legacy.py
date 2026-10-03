@@ -182,6 +182,11 @@ class LegacyLanguageModel:
                         # progress text as its own row, so they stay in the event log.
                         if event["kind"] in {"activity", "message"} and progress:
                             progress({"target": conversation["target"], "text": event["data"].get("text", "")})
+                        elif event["kind"] == "file_diff" and progress:
+                            data = event["data"]
+                            progress({"target": conversation["target"], "text": f"Edited {data.get('path', '')}",
+                                     "diff": {"path": data.get("path"), "status": data.get("status"),
+                                             "diff": data.get("diff")}})
                     turn = self.model.store.turn(turn["id"])
                     if turn["status"] in TERMINAL:
                         break

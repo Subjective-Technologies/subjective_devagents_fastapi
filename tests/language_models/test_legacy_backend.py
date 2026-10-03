@@ -245,3 +245,22 @@ def test_only_whole_steps_reach_the_live_progress_feed(backend, conversation):
     assert result["success"] is True
     assert [item["text"] for item in seen] == ["Running: ls", "Hello"]
     assert {item["target"] for item in seen} == {conversation["target"]}
+
+
+def test_file_diff_events_reach_the_progress_feed_with_their_payload(backend, conversation):
+    class Editor(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            emit("file_diff", {"path": "/repo/app.py", "status": "modified", "diff": "--- a\n+++ b\n-old\n+new"})
+            emit("message", {"text": "Done."})
+            return ModelResult("completed", "Done.", "session")
+
+    backend.model.strategies = {"cli:codex": Editor()}
+    seen = []
+    result = backend.send(conversation, {}, {"prompt": "q", "timeout": 5},
+                          lambda target, cancel: None, lambda target: None, seen.append)
+    assert result["success"] is True
+    diff_rows = [item for item in seen if "diff" in item]
+    assert len(diff_rows) == 1
+    assert diff_rows[0]["target"] == conversation["target"]
+    assert diff_rows[0]["text"] == "Edited /repo/app.py"
+    assert diff_rows[0]["diff"] == {"path": "/repo/app.py", "status": "modified", "diff": "--- a\n+++ b\n-old\n+new"}
