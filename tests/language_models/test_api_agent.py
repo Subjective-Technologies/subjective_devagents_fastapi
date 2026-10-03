@@ -177,6 +177,11 @@ def test_system_prompt_warns_against_self_restart(identity):
     assert "Never kill or restart" in prompt
 
 
+def test_system_prompt_mentions_ask_user(identity):
+    from subjective_devagents_fastapi.language_models.strategies import agent_system_prompt
+    assert "AskUser" in agent_system_prompt(identity)
+
+
 def test_read_only_sandbox_refuses_mutating_tools_without_calling_them(request_data, monkeypatch):
     monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
     with ScriptedProxy([
@@ -189,7 +194,7 @@ def test_read_only_sandbox_refuses_mutating_tools_without_calling_them(request_d
     tool_message = proxy.requests[1][2]["messages"][-1]
     assert tool_message["role"] == "tool" and "not permitted" in tool_message["content"]
     first_tools = {t["function"]["name"] for t in proxy.requests[0][2]["tools"]}
-    assert first_tools == {"Read", "Grep", "Glob", "TodoWrite"}
+    assert first_tools == {"Read", "Grep", "Glob", "TodoWrite", "AskUser"}
 
 
 def test_allowed_tools_further_restricts_the_declared_set(request_data, monkeypatch):
@@ -198,6 +203,42 @@ def test_allowed_tools_further_restricts_the_declared_set(request_data, monkeypa
         identity = replace(request_data.identity, api_base_url=proxy.url, allowed_tools=("Read", "Grep"))
         ApiAgent().run(replace(request_data, identity=identity), lambda *_: None, lambda: False)
     assert {t["function"]["name"] for t in proxy.requests[0][2]["tools"]} == {"Read", "Grep"}
+
+
+def test_ask_user_ends_the_turn_with_the_question_as_the_reply(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "Bash", command="echo context")]),
+        completion(tool_calls=[tool_call("2", "AskUser", question="Should I use approach A or B?")]),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
+    assert result.status == "completed" and result.text == "Should I use approach A or B?"
+    # Only two rounds happened: AskUser must stop the loop, not get treated as just another tool.
+    assert len(proxy.requests) == 2
+    assert ("message", {"text": "Should I use approach A or B?"}) in events
+    assert any(kind == "activity" and "Asking:" in data["text"] for kind, data in events)
+
+
+def test_ask_user_with_no_question_is_an_error_not_a_fatal_stop(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "AskUser", question="")]),
+        completion(content="Never mind, I figured it out."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+    assert result.status == "completed" and result.text == "Never mind, I figured it out."
+    assert "required" in proxy.requests[1][2]["messages"][-1]["content"]
+
+
+def test_ask_user_is_available_in_read_only_sandbox(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    with ScriptedProxy([completion(tool_calls=[tool_call("1", "AskUser", question="Which file?")])]) as proxy:
+        identity = replace(request_data.identity, api_base_url=proxy.url, sandbox="read-only")
+        result = ApiAgent().run(replace(request_data, identity=identity), lambda *_: None, lambda: False)
+    assert result.status == "completed" and result.text == "Which file?"
 
 
 def test_unknown_tool_name_is_reported_back_to_the_model_not_fatal(request_data, monkeypatch):

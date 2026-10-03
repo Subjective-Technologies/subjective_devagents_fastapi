@@ -507,6 +507,13 @@ AGENT_TOOLS = {
         "parameters": {"type": "object", "properties": {
             "todos": {"type": "array", "items": {"type": "object"}}},
             "required": ["todos"]}}},
+    "AskUser": {"type": "function", "function": {
+        "name": "AskUser",
+        "description": "Ask the user a clarifying question when genuinely uncertain, instead of "
+                       "guessing. Ends your turn immediately; their next reply answers it.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string"}},
+            "required": ["question"]}}},
 }
 MUTATING_TOOLS = frozenset({"Bash", "Write", "Edit"})
 
@@ -565,6 +572,11 @@ def agent_system_prompt(identity) -> str:
         lines.append("This session is read-only: Bash, Write and Edit are unavailable.")
     if identity.allowed_tools:
         lines.append("Only these tools are available: " + ", ".join(sorted(identity.allowed_tools)))
+    lines.append(
+        "If you are genuinely uncertain about a decision only the user can make, or need "
+        "information only they have, call AskUser with your question instead of guessing. "
+        "That ends your turn; their next message answers it and the conversation continues."
+    )
     lines.append(
         "You are running inside the devagents backend service itself. Never kill or restart "
         "that service (its systemd unit, or its own process) with Bash: doing so terminates "
@@ -776,6 +788,13 @@ class ApiAgent(ModelStrategy):
             return "Error: tool arguments were not valid JSON."
         if name not in tools:
             return f"Error: tool {name!r} is not permitted in this session."
+        if name == "AskUser":
+            question = str(arguments.get("question") or "").strip()
+            if not question:
+                return "Error: question is required."
+            emit("activity", {"text": f"Asking: {short(question)}"})
+            emit("message", {"text": question})
+            return ModelResult("completed", question)
         step = ClaudeCli.tool_step(name, arguments)
         if step:
             emit("activity", {"text": step})
