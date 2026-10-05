@@ -47,10 +47,18 @@ systemctl is-active subjective-devagents-fastapi.service
 curl -fsS -D - https://devagents-api.subjectivetechnologies.com:8080/healthz
 ```
 
-`X-DevAgents-Version` identifies the **frontend checkout**. It must not be compared
-to a backend commit. `X-DevAgents-Backend-Version` and `/api/version.backendVersion`
-identify the backend checkout loaded at startup. A health response proves liveness,
-not that a provider can send a message.
+Read the served commit without authenticating. `/api/version` is gated; the
+public HTML comment is not:
+
+```bash
+curl -sS https://devagents.subjectivetechnologies.com/ | grep 'devagents-deploy'
+# <!-- devagents-deploy version=20260921e+c055e92 backend=20260921e+623190f instance=... served=... -->
+```
+
+`version=` is the **frontend checkout** (`SUBJECTIVE_DEVAGENTS_CLIENT_ROOT`).
+`backend=` is this FastAPI checkout. `X-DevAgents-Version` / `X-DevAgents-Backend-Version`
+on `/healthz` report the same pair. A health response proves liveness, not that a
+provider can send a message.
 
 ## Required live send gate
 

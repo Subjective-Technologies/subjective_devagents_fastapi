@@ -309,6 +309,8 @@ def test_api_responses_are_not_cached(client):
 
 
 def test_static_index_is_stamped_and_framable(client):
+    from subjective_devagents_fastapi.app import state
+
     response = client.get("/")
     assert response.status_code == 200
     assert "DEVAGENTS_DEPLOY_VERSION" not in response.text
@@ -316,6 +318,18 @@ def test_static_index_is_stamped_and_framable(client):
     assert 'data-devagents-instance="' in response.text
     assert "frame-ancestors" in response.headers["content-security-policy"]
     assert response.headers["cache-control"] == "no-store"
+    # The shipped page already contains the placeholder, so the comment must
+    # still be injected — otherwise curl of / cannot read the commit.
+    match = re.search(
+        r"<!-- devagents-deploy version=(?P<version>\S+) backend=(?P<backend>\S+) instance=(?P<instance>\S+) served=\S+ -->",
+        response.text,
+    )
+    assert match, response.text.splitlines()[:8]
+    assert match.group("version") == state.deploy_version
+    assert match.group("backend") == state.backend_version
+    assert match.group("instance") == state.instance_id
+    assert response.headers["x-devagents-version"] == state.deploy_version
+    assert response.headers["x-devagents-backend-version"] == state.backend_version
 
 
 def test_instance_id_is_stable_within_a_run_and_matches_the_stamped_page(client):

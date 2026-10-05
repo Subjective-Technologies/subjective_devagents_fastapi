@@ -55,9 +55,18 @@ alone does not prove those consumers are absent.
 
 ## Verification
 
-Compare `/api/version` on both public hosts: `version`, `backendVersion`, and
-`instanceId` must agree. Compare those fields with the HTML document's
-`data-devagents-version` and `data-devagents-instance`; placeholders must be gone.
+A credential-free curl of the public page must show the live commits:
+
+```bash
+curl -sS https://devagents.subjectivetechnologies.com/ | grep 'devagents-deploy'
+curl -sS -D - -o /dev/null https://devagents-api.subjectivetechnologies.com:8080/healthz \
+  | grep -i 'X-DevAgents'
+```
+
+Compare `/api/version` on both public hosts (authenticated): `version`,
+`backendVersion`, and `instanceId` must agree with that HTML comment and with
+the HTML document's `data-devagents-version` and `data-devagents-instance`.
+Placeholders (`DEVAGENTS_DEPLOY_VERSION`, `DEVAGENTS_INSTANCE_ID`) must be gone.
 Check actual public HTML and JavaScript, not only `/healthz`.
 
 A fresh browser must keep the version banner hidden. After an idle backend restart,

@@ -84,7 +84,8 @@ def _client_root() -> Path:
     return (Path(__file__).resolve().parents[3] / ".." / "clients" / "desktop" / "subjective_devagents").resolve()
 
 
-def resolve_deploy_version(root: Path) -> str:
+def resolve_git_revision(root: Path) -> str:
+    """HEAD plus a -dirty suffix when the working tree has local edits."""
     sha = "nogit"
     try:
         sha = (
@@ -108,7 +109,24 @@ def resolve_deploy_version(root: Path) -> str:
             dirty = "-dirty"
     except (OSError, subprocess.SubprocessError):
         pass
-    return f"{WEB_UI_RELEASE}+{sha}{dirty}"
+    return f"{sha}{dirty}"
+
+
+def resolve_deploy_version(root: Path) -> str:
+    return f"{WEB_UI_RELEASE}+{resolve_git_revision(root)}"
+
+
+def deploy_stamp_comment() -> str:
+    """HTML comment curl can grep: frontend and backend git SHAs, no auth needed.
+
+    /api/version is gated, so an operator checking a live deploy with curl must
+    be able to read the same commit ids from a public HTML response.
+    """
+    served = datetime.now(timezone.utc).isoformat()
+    return (
+        f"<!-- devagents-deploy version={state.deploy_version} "
+        f"backend={state.backend_version} instance={state.instance_id} served={served} -->"
+    )
 
 
 class EventHub:
@@ -503,14 +521,29 @@ async def api_llm_conversation(target: str = Query(default="")) -> dict:
 async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
     instance = core()
     try:
+        # Extract provider from identity_id if provided, otherwise use provider directly
+        identity_id = body.get("identity_id")
+        provider = body.get("provider")
+
+        if identity_id:
+            # If identity_id is provided, extract the provider from it
+            # identity_id format is typically "provider-model" (e.g., "claude-sonnet-4-5")
+            provider_from_id = identity_id.split('-')[0] if '-' in identity_id else identity_id
+            provider = provider_from_id
+
         conversation = await asyncio.to_thread(
             instance.llm_service.create_conversation,
-            body.get("provider"),
+            provider,
             body.get("name") or "",
             body.get("workspace") or "",
             body.get("osUser") or "",
             body.get("sshConnection") or "",
         )
+
+        # Store the identity_id in the conversation for future reference
+        if identity_id:
+            conversation["identity_id"] = identity_id
+
         instance.activate_llm_irc_channel(conversation)
         instance.broadcast("llm-conversation", {"conversation": conversation})
         return {"ok": True, "conversation": conversation}
@@ -1561,6 +1594,7 @@ def _static_files() -> dict[str, Path]:
         "/terminal.css": src / "terminal.css",
         "/messageRenderer.js": src / "messageRenderer.js",
         "/taggyClient.js": src / "taggyClient.js",
+        "/llmModelSelector.js": web / "llmModelSelector.js",
         "/renderer.js": src / "renderer.js",
         "/terminal-renderer.js": src / "terminal-renderer.js",
     }
@@ -1625,17 +1659,27 @@ def _stamp_api_base(html: str) -> str:
 
 
 def _stamp_html(html: str) -> str:
-    """Replace the static placeholder so View Source shows the live release + git SHA."""
+    """Replace the static placeholder so View Source / curl shows the live git SHAs."""
     import re
 
     out = _stamp_api_base(str(html))
-    stamp_comment = f"<!-- devagents-deploy {state.deploy_version} served={datetime.now(timezone.utc).isoformat()} -->"
+    stamp_comment = deploy_stamp_comment()
     if "DEVAGENTS_DEPLOY_VERSION" in out:
         out = out.replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version)
     if "DEVAGENTS_INSTANCE_ID" in out:
         out = out.replace("DEVAGENTS_INSTANCE_ID", state.instance_id)
-    if "DEVAGENTS_DEPLOY_VERSION" not in html and "<!doctype html>" in out.lower():
-        out = re.sub(r"<!doctype html>", lambda match: f"{match.group(0)}\n{stamp_comment}", out, count=1, flags=re.IGNORECASE)
+    # Always inject a machine-readable comment. The shipped index.html already
+    # contains DEVAGENTS_DEPLOY_VERSION, so the previous "only when the
+    # placeholder is absent" branch never ran in production — curl of / showed
+    # no commit id.
+    if not re.search(r"<!-- devagents-deploy version=\S+", out) and re.search(r"<!doctype html>", out, flags=re.IGNORECASE):
+        out = re.sub(
+            r"<!doctype html>",
+            lambda match: f"{match.group(0)}\n{stamp_comment}",
+            out,
+            count=1,
+            flags=re.IGNORECASE,
+        )
 
     def stamp_tag(match: "re.Match[str]") -> str:
         attrs = match.group(1)
