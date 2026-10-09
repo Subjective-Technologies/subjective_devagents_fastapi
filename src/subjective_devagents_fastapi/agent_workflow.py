@@ -62,13 +62,22 @@ def workflow_root(app_home: str) -> Path:
     return Path(configured) if configured else Path(app_home) / "workflows"
 
 
-def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen) -> dict:
-    """The company's current published workflow, as the caller sees it."""
+def fetch_export_as_service(company_id: str, *, opener=urllib.request.urlopen) -> dict:
+    """The published workflow read with DevAgents' own service token (agents' wf command)."""
+    token = (os.environ.get("SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN") or "").strip()
+    if not token:
+        raise WorkflowUnavailable("DevAgents has no workflow service token configured.")
+    return fetch_export(company_id, "", opener=opener, service_token=token)
+
+
+def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "") -> dict:
+    """The company's current published workflow, as the caller (or the service) sees it."""
     if not _COMPANY.match(company_id or ""):
         raise WorkflowUnavailable("This agent names no valid workflow company.")
-    if not authorization.lower().startswith("bearer "):
+    if not service_token and not authorization.lower().startswith("bearer "):
         raise WorkflowUnavailable("Sign in again to load this agent's workflow.")
-    key = (company_id, hashlib.sha256(authorization.encode()).hexdigest())
+    credential = f"service:{service_token}" if service_token else authorization
+    key = (company_id, hashlib.sha256(credential.encode()).hexdigest())
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
@@ -77,7 +86,7 @@ def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.u
     request = urllib.request.Request(
         f"{workflow_api()}/companies/{company_id}/workflow/export",
         headers={
-            "Authorization": authorization,
+            **({"X-Workflow-Service-Token": service_token} if service_token else {"Authorization": authorization}),
             "Accept": "application/json",
             # Cloudflare refuses urllib's default User-Agent (error 1010).
             "User-Agent": "Mozilla/5.0 (subjective-devagents)",

@@ -346,6 +346,11 @@ async def require_api_token(request: Request, call_next):
     unauthenticated request must not reach a handler that reads conversations or starts a
     turn. Static UI files stay public: they are an empty shell without the API.
     """
+    if auth.is_workflow_read_path(request.url.path):
+        # Read-only prompt access for agents: its own token, GET only.
+        if request.method != "GET" or not auth.workflow_token_is_valid(request.headers):
+            return JSONResponse(status_code=401, content={"ok": False, "error": "A workflow read token is required."})
+        return await call_next(request)
     if auth.path_requires_token(request.url.path):
         supplied = auth.token_from_request(request.headers)
         if not await asyncio.to_thread(auth.token_is_valid, supplied):
@@ -772,6 +777,49 @@ async def api_llm_status(provider: str = Query(default="codex")) -> dict:
 async def api_llm_sessions(provider: str = Query(default="")) -> dict:
     listed = await asyncio.to_thread(core().llm_service.list_provider_sessions, provider)
     return {"ok": True, **listed}
+
+
+def _workflow_company(company: str) -> str:
+    return (company or os.environ.get("SUBJECTIVE_DEVAGENTS_WORKFLOW_COMPANY") or "").strip()
+
+
+@app.get("/api/workflow/files")
+async def api_workflow_files(company: str = Query(default="")) -> dict:
+    """The company's published workflow: version and every file's path and category."""
+    from . import agent_workflow
+
+    try:
+        export = await asyncio.to_thread(agent_workflow.fetch_export_as_service, _workflow_company(company))
+    except agent_workflow.WorkflowUnavailable as error:
+        return JSONResponse(status_code=503, content={"ok": False, "error": str(error)})
+    return {
+        "ok": True,
+        "company_id": _workflow_company(company),
+        "version": export["version"]["version"],
+        "files": [{"path": item["path"], "category": item.get("category"), "revision": item.get("revision")} for item in export["files"]],
+    }
+
+
+@app.get("/api/workflow/file")
+async def api_workflow_file(path: str = Query(default=""), company: str = Query(default="")):
+    """One published workflow file as text, e.g. path=agents/roles/coder_agent.md."""
+    from fastapi.responses import PlainTextResponse
+    from . import agent_workflow
+
+    wanted = path.strip().lstrip("/")
+    if wanted.startswith("workflow/"):
+        wanted = wanted[len("workflow/"):]
+    try:
+        export = await asyncio.to_thread(agent_workflow.fetch_export_as_service, _workflow_company(company))
+    except agent_workflow.WorkflowUnavailable as error:
+        return JSONResponse(status_code=503, content={"ok": False, "error": str(error)})
+    match = next((item for item in export["files"] if item["path"] == wanted), None)
+    if match is None:
+        return JSONResponse(status_code=404, content={"ok": False, "error": f"No published workflow file {wanted}."})
+    return PlainTextResponse(
+        str(match.get("content") or ""),
+        headers={"X-Workflow-Version": export["version"]["version"], "X-Workflow-Path": wanted},
+    )
 
 
 @app.post("/api/llm/send-message")

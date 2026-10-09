@@ -59,6 +59,28 @@ def token_is_valid(supplied: str) -> bool:
     return authenticated_claims(supplied) is not None
 
 
+# Agents read their company's published prompts here with a read-only token
+# (X-Workflow-Token), not the owner's login. Nothing else accepts that token.
+WORKFLOW_READ_PREFIX = "/api/workflow/"
+WORKFLOW_TOKEN_HEADER = "X-Workflow-Token"
+
+
+def workflow_read_token() -> str:
+    return (os.environ.get("SUBJECTIVE_DEVAGENTS_WORKFLOW_READ_TOKEN") or "").strip()
+
+
+def workflow_token_is_valid(headers) -> bool:
+    expected = workflow_read_token()
+    supplied = str(headers.get(WORKFLOW_TOKEN_HEADER) or headers.get(WORKFLOW_TOKEN_HEADER.lower()) or "").strip()
+    if len(expected) < 32 or not supplied:
+        return False
+    return hmac.compare_digest(supplied.encode(), expected.encode())
+
+
+def is_workflow_read_path(path: str) -> bool:
+    return path.startswith(WORKFLOW_READ_PREFIX)
+
+
 def path_requires_token(path: str) -> bool:
     if path in PUBLIC_PATHS:
         return False

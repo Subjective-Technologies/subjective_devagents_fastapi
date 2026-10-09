@@ -122,3 +122,20 @@ def test_replies_without_the_header_get_it():
     already = "[WF:20261009150839][agent:coder_agent]\nDone."
     assert aw.ensure_header(already, "20261009150839", "coder_agent") == already
     assert aw.ensure_header("", "20261009150839", "coder_agent") == ""
+
+
+def test_the_service_fetch_uses_the_service_token_header(monkeypatch):
+    seen = []
+
+    def opener(request, timeout=0):
+        seen.append(request)
+        return _Response(json.dumps(_export()).encode())
+
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN", "svc-token")
+    export = aw.fetch_export_as_service(COMPANY, opener=opener)
+    assert export["version"]["version"] == "20261009150839"
+    assert seen[0].get_header("X-workflow-service-token") == "svc-token"
+    assert seen[0].get_header("Authorization") is None
+    monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN")
+    with pytest.raises(aw.WorkflowUnavailable):
+        aw.fetch_export_as_service(COMPANY, opener=opener)

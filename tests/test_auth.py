@@ -247,3 +247,60 @@ def test_an_unset_static_token_still_leaves_the_gate_open_even_with_a_bad_fireba
     Firebase auth was added — token_is_valid's "gate disabled" branch returns before the
     Firebase check ever runs."""
     assert open_gate.get("/api/config", headers={"Authorization": "Bearer nonsense"}).status_code == 200
+
+
+# --- agents' read-only workflow access (/api/workflow/*) ---------------------
+
+WORKFLOW_TOKEN = "w" * 40
+EXPORT = {
+    "version": {"version": "20261009190101"},
+    "files": [
+        {"path": "AGENTS.md", "category": "contract", "revision": 1, "content": "# Contract"},
+        {"path": "skills/browser-verification/SKILL.md", "category": "skill", "revision": 2, "content": "# Browser"},
+    ],
+}
+
+
+@pytest.fixture()
+def workflow_client(monkeypatch, tmp_path):
+    from subjective_devagents_fastapi import agent_workflow
+
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_WORKFLOW_READ_TOKEN", WORKFLOW_TOKEN)
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_WORKFLOW_COMPANY", "company_54961bc50fe94bbab712")
+    calls = []
+    monkeypatch.setattr(agent_workflow, "fetch_export_as_service", lambda company: calls.append(company) or EXPORT)
+    client = build_client(monkeypatch, tmp_path, "owner-only-secret-token")
+    client.calls = calls
+    return client
+
+
+def test_workflow_files_need_the_read_token(workflow_client):
+    assert workflow_client.get("/api/workflow/files").status_code == 401
+    assert workflow_client.get("/api/workflow/files", headers={"X-Workflow-Token": "x" * 40}).status_code == 401
+
+
+def test_the_read_token_lists_and_reads_published_files(workflow_client):
+    headers = {"X-Workflow-Token": WORKFLOW_TOKEN}
+    listed = workflow_client.get("/api/workflow/files", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["version"] == "20261009190101"
+    assert [f["path"] for f in listed.json()["files"]] == ["AGENTS.md", "skills/browser-verification/SKILL.md"]
+    assert workflow_client.calls == ["company_54961bc50fe94bbab712"]
+
+    one = workflow_client.get("/api/workflow/file", params={"path": "workflow/skills/browser-verification/SKILL.md"}, headers=headers)
+    assert one.status_code == 200
+    assert one.text == "# Browser"
+    assert one.headers["X-Workflow-Version"] == "20261009190101"
+    assert workflow_client.get("/api/workflow/file", params={"path": "nope.md"}, headers=headers).status_code == 404
+
+
+def test_the_read_token_opens_nothing_else(workflow_client):
+    headers = {"X-Workflow-Token": WORKFLOW_TOKEN}
+    assert workflow_client.post("/api/workflow/files", headers=headers).status_code == 401
+    assert workflow_client.get("/api/llm/conversations", headers=headers).status_code == 401
+
+
+def test_without_a_configured_read_token_the_routes_stay_shut(monkeypatch, tmp_path):
+    monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_WORKFLOW_READ_TOKEN", raising=False)
+    client = build_client(monkeypatch, tmp_path, "owner-only-secret-token")
+    assert client.get("/api/workflow/files", headers={"X-Workflow-Token": ""}).status_code == 401
