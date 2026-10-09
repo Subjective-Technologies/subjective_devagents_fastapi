@@ -29,9 +29,14 @@ jobs:
           uv venv --python 3.11 .venv
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+      - name: Install internal packages (public repos)
+        run: |
+          uv pip install "brainboost-configuration-package @ git+https://github.com/Subjective-Technologies/brainboost_configuration_package.git"
+          uv pip install "brainboost-data-source-logger-package @ git+https://github.com/Subjective-Technologies/brainboost_data_source_logger_package.git"
+          uv pip install "subjective-abstract-data-source-package @ git+https://github.com/Subjective-Technologies/subjective-abstract-data-source-package.git"
       - name: Install dependencies
         run: |
           uv pip install -e ".[dev]"
           uv pip install pytest
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -q tests
