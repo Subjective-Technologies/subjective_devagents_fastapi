@@ -775,7 +775,7 @@ async def api_llm_sessions(provider: str = Query(default="")) -> dict:
 
 
 @app.post("/api/llm/send-message")
-async def api_llm_send_message(body: dict = Body(default={})) -> dict:
+async def api_llm_send_message(request: Request, body: dict = Body(default={})) -> dict:
     instance = core()
     target = str(body.get("target") or "")
     text = str(body.get("text") or "").strip()
@@ -785,6 +785,24 @@ async def api_llm_send_message(body: dict = Body(default={})) -> dict:
     conversation = await asyncio.to_thread(instance.llm_service.find_conversation, target)
     if not conversation:
         return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+    # A workflow-backed AI user: build its definition here from the company's
+    # published workflow, read as the caller, instead of trusting browser text.
+    agent = body.get("agent")
+    if isinstance(agent, dict) and agent.get("role_file") and agent.get("company_id"):
+        from . import agent_workflow
+
+        try:
+            text = await asyncio.to_thread(
+                agent_workflow.prepare_turn,
+                instance.llm_service.agent_turns,
+                target,
+                agent,
+                request.headers.get("authorization", ""),
+                text,
+                instance.llm_service.app_home,
+            )
+        except agent_workflow.WorkflowUnavailable as error:
+            return {"ok": False, "status": "workflow_unavailable", "error": str(error)}
     # Cloudflare (and most reverse proxies) close idle HTTP at ~100s with 524, while
     # Cursor/Claude/Codex turns are allowed 30 minutes. Accept here and deliver the
     # assistant reply on the WebSocket (llm-message / llm-busy / system).
@@ -795,6 +813,9 @@ async def api_llm_send_message(body: dict = Body(default={})) -> dict:
     async def run_send() -> None:
         try:
             result = await asyncio.to_thread(instance.send_llm_message, target, text, files)
+            if not result.get("ok"):
+                # The definition did not reach the model; send it again next turn.
+                (instance.llm_service.agent_turns.get(target) or {}).pop("definition", None)
             default_log("info" if result.get("ok") else "error", "LLM send background finished", {
                 "target": target, "ok": bool(result.get("ok")),
                 "status": result.get("status") or "", "error": result.get("error") or "",

@@ -21,6 +21,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
+from . import agent_workflow
 from .cursor_inject import inject_into_cursor_dom
 from .provider_sessions import list_provider_sessions, sessions_for_provider
 from .system_users import current_username, is_valid_username
@@ -484,6 +485,9 @@ class LlmService:
         log: Callable[..., None] | None = None,
     ):
         self.root = str(root)
+        # Per-conversation agent state for chats with a workflow-backed AI user: the
+        # definition hash last sent and the [WF:..] header its replies must carry.
+        self.agent_turns: dict[str, dict] = {}
         self.app_home = str(
             app_home
             or os.environ.get("SUBJECTIVE_CHAT_HOME")
@@ -1885,7 +1889,11 @@ class LlmService:
                         failure["sessions"]["users"].sort(key=lambda user: (-int(bool(user["ready"])), user["username"]))
                 return failure
             conversation["sessionId"] = str(result.get("session_id") or "")
-            assistant_message = {"role": "assistant", "text": str(result.get("response") or ""), "time": time.time() * 1000}
+            reply_text = str(result.get("response") or "")
+            header = (self.agent_turns.get(target) or {}).get("header")
+            if header:
+                reply_text = agent_workflow.ensure_header(reply_text, *header)
+            assistant_message = {"role": "assistant", "text": reply_text, "time": time.time() * 1000}
             if result.get("turn_id"):
                 user_message["turnId"] = result["turn_id"]
                 assistant_message["turnId"] = result["turn_id"]
