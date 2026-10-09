@@ -1085,6 +1085,17 @@ class LlmService:
             return self.ssh_runtime
         return self.codex_runtime
 
+    def _default_workspace(self, provider: str) -> str:
+        """Where a chat created without a workspace works.
+
+        `self.root` is this service's client bundle (subjective_chat on the VPS), not the
+        repository agents are asked to change, so a dashboard agent created there could not
+        find the code it was talking about. SUBJECTIVE_DEVAGENTS_LLM_WORKSPACE names that
+        repository instead. An SSH chat's workspace is a host name, so it never takes this.
+        """
+        configured = os.environ.get("SUBJECTIVE_DEVAGENTS_LLM_WORKSPACE", "").strip()
+        return configured if configured and provider != "ssh" else self.root
+
     def create_conversation(
         self, provider: Any = None, name: str = "", workspace: str = "", os_user: str = "",
         ssh_connection: str = "",
@@ -1132,7 +1143,7 @@ class LlmService:
                     f"{label} CLI conversation as {owner}" if owner != me
                     else f"{label} CLI conversation"
                 ),
-                "workspace": str(workspace or self.root).strip() or self.root,
+                "workspace": str(workspace or self._default_workspace(key)).strip() or self.root,
                 "sshConnection": str(ssh_connection or "").strip() or None,
                 "sourceUser": owner,
                 # Only tag a chat with an owner when it is not the service account's own:

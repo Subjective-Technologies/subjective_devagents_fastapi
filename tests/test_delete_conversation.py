@@ -115,3 +115,18 @@ def test_a_cli_transcript_on_disk_is_not_ours_to_delete(service, monkeypatch):
     assert outcome["ok"] is False
     assert outcome["status"] == "read_only"
     assert "CLI" in outcome["error"]
+
+
+def test_a_chat_without_a_workspace_works_in_the_configured_repository(service, monkeypatch, tmp_path):
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_LLM_WORKSPACE", str(tmp_path / "repo"))
+    conversation = service.create_conversation(provider="claude", name="Agent")
+    assert conversation["workspace"] == str(tmp_path / "repo")
+
+    explicit = service.create_conversation(provider="claude", name="Agent", workspace=str(tmp_path / "other"))
+    assert explicit["workspace"] == str(tmp_path / "other")
+
+
+def test_without_the_setting_a_chat_keeps_the_service_root(service, monkeypatch, tmp_path):
+    monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_LLM_WORKSPACE", raising=False)
+    conversation = service.create_conversation(provider="claude", name="Agent")
+    assert conversation["workspace"] == str(tmp_path / "workspace")
