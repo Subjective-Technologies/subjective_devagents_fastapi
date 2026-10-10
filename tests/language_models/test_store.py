@@ -96,6 +96,15 @@ def test_same_cli_account_cannot_race_credentials_across_conversations(store, id
     assert reserve(store, identity, second_conversation["id"])["status"] == "queued"
 
 
+def test_an_interrupted_http_turn_does_not_lock_the_providers_other_conversations(store, identity):
+    http = replace(identity, id="legacy-api-proxy", strategy="api_agent", api_base_url="http://127.0.0.1:8317/v1",
+                   api_key_env="KEY", model="m")
+    first = reserve(store, http, store.create(http)["id"])
+    store.finish(first["id"], ModelResult("interrupted", error_code="worker_exception"))
+    other = store.create(http)
+    assert reserve(store, http, other["id"])["status"] == "queued"
+
+
 def test_different_cli_accounts_can_run_concurrently(store, identity):
     other = replace(identity, id="claude-b", home="/profiles/b", config_dir="/profiles/b/config")
     first = reserve(store, identity, store.create(identity)["id"])

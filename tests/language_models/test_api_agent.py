@@ -316,7 +316,7 @@ def test_cancellation_mid_tool_call_stops_the_loop(request_data, monkeypatch):
             return calls["n"] > 2  # let the first round complete, then stop before executing the tool
 
         result = ApiAgent().run(request, lambda *_: None, cancelled)
-    assert result.status == "interrupted" and result.error_code == "cancelled_mid_tool"
+    assert result.status == "cancelled" and result.error_code == "cancelled_mid_tool"
     assert len(proxy.requests) == 1
 
 

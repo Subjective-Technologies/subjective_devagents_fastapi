@@ -448,12 +448,16 @@ class Api(ModelStrategy):
         deadline = asyncio.get_running_loop().time() + request.timeout
         try:
             while not task.done():
-                if cancelled() or asyncio.get_running_loop().time() >= deadline:
-                    return ModelResult("interrupted", error_code="api_outcome_unknown")
+                # An inference call has no side effects outside the reply, so stopping
+                # or timing out leaves a known outcome, not one that needs reconciliation.
+                if cancelled():
+                    return ModelResult("cancelled", error_code="cancelled_during_request")
+                if asyncio.get_running_loop().time() >= deadline:
+                    return ModelResult("timed_out", error_code="timed_out")
                 await asyncio.wait({task}, timeout=0.1)
             return await task
         except httpx.HTTPError:
-            return ModelResult("interrupted", error_code="api_outcome_unknown")
+            return ModelResult("failed", error_code="provider_unreachable")
         finally:
             if not task.done():
                 task.cancel()
@@ -767,7 +771,8 @@ class ApiAgent(ModelStrategy):
                 return ModelResult("completed", text)
             for call in calls:
                 if cancelled():
-                    return ModelResult("interrupted", error_code="cancelled_mid_tool")
+                    # Between tool calls nothing is running: the stop is clean.
+                    return ModelResult("cancelled", error_code="cancelled_mid_tool")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return ModelResult("timed_out", error_code="timed_out")
@@ -830,12 +835,14 @@ class ApiAgent(ModelStrategy):
         call_deadline = asyncio.get_running_loop().time() + timeout
         try:
             while not task.done():
-                if cancelled() or asyncio.get_running_loop().time() >= call_deadline:
-                    return ModelResult("interrupted", error_code="api_outcome_unknown")
+                if cancelled():
+                    return ModelResult("cancelled", error_code="cancelled_during_request")
+                if asyncio.get_running_loop().time() >= call_deadline:
+                    return ModelResult("timed_out", error_code="timed_out")
                 await asyncio.wait({task}, timeout=0.1)
             return await task
         except httpx.HTTPError:
-            return ModelResult("interrupted", error_code="api_outcome_unknown")
+            return ModelResult("failed", error_code="provider_unreachable")
         finally:
             if not task.done():
                 task.cancel()

@@ -152,7 +152,11 @@ class TurnStore:
                             for key in ("provider", "ssh_host", "home", "config_dir")))
                 if active["conversation_id"] == conversation_id and active["status"] in ACTIVE:
                     raise ModelError("busy", "Conversation already has an active turn.")
-                if same_account and (identity.strategy == "cli" or active["status"] == "interrupted"):
+                # Account-wide serialisation and the unknown-outcome lock protect a CLI's own
+                # session/credential files. An HTTP identity (api, api_agent) has neither, and
+                # every dashboard agent of a provider shares one: an interrupted turn in one
+                # conversation must not lock all of them.
+                if same_account and identity.strategy == "cli":
                     if active["status"] == "interrupted":
                         raise ModelError("reconciliation_required", "This account has an unresolved execution outcome.")
                     raise ModelError("identity_busy", "This CLI account is executing another conversation.")

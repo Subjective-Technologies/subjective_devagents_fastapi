@@ -208,13 +208,13 @@ def test_api_does_not_retry_http_failures(http_provider, request_data, monkeypat
     assert result.error_code == expected and len(requests) == 1
 
 
-def test_api_cancel_reports_unknown_remote_outcome(http_provider, request_data, monkeypatch):
+def test_api_cancel_is_a_clean_cancellation(http_provider, request_data, monkeypatch):
     url, requests, settings = http_provider
     settings["delay"] = 0.5
     monkeypatch.setenv("TEST_LM_KEY", "fixture-key")
     identity = Identity("api", "compatible", strategy="api", model="test", api_base_url=url, api_key_env="TEST_LM_KEY")
     result = Api().run(replace(request_data, identity=identity), lambda *_: None, lambda: bool(requests))
-    assert result.status == "interrupted" and result.error_code == "api_outcome_unknown"
+    assert result.status == "cancelled" and result.error_code == "cancelled_during_request"
     assert len(requests) == 1
 
 
