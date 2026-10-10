@@ -161,5 +161,7 @@ def test_the_real_repository_registry_parses(monkeypatch):
     listed = agents.list_agents()
     if not listed["ok"]:
         pytest.skip("workflow/agents is not present in this checkout")
-    assert len(listed["agents"]) >= 20
+    # No fixed count: the registry's size follows the published workflow (20 rows became
+    # 17 in the 2026-10-08 restructure), and this test guards the parser, not the roster.
+    assert listed["agents"], "the shipped registry parsed to no agents"
     assert all(item["exists"] for item in listed["agents"]), "registry points at a missing role file"
