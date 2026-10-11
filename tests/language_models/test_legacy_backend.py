@@ -264,3 +264,21 @@ def test_file_diff_events_reach_the_progress_feed_with_their_payload(backend, co
     assert diff_rows[0]["target"] == conversation["target"]
     assert diff_rows[0]["text"] == "Edited /repo/app.py"
     assert diff_rows[0]["diff"] == {"path": "/repo/app.py", "status": "modified", "diff": "--- a\n+++ b\n-old\n+new"}
+
+
+def test_file_diffs_are_kept_per_turn_for_a_reopened_chat(backend, conversation):
+    class Editor(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            emit("file_diff", {"path": "/repo/a.py", "status": "created", "diff": "+++ a\n+one"})
+            emit("file_diff", {"path": "/repo/b.py", "status": "modified", "diff": "--- b\n+++ b\n-x\n+y"})
+            return ModelResult("completed", "Done.", "session")
+
+    backend.model.strategies = {"cli:codex": Editor()}
+    edited = send(backend, conversation)
+    backend.model.strategies = {"cli:codex": RecordingStrategy()}
+    plain = send(backend, conversation)
+    diffs = backend.file_diffs([edited["turn_id"], plain["turn_id"], ""])
+    assert list(diffs) == [edited["turn_id"]]
+    assert [item["path"] for item in diffs[edited["turn_id"]]] == ["/repo/a.py", "/repo/b.py"]
+    assert diffs[edited["turn_id"]][0] == {"path": "/repo/a.py", "status": "created", "diff": "+++ a\n+one"}
+    assert backend.file_diffs([]) == {}

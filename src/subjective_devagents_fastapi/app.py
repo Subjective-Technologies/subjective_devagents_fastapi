@@ -492,6 +492,25 @@ async def api_llm_conversations(limit: int = Query(default=200), q: str = Query(
         return {"ok": False, "error": str(error), "conversations": []}
 
 
+def _with_file_diffs(instance, conversation: dict) -> dict:
+    """Each agent answer carries the diffs of the files it changed, so a reopened chat shows them."""
+    messages = conversation.get("messages") or []
+    turn_ids = [m.get("turnId") for m in messages if m.get("role") == "assistant" and m.get("turnId")]
+    if not turn_ids:
+        return conversation
+    try:
+        diffs = instance.llm_service.backend.file_diffs(turn_ids)
+    except Exception as error:  # noqa: BLE001
+        default_log("error", "LLM conversation diffs unavailable", {"message": str(error)})
+        return conversation
+    if not diffs:
+        return conversation
+    return {**conversation, "messages": [
+        {**m, "diffs": diffs[m["turnId"]]} if m.get("role") == "assistant" and m.get("turnId") in diffs else m
+        for m in messages
+    ]}
+
+
 @app.get("/api/llm/conversation")
 async def api_llm_conversation(target: str = Query(default="")) -> dict:
     instance = core()
@@ -515,6 +534,7 @@ async def api_llm_conversation(target: str = Query(default="")) -> dict:
             # Authoritative busy state on hydrate, so opening a chat recovers from a missed
             # llm-busy:false (dropped socket) rather than inheriting a stale wedge.
             conversation["busy"] = str(target) in instance.llm_service.busy
+            conversation = await asyncio.to_thread(_with_file_diffs, instance, conversation)
             return {"ok": True, "conversation": conversation}
         return {"ok": False, "error": "Conversation was not found."}
     except Exception as error:  # noqa: BLE001

@@ -220,6 +220,28 @@ class LegacyLanguageModel:
             db.execute("INSERT OR IGNORE INTO legacy_projections(target,turn_id) VALUES (?,?)", (target, turn_id))
             db.execute("UPDATE legacy_bindings SET pending_turn=NULL WHERE target=? AND pending_turn=?", (target, turn_id))
 
+    def file_diffs(self, turn_ids: list[str]) -> dict[str, list[dict]]:
+        """The files each turn changed, as the unified diffs recorded while it ran."""
+        ids = sorted({str(item) for item in turn_ids if item})
+        found: dict[str, list[dict]] = {}
+        if not ids:
+            return found
+        with self.model.store.connection() as db:
+            for start in range(0, len(ids), 200):
+                chunk = ids[start:start + 200]
+                rows = db.execute(
+                    f"SELECT turn_id, data FROM events WHERE kind='file_diff' AND turn_id IN ({','.join('?' * len(chunk))}) "
+                    "ORDER BY sequence", chunk).fetchall()
+                for turn_id, raw in rows:
+                    try:
+                        data = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if data.get("path") and data.get("diff"):
+                        found.setdefault(turn_id, []).append(
+                            {"path": data["path"], "status": data.get("status") or "modified", "diff": data["diff"]})
+        return found
+
     def is_bound(self, target: str) -> bool:
         with self.model.store.connection() as db:
             return db.execute("SELECT 1 FROM legacy_bindings WHERE target=?", (target,)).fetchone() is not None
