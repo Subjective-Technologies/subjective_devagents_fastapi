@@ -655,6 +655,106 @@ def _unified_diff(path: str, before: str, after: str) -> str:
     return _cap("\n".join(diff))
 
 
+# Files a Bash command changes (scripts, sed -i, heredocs, commits) produce no Write/Edit
+# diff. Each git repository under the workspace (submodules included) is recorded before
+# the turn's first Bash command and compared when the turn ends: every file that changed
+# since then, committed or not, becomes a file_diff like the ones Write and Edit emit.
+_SNAPSHOT_SCRIPT = r"""
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+{ printf '%s\n' "$top"; git -C "$top" submodule foreach --recursive --quiet 'printf "%s\n" "$toplevel/$sm_path"' 2>/dev/null; } |
+while IFS= read -r repo; do
+  head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || continue
+  printf 'R\t%s\t%s\n' "$repo" "$head"
+  { git -C "$repo" ls-files -m -o -d --exclude-standard; git -C "$repo" diff --cached --name-only; } 2>/dev/null | sort -u |
+  while IFS= read -r file; do
+    if [ -d "$repo/$file" ]; then continue; fi
+    if [ -f "$repo/$file" ]; then hash=$(git -C "$repo" hash-object -- "$file" 2>/dev/null || echo '?'); else hash=-; fi
+    printf 'F\t%s\t%s\t%s\n' "$repo" "$file" "$hash"
+  done
+done
+"""
+_CHANGED_SCRIPT = r"""
+repo=$1; base=$2
+{ git -C "$repo" diff --name-only "$base" --; git -C "$repo" ls-files -o --exclude-standard; } 2>/dev/null | sort -u
+"""
+_FILE_DIFF_SCRIPT = r"""
+repo=$1; base=$2; file=$3
+if git -C "$repo" cat-file -e "$base:$file" 2>/dev/null; then
+  if [ -e "$repo/$file" ]; then echo modified; else echo deleted; fi
+  git -C "$repo" diff --no-color "$base" -- "$file"
+else
+  echo created
+  git -C "$repo" diff --no-color --no-index -- /dev/null "$repo/$file"
+fi
+exit 0
+"""
+MAX_BASH_DIFF_FILES = 30
+
+
+def _raw_shell(script: str, args: tuple[str, ...], identity, transport: ProcessTransport,
+               cancelled: Cancelled, timeout: float) -> str | None:
+    """stdout of a helper script in the workspace, or None if it did not complete."""
+    env = agent_environment(identity)
+    wrapped, cwd = _localize(("sh", "-c", script, "devagents-diff", *args), env, identity)
+    try:
+        result = transport.run(Command(argv=wrapped, cwd=cwd, env=env), timeout=timeout,
+                               cancelled=cancelled, on_stdout=lambda _chunk: None)
+    except Exception:
+        return None
+    return result.stdout if result.status == "completed" else None
+
+
+def workspace_snapshot(identity, transport: ProcessTransport, cancelled: Cancelled,
+                       timeout: float) -> dict | None:
+    """{repo: {"head": sha, "dirty": {path: hash}}} for every repository in the workspace."""
+    output = _raw_shell(_SNAPSHOT_SCRIPT, (), identity, transport, cancelled, timeout)
+    if output is None:
+        return None
+    repos: dict[str, dict] = {}
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if parts[0] == "R" and len(parts) == 3:
+            repos[parts[1]] = {"head": parts[2], "dirty": {}}
+        elif parts[0] == "F" and len(parts) == 4 and parts[1] in repos:
+            repos[parts[1]]["dirty"][parts[2]] = parts[3]
+    return repos
+
+
+def bash_file_diffs(before: dict, identity, transport: ProcessTransport, cancelled: Cancelled,
+                    timeout: float, skip: set[str]) -> list[dict]:
+    """Diffs of the files that changed in the workspace since `before`, except paths in `skip`."""
+    deadline = time.monotonic() + timeout
+    after = workspace_snapshot(identity, transport, cancelled, max(1.0, deadline - time.monotonic()))
+    if not after:
+        return []
+    diffs: list[dict] = []
+    for repo, start in before.items():
+        end = after.get(repo)
+        if not end or (end["head"] == start["head"] and end["dirty"] == start["dirty"]):
+            continue
+        listed = _raw_shell(_CHANGED_SCRIPT, (repo, start["head"]), identity, transport, cancelled,
+                            max(1.0, deadline - time.monotonic()))
+        candidates = set((listed or "").splitlines()) | set(start["dirty"]) | set(end["dirty"])
+        for path in sorted(candidates):
+            if not path or os.path.normpath(os.path.join(repo, path)) in skip:
+                continue
+            if path in start["dirty"] and start["dirty"].get(path) == end["dirty"].get(path, "?gone"):
+                continue  # changed before this turn and untouched by it
+            if path not in start["dirty"] and path not in end["dirty"] and end["head"] == start["head"]:
+                continue
+            if len(diffs) >= MAX_BASH_DIFF_FILES or time.monotonic() >= deadline:
+                return diffs
+            output = _raw_shell(_FILE_DIFF_SCRIPT, (repo, start["head"], path), identity, transport,
+                                cancelled, max(1.0, deadline - time.monotonic()))
+            if not output:
+                continue
+            status, _, diff = output.partition("\n")
+            if diff.strip():
+                diffs.append({"path": os.path.join(repo, path), "status": status.strip() or "modified",
+                              "diff": _cap(diff.rstrip("\n"))})
+    return diffs
+
+
 def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessTransport,
                        cancelled: Cancelled, timeout: float, emit: Emit) -> str:
     """Runs one tool call. Raises ToolAbort when the whole turn must stop, not just this call."""
@@ -747,6 +847,9 @@ class ApiAgent(ModelStrategy):
         transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
                                        if identity.ssh_host else LocalProcess())
         deadline = time.monotonic() + request.timeout
+        # Repositories as they were before the first Bash command; None until one runs.
+        snapshot: dict | None = None
+        edited: set[str] = set()
         for _ in range(MAX_TOOL_ROUNDS):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -768,6 +871,10 @@ class ApiAgent(ModelStrategy):
             if not calls:
                 if finish_reason != "stop" or not isinstance(text, str) or not text.strip():
                     return ModelResult("failed", error_code="incomplete_provider_output")
+                if snapshot:
+                    budget = min(60.0, max(5.0, deadline - time.monotonic()))
+                    for diff in bash_file_diffs(snapshot, identity, transport, cancelled, budget, edited):
+                        emit("file_diff", diff)
                 return ModelResult("completed", text)
             for call in calls:
                 if cancelled():
@@ -776,14 +883,18 @@ class ApiAgent(ModelStrategy):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return ModelResult("timed_out", error_code="timed_out")
-                result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, emit)
+                name = (call.get("function") or {}).get("name") or ""
+                if name == "Bash" and snapshot is None:
+                    snapshot = workspace_snapshot(identity, transport, cancelled, min(30.0, remaining)) or {}
+                result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, emit,
+                                             edited)
                 if isinstance(result_text, ModelResult):
                     return result_text
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
         return ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod
-    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit):
+    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None):
         name = (call.get("function") or {}).get("name") or ""
         try:
             arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
@@ -803,6 +914,9 @@ class ApiAgent(ModelStrategy):
         step = ClaudeCli.tool_step(name, arguments)
         if step:
             emit("activity", {"text": step})
+        if name in {"Write", "Edit"} and edited is not None and arguments.get("file_path"):
+            # Already shown by the tool's own diff; the end-of-turn Bash diff skips it.
+            edited.add(os.path.normpath(os.path.join(identity.workspace or "/", str(arguments["file_path"]))))
         try:
             return execute_agent_tool(name, arguments, identity, transport, cancelled, timeout, emit)
         except ToolAbort as abort:

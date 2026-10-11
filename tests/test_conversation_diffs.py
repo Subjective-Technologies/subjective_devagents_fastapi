@@ -1,4 +1,4 @@
-"""A reopened chat shows the files each agent answer changed."""
+"""A reopened chat shows each agent answer's steps and the files it changed."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ from subjective_devagents_fastapi import app as app_module  # noqa: E402
 DIFF = {"path": "/repo/a.py", "status": "modified", "diff": "--- a\n+++ a\n-x\n+y"}
 
 
-def _instance(diffs, asked):
-    def file_diffs(turn_ids):
+def _instance(details, asked):
+    def turn_details(turn_ids):
         asked.append(list(turn_ids))
-        return diffs
+        return details
 
-    return SimpleNamespace(llm_service=SimpleNamespace(backend=SimpleNamespace(file_diffs=file_diffs)))
+    return SimpleNamespace(llm_service=SimpleNamespace(backend=SimpleNamespace(turn_details=turn_details)))
 
 
 def test_answers_carry_the_diffs_of_their_turn():
@@ -31,10 +31,13 @@ def test_answers_carry_the_diffs_of_their_turn():
         {"role": "assistant", "text": "imported"},
     ]
     conversation = {"target": "x", "messages": messages}
-    result = app_module._with_file_diffs(_instance({"t1": [DIFF]}, asked), conversation)
+    details = {"t1": {"steps": ["Running: ls", "Editing a.py"], "diffs": [DIFF]}, "t2": {"steps": ["Reading x"], "diffs": []}}
+    result = app_module._with_turn_details(_instance(details, asked), conversation)
     assert asked == [["t1", "t2"]]
     assert result["messages"][1]["diffs"] == [DIFF]
-    assert "diffs" not in result["messages"][0] and "diffs" not in result["messages"][3]
+    assert result["messages"][1]["steps"] == ["Running: ls", "Editing a.py"]
+    assert result["messages"][3]["steps"] == ["Reading x"] and "diffs" not in result["messages"][3]
+    assert "diffs" not in result["messages"][0] and "steps" not in result["messages"][0]
     # the stored conversation is not changed
     assert "diffs" not in messages[1]
 
@@ -43,6 +46,6 @@ def test_a_failing_lookup_still_returns_the_conversation():
     def broken(_ids):
         raise RuntimeError("db locked")
 
-    instance = SimpleNamespace(llm_service=SimpleNamespace(backend=SimpleNamespace(file_diffs=broken)))
+    instance = SimpleNamespace(llm_service=SimpleNamespace(backend=SimpleNamespace(turn_details=broken)))
     conversation = {"messages": [{"role": "assistant", "text": "a", "turnId": "t1"}]}
-    assert app_module._with_file_diffs(instance, conversation) is conversation
+    assert app_module._with_turn_details(instance, conversation) is conversation

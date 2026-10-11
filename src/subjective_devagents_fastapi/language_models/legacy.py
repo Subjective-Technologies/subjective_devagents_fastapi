@@ -175,6 +175,9 @@ class LegacyLanguageModel:
             cursor = 0
             try:
                 while True:
+                    # Status first, then events: whatever the turn emitted before it ended
+                    # (the end-of-turn diffs) is still read in this pass.
+                    finished = self.model.store.turn(turn["id"])["status"] in TERMINAL
                     events = self.model.store.events(turn["id"], cursor)
                     for event in events:
                         cursor = event["sequence"]
@@ -187,8 +190,8 @@ class LegacyLanguageModel:
                             progress({"target": conversation["target"], "text": f"Edited {data.get('path', '')}",
                                      "diff": {"path": data.get("path"), "status": data.get("status"),
                                              "diff": data.get("diff")}})
-                    turn = self.model.store.turn(turn["id"])
-                    if turn["status"] in TERMINAL:
+                    if finished and len(events) < 1000:  # a full page may have more behind it
+                        turn = self.model.store.turn(turn["id"])
                         break
                     time.sleep(0.05)
             finally:
@@ -220,26 +223,31 @@ class LegacyLanguageModel:
             db.execute("INSERT OR IGNORE INTO legacy_projections(target,turn_id) VALUES (?,?)", (target, turn_id))
             db.execute("UPDATE legacy_bindings SET pending_turn=NULL WHERE target=? AND pending_turn=?", (target, turn_id))
 
-    def file_diffs(self, turn_ids: list[str]) -> dict[str, list[dict]]:
-        """The files each turn changed, as the unified diffs recorded while it ran."""
+    def turn_details(self, turn_ids: list[str]) -> dict[str, dict]:
+        """Per turn, what the agent did: its steps and the unified diffs of the files it changed."""
         ids = sorted({str(item) for item in turn_ids if item})
-        found: dict[str, list[dict]] = {}
+        found: dict[str, dict] = {}
         if not ids:
             return found
         with self.model.store.connection() as db:
             for start in range(0, len(ids), 200):
                 chunk = ids[start:start + 200]
                 rows = db.execute(
-                    f"SELECT turn_id, data FROM events WHERE kind='file_diff' AND turn_id IN ({','.join('?' * len(chunk))}) "
-                    "ORDER BY sequence", chunk).fetchall()
-                for turn_id, raw in rows:
+                    f"SELECT turn_id, kind, data FROM events WHERE kind IN ('file_diff','activity') "
+                    f"AND turn_id IN ({','.join('?' * len(chunk))}) ORDER BY sequence", chunk).fetchall()
+                for turn_id, kind, raw in rows:
                     try:
                         data = json.loads(raw)
                     except ValueError:
                         continue
-                    if data.get("path") and data.get("diff"):
-                        found.setdefault(turn_id, []).append(
+                    entry = found.setdefault(turn_id, {"steps": [], "diffs": []})
+                    if kind == "file_diff" and data.get("path") and data.get("diff"):
+                        entry["diffs"].append(
                             {"path": data["path"], "status": data.get("status") or "modified", "diff": data["diff"]})
+                    elif kind == "activity" and data.get("text"):
+                        text = str(data["text"])
+                        if (not entry["steps"] or entry["steps"][-1] != text) and len(entry["steps"]) < 200:
+                            entry["steps"].append(text)
         return found
 
     def is_bound(self, target: str) -> bool:

@@ -387,3 +387,55 @@ def test_legacy_proxy_identity_is_built_when_configured(monkeypatch):
     found = proxy_identity("claude", "alice", "/tmp/ws", "/home/alice")
     assert found is not None and found.strategy == "api_agent" and found.model == "claude-sonnet-4-5"
     assert found.api_base_url == "http://127.0.0.1:8317/v1" and found.api_key_env == "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
+
+
+def _git(workspace, *args):
+    import subprocess
+    subprocess.run(["git", "-C", workspace, "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                   check=True, capture_output=True)
+
+
+def test_files_changed_by_bash_become_diffs_when_the_turn_ends(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    ws = request_data.identity.workspace
+    _git(ws, "init", "-q")
+    open(f"{ws}/a.txt", "w").write("one\ntwo\n")
+    open(f"{ws}/old.txt", "w").write("keep\n")
+    open(f"{ws}/committed.txt", "w").write("v1\n")
+    _git(ws, "add", ".")
+    _git(ws, "commit", "-q", "-m", "base")
+    open(f"{ws}/old.txt", "w").write("keep\nchanged before the turn\n")  # dirty before, untouched by the turn
+    script = ("sed -i 's/two/TWO/' a.txt && printf 'new\\n' > made.txt && printf 'v2\\n' > committed.txt "
+              "&& git -c user.email=t@t -c user.name=t commit -q -m agent committed.txt")
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "Bash", command=script)]),
+        completion(tool_calls=[tool_call("2", "Write", file_path=f"{ws}/written.txt", content="w\n")]),
+        completion(content="Done."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
+    assert result.status == "completed"
+    diffs = {data["path"].rsplit("/", 1)[-1]: data for kind, data in events if kind == "file_diff"}
+    assert set(diffs) == {"a.txt", "made.txt", "committed.txt", "written.txt"}
+    assert diffs["a.txt"]["status"] == "modified" and "-two" in diffs["a.txt"]["diff"] and "+TWO" in diffs["a.txt"]["diff"]
+    assert diffs["made.txt"]["status"] == "created" and "+new" in diffs["made.txt"]["diff"]
+    # a change the agent committed during the turn still shows
+    assert "-v1" in diffs["committed.txt"]["diff"] and "+v2" in diffs["committed.txt"]["diff"]
+    # Write's own diff is the only one for written.txt
+    assert sum(1 for kind, data in events if kind == "file_diff" and data["path"].endswith("written.txt")) == 1
+
+
+def test_a_turn_without_bash_or_outside_git_takes_no_snapshot(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    ws = request_data.identity.workspace
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("1", "Bash", command="printf x > plain.txt")]),
+        completion(content="Done."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
+    assert result.status == "completed"
+    assert open(f"{ws}/plain.txt").read() == "x"
+    assert not [data for kind, data in events if kind == "file_diff"]
