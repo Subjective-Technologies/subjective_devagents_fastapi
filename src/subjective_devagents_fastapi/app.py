@@ -15,6 +15,7 @@ Run locally:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import base64
 import json
 import mimetypes
@@ -847,6 +848,21 @@ async def api_workflow_file(path: str = Query(default=""), company: str = Query(
     )
 
 
+def _context_meta(raw) -> dict:
+    """The client's description of how it built a prompt, reduced to short scalars."""
+    if not isinstance(raw, dict):
+        return {}
+    meta = {}
+    for key, value in list(raw.items())[:20]:
+        if not isinstance(key, str) or len(key) > 64:
+            continue
+        if isinstance(value, (bool, int, float)) or value is None:
+            meta[key] = value
+        elif isinstance(value, str):
+            meta[key] = value[:120]
+    return meta
+
+
 @app.post("/api/llm/send-message")
 async def api_llm_send_message(request: Request, body: dict = Body(default={})) -> dict:
     instance = core()
@@ -887,6 +903,10 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
     # assistant reply on the WebSocket (llm-message / llm-busy / system).
     default_log("info", "LLM send accepted (async)", {
         "target": target, "provider": conversation["provider"], "promptChars": len(text), "files": len(files),
+        # What the client put in the prompt (counts and sizes only, never content), and a
+        # fingerprint of the exact text, to tell "never sent" from "sent and ignored".
+        "promptSha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        "context": _context_meta(body.get("context")),
     })
 
     async def run_send() -> None:
