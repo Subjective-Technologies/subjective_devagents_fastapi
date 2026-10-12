@@ -858,6 +858,8 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
     conversation = await asyncio.to_thread(instance.llm_service.find_conversation, target)
     if not conversation:
         return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+    # From here on a Stop is honoured even before the turn starts (see cancel_message).
+    instance.llm_service.accept_send(target)
     # A workflow-backed AI user: build its definition here from the company's
     # published workflow, read as the caller, instead of trusting browser text.
     agent = body.get("agent")
@@ -875,7 +877,11 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
                 instance.llm_service.app_home,
             )
         except agent_workflow.WorkflowUnavailable as error:
+            instance.llm_service.settle_send(target)
             return {"ok": False, "status": "workflow_unavailable", "error": str(error)}
+        except Exception:
+            instance.llm_service.settle_send(target)
+            raise
     # Cloudflare (and most reverse proxies) close idle HTTP at ~100s with 524, while
     # Cursor/Claude/Codex turns are allowed 30 minutes. Accept here and deliver the
     # assistant reply on the WebSocket (llm-message / llm-busy / system).
@@ -895,6 +901,8 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
             })
         except Exception as error:  # noqa: BLE001
             default_log("error", "LLM send background crash", {"target": target, "message": str(error)})
+        finally:
+            instance.llm_service.settle_send(target)
 
     asyncio.create_task(run_send())
     return {"ok": True, "pending": True, "target": target}

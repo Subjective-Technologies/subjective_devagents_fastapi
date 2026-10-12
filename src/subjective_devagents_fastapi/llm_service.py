@@ -525,6 +525,9 @@ class LlmService:
         self._cancellers: dict[str, Callable[[], bool]] = {}
         self._cancel_lock = threading.Lock()
         self._cancelled_targets: set[str] = set()
+        # Sends accepted but not running yet (the workflow is still being prepared). A Stop
+        # in that window is latched and stops the turn before it starts.
+        self.pending_sends: set[str] = set()
         self._history_refresh_deferred = False
         self._history_cache: list[dict] | None = None
         self._sorted_cache: dict | None = None
@@ -1613,6 +1616,17 @@ class LlmService:
             self._cancellers.pop(target, None)
             self._cancelled_targets.discard(target)
 
+    def accept_send(self, target: str) -> None:
+        with self._cancel_lock:
+            self.pending_sends.add(target)
+
+    def settle_send(self, target: str) -> None:
+        """The accepted send is over (ran, failed or was stopped); a latch it left must not stop the next one."""
+        with self._cancel_lock:
+            self.pending_sends.discard(target)
+            if target not in self.busy:
+                self._cancelled_targets.discard(target)
+
     def was_cancelled(self, target: str) -> bool:
         with self._cancel_lock:
             return target in self._cancelled_targets
@@ -1629,7 +1643,7 @@ class LlmService:
             return {"ok": False, "error": "Missing conversation target."}
         with self._cancel_lock:
             canceller = self._cancellers.get(key)
-            running = key in self.busy
+            running = key in self.busy or key in self.pending_sends
             if running:
                 self._cancelled_targets.add(key)
         stopped = False
@@ -1668,6 +1682,12 @@ class LlmService:
         if target in self.busy:
             self.log("warn", "LLM send aborted: already busy", {"target": target, "provider": source["provider"]})
             return {"ok": False, "status": "busy", "error": f"{provider['label']} is already responding in this conversation."}
+        if self.was_cancelled(target):
+            # Stop was pressed while this send was still being prepared: never start it.
+            with self._cancel_lock:
+                self._cancelled_targets.discard(target)
+            self.log("info", "LLM turn stopped before it started", {"target": target, "provider": source["provider"]})
+            return {"ok": False, "stopped": True, "status": "cancelled", "error": "Stopped."}
 
         pending = self.backend.pending(target)
         if pending:

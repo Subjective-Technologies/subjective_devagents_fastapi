@@ -120,3 +120,40 @@ def test_a_stop_racing_the_spawn_is_not_lost(service, monkeypatch):
 
     assert cancelled.is_set(), "a cancel that arrived before the process was dropped"
     service.busy.discard(target)
+
+
+def test_stop_while_the_send_is_still_being_prepared_never_starts_the_turn(service, monkeypatch):
+    """The browser posts, DevAgents prepares the workflow, and only then is the chat busy.
+    A Stop in that gap used to be dropped as "not running", and the turn ran on unwatched."""
+    chat = service.create_conversation("claude", "early stop")
+    started = []
+    monkeypatch.setattr(
+        service.backend, "send",
+        lambda conversation, source, request, register, clear, progress: started.append(1) or {
+            "success": True, "status": "completed", "response": "answer", "session_id": ""},
+    )
+    service.accept_send(chat["target"])
+    result = service.cancel_message(chat["target"])
+    assert result["running"] is True
+    outcome = service.send_message(chat["target"], "go")
+    service.settle_send(chat["target"])
+    assert outcome.get("stopped") is True and outcome.get("status") == "cancelled"
+    assert not started, "the stopped turn must not reach the model"
+
+
+def test_a_stop_latched_for_one_send_does_not_stop_the_next(service, monkeypatch):
+    chat = service.create_conversation("claude", "next send runs")
+    started = []
+    monkeypatch.setattr(
+        service.backend, "send",
+        lambda conversation, source, request, register, clear, progress: started.append(1) or {
+            "success": True, "status": "completed", "response": "answer", "session_id": ""},
+    )
+    service.accept_send(chat["target"])
+    service.cancel_message(chat["target"])
+    service.settle_send(chat["target"])  # e.g. the workflow could not be loaded
+    assert not service.was_cancelled(chat["target"])
+    # an idle chat: Stop is a no-op and latches nothing
+    assert service.cancel_message(chat["target"])["running"] is False
+    service.send_message(chat["target"], "go")
+    assert started == [1]
