@@ -23,7 +23,16 @@ PROXY_URL_ENV = "SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL"
 PROXY_KEY_ENV = "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
 PROXY_MODEL_ENV = {"claude": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CLAUDE",
                    "codex": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CODEX",
-                   "grok": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK"}
+                   "grok": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK",
+                   "kimi": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI"}
+# Providers with no CLI of their own: they run only as api_agent identities behind the proxy.
+PROXY_ONLY_PROVIDERS = frozenset({"kimi"})
+
+
+def proxy_configured(provider: str) -> bool:
+    """Whether the inference proxy and a model id are set for this provider."""
+    model_env = PROXY_MODEL_ENV.get(provider)
+    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and os.environ.get(model_env, "").strip())
 
 
 def proxy_identity(provider: str, username: str, workspace: str, home: str) -> Identity | None:
@@ -94,7 +103,7 @@ class LegacyLanguageModel:
             return choices[0]
         if conversation.get("sshConnection"):
             raise ModelError("configuration_required", "Remote model execution requires an explicitly configured SSH identity.")
-        if provider not in {"codex", "claude", "cursor", "grok"}:
+        if provider not in {"codex", "claude", "cursor", "grok"} | PROXY_ONLY_PROVIDERS:
             raise ModelError("unsupported_provider", "No standalone driver is registered for this provider.")
         account = pwd.getpwnam(username)
         home = account.pw_dir
@@ -102,6 +111,9 @@ class LegacyLanguageModel:
         if api_identity is not None:
             self.model.identities.register_legacy(api_identity)
             return api_identity
+        if provider in PROXY_ONLY_PROVIDERS:
+            raise ModelError("configuration_required",
+                             f"{provider.title()} runs only through the LLM proxy: set {PROXY_URL_ENV} and {PROXY_MODEL_ENV[provider]}.")
         config_dir = str(Path(home) / {"codex": ".codex", "claude": ".claude", "cursor": ".config/cursor", "grok": ".grok"}[provider])
         binary = {"cursor": "cursor-agent"}.get(provider, provider)
         executable = find_executable(binary, home)

@@ -36,6 +36,8 @@ PROVIDER_ICONS = {
     "google-gemini": "../assets/providers/gemini.svg",
     "grok": "../assets/providers/grok.svg",
     "xai": "../assets/providers/grok.svg",
+    "kimi": "../assets/providers/kimi.svg",
+    "moonshot": "../assets/providers/kimi.svg",
     "chatgpt": "../assets/providers/chatgpt.svg",
     "chat-gpt": "../assets/providers/chatgpt.svg",
     "openai": "../assets/providers/chatgpt.svg",
@@ -53,6 +55,8 @@ PROVIDER_LABELS = {
     "google-gemini": "Gemini",
     "grok": "Grok",
     "xai": "Grok",
+    "kimi": "Kimi",
+    "moonshot": "Kimi",
     "chatgpt": "ChatGPT",
     "chat-gpt": "ChatGPT",
     "openai": "ChatGPT",
@@ -68,6 +72,9 @@ WRITABLE_PROVIDERS = {
     "claude": {"bundle": "claude", "label": "Claude"},
     "cursor": {"bundle": "cursor", "label": "Cursor"},
     "grok": {"bundle": "grok", "label": "Grok"},
+    # Moonshot's Kimi has no CLI: it runs as the backend's own tool loop (ApiAgent) through
+    # the LLM proxy, with SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI naming the model.
+    "kimi": {"bundle": "kimi", "label": "Kimi"},
     # Not an LLM CLI: the other end is a shell on another machine, and a turn's text is
     # run there as a command. The conversation's workspace names the target, written
     # `user@host:/path` — see datasources.ssh_connection_from_workspace.

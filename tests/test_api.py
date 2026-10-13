@@ -494,6 +494,7 @@ def test_every_creatable_agent_is_listed_for_the_picker(client):
     listed = {item["key"]: item for item in payload["providers"]}
     assert set(listed) == set(WRITABLE_PROVIDERS), "picker list drifted from the backend"
     assert "grok" in listed, "Grok is creatable and must be offered"
+    assert listed["kimi"]["label"] == "Kimi"
     assert payload["default"] in listed
     for key, provider in WRITABLE_PROVIDERS.items():
         assert listed[key]["label"] == provider["label"]

@@ -784,11 +784,19 @@ async def api_llm_cancel_message(body: dict = Body(default={})) -> dict:
 @app.get("/api/llm/providers")
 async def api_llm_providers() -> dict:
     """Stable provider discovery, backed by standalone drivers."""
+    from .language_models.legacy import PROXY_ONLY_PROVIDERS, proxy_configured
     from .llm_service import DEFAULT_PROVIDER, WRITABLE_PROVIDERS
+
+    def available(key: str) -> bool:
+        if key == "ssh":
+            return True
+        if key in PROXY_ONLY_PROVIDERS:
+            return proxy_configured(key)
+        return f"cli:{key}" in core().llm_service.backend.model.strategies
+
     return {
         "ok": True, "default": DEFAULT_PROVIDER,
-        "providers": [{"key": key, "label": provider["label"],
-                       "available": key == "ssh" or f"cli:{key}" in core().llm_service.backend.model.strategies}
+        "providers": [{"key": key, "label": provider["label"], "available": available(key)}
                       for key, provider in WRITABLE_PROVIDERS.items()],
     }
 

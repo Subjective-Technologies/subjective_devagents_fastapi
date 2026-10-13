@@ -389,6 +389,35 @@ def test_legacy_proxy_identity_is_built_when_configured(monkeypatch):
     assert found.api_base_url == "http://127.0.0.1:8317/v1" and found.api_key_env == "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
 
 
+def test_kimi_runs_only_through_the_proxy(monkeypatch, tmp_path):
+    """Kimi has no CLI: with the proxy and a model set it is an api_agent identity; without,
+    a turn is refused with what to configure instead of looking for a "kimi" binary."""
+    import getpass
+
+    from subjective_devagents_fastapi.language_models import legacy
+    from subjective_devagents_fastapi.language_models.contracts import ModelError
+
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL", "http://127.0.0.1:8317/v1")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI", "kimi-k2.8-code")
+    found = proxy_identity("kimi", "alice", "/tmp/ws", "/home/alice")
+    assert found is not None and found.provider == "kimi" and found.strategy == "api_agent"
+    assert found.model == "kimi-k2.8-code"
+    assert legacy.proxy_configured("kimi")
+
+    monkeypatch.delenv("SUBJECTIVE_LANGUAGE_MODELS_CONFIG", raising=False)
+    monkeypatch.setenv("SUBJECTIVE_LANGUAGE_MODELS_DB", str(tmp_path / "turns.sqlite3"))
+    adapter = legacy.LegacyLanguageModel(str(tmp_path))
+    try:
+        conversation = {"target": "t", "provider": "kimi", "osUser": getpass.getuser(), "workspace": str(tmp_path)}
+        assert adapter.identity(conversation).strategy == "api_agent"
+        monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI")
+        assert not legacy.proxy_configured("kimi")
+        with pytest.raises(ModelError, match="SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI"):
+            adapter.identity(conversation)
+    finally:
+        adapter.close()
+
+
 def _git(workspace, *args):
     import subprocess
     subprocess.run(["git", "-C", workspace, "-c", "user.email=t@t", "-c", "user.name=t", *args],
