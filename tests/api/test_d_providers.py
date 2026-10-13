@@ -21,6 +21,8 @@ PROVIDERS = {
     "grok": ("grok", "subjective_grok_cli_datasource"),
     "ssh": ("ssh", "subjective_ssh_datasource"),
 }
+# Agents with no CLI or plugin: they run only through the LLM proxy (ApiAgent).
+PROXY_ONLY = {"kimi"}
 # `localchats` is a reader, not a writable agent: it imports history rather than
 # answering a turn, so it has a datasource but no entry in the new-chat picker.
 READ_ONLY_DATASOURCES = {"localchats"}
@@ -38,7 +40,7 @@ def test_d1_the_provider_list_carries_a_key_and_a_label_for_each_agent(client):
     """The picker used to hard-code this in two files, which drifted from the backend."""
     body = envelope(client.get("/api/llm/providers"), ok=True)
     keys = [provider["key"] for provider in body["providers"]]
-    assert set(keys) == {"codex", "claude", "cursor", "grok", "ssh"}, keys
+    assert set(keys) == set(PROVIDERS) | PROXY_ONLY, keys
     assert body["default"] in keys
 
     for provider in body["providers"]:
@@ -75,7 +77,7 @@ def test_d2_the_datasource_report_says_where_each_plugin_resolved_from(client):
     body = envelope(client.get("/api/datasources"), ok=True)
     report = body["datasources"]
 
-    assert set(report) == set(PROVIDERS) | READ_ONLY_DATASOURCES, sorted(report)
+    assert set(report) == set(PROVIDERS) | READ_ONLY_DATASOURCES | PROXY_ONLY, sorted(report)
     for key, entry in report.items():
         assert entry["package"], f"{key} reports no package name"
         assert isinstance(entry["found"], bool)

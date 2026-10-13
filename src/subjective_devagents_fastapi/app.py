@@ -947,17 +947,26 @@ async def api_datasources() -> dict:
     report = datasources.available()
     model = core().llm_service.backend.model
     model_path = str(Path(__file__).with_name("language_models") / "strategies.py")
+    from .language_models.legacy import PROXY_MODEL_ENV, PROXY_ONLY_PROVIDERS, PROXY_URL_ENV, proxy_configured
+
     for key in WRITABLE_PROVIDERS:
         entry = report.setdefault(key, {"package": f"language-model:{key}", "found": True})
         strategies = [name for name in (f"cli:{key}", f"api_agent:{key}") if name in model.strategies]
+        loaded = bool(strategies) or key == "ssh"
+        error = ""
+        if key in PROXY_ONLY_PROVIDERS:
+            # No plugin or CLI: it runs through the LLM proxy once that is configured.
+            loaded = proxy_configured(key)
+            strategies = ["api_agent"] if loaded else []
+            error = "" if loaded else f"runs only through the LLM proxy: set {PROXY_URL_ENV} and {PROXY_MODEL_ENV[key]}"
         entry.update({
             "found": True,
-            "loaded": bool(strategies) or key == "ssh",
+            "loaded": loaded,
             "strategies": strategies,
             "path": model_path,
             "backend": "language-model",
             "execution": "language-model",
-            "error": "",
+            "error": error,
         })
     for key in ("localchats", "ssh"):
         if key in report:
