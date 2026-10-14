@@ -566,6 +566,78 @@ def agent_text_bytes(messages: list) -> int:
     return total
 
 
+# The conversation is replayed on every request. Its earlier turns may use this much of the
+# context, so the current turn's tool rounds keep the rest.
+HISTORY_BUDGET_BYTES = int(MAX_CONTEXT_BYTES * 0.6)
+# Tool results of the current turn kept whole when older ones are shortened to fit.
+KEEP_RECENT_TOOL_RESULTS = 4
+# The first message of a workflow agent's conversation carries its definition (its role).
+DEFINITION_MARKER = "[[subjective-agent-definition]]"
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+def fit_history(messages: list, budget: int = HISTORY_BUDGET_BYTES) -> tuple[list, int]:
+    """Drop the oldest earlier turns until the request fits `budget`; returns (messages, dropped).
+
+    `messages` is [system, *history, latest user message]. The agent definition (a history
+    message carrying DEFINITION_MARKER) is kept, the latest message always is, and history
+    restarts on a user message so roles keep alternating. A note on the latest message says
+    how much was dropped, so the agent knows its memory of this conversation is partial.
+    """
+    if agent_text_bytes(messages) <= budget or len(messages) <= 2:
+        return messages, 0
+    system, history, latest = messages[0], list(messages[1:-1]), messages[-1]
+    pinned = [m for m in history[:1] if m.get("role") == "user" and DEFINITION_MARKER in _text_of(m.get("content"))]
+    # A pinned definition keeps the answer that followed it, so the pair stays a pair.
+    if pinned and len(history) > 1 and history[1].get("role") == "assistant":
+        pinned.append(history[1])
+    rest = history[len(pinned):]
+    dropped = 0
+    while rest and agent_text_bytes([system, *pinned, *rest, latest]) > budget:
+        rest.pop(0)
+        dropped += 1
+    while rest and rest[0].get("role") != "user":
+        rest.pop(0)
+        dropped += 1
+    if not dropped:
+        return messages, 0
+    note = (f"[Note: the {dropped} oldest message(s) of this conversation were left out to fit the "
+            "context window. The channel history in this message is the record; ask if you need more.]\n")
+    content = latest.get("content")
+    if isinstance(content, list):
+        content = [{"type": "text", "text": note}, *content]
+    else:
+        content = note + str(content or "")
+    return [system, *pinned, *rest, {**latest, "content": content}], dropped
+
+
+def shorten_tool_results(messages: list, first_of_turn: int, budget: int = MAX_CONTEXT_BYTES,
+                         keep: int = KEEP_RECENT_TOOL_RESULTS) -> int:
+    """Replace this turn's oldest tool results with a short note until the request fits.
+
+    The newest `keep` results stay whole. Returns how many were shortened.
+    """
+    tool_indexes = [index for index in range(first_of_turn, len(messages)) if messages[index].get("role") == "tool"]
+    shortened = 0
+    for index in tool_indexes[:-keep] if keep else tool_indexes:
+        if agent_text_bytes(messages) <= budget:
+            break
+        text = _text_of(messages[index].get("content"))
+        if text.startswith("[Earlier tool output left out"):
+            continue
+        messages[index] = {**messages[index],
+                           "content": f"[Earlier tool output left out to fit the context window: {len(text)} chars. Run it again if you need it.]"}
+        shortened += 1
+    return shortened
+
+
 def agent_system_prompt(identity) -> str:
     lines = [
         "You are a coding assistant with tool access to one real workspace. Use tools to inspect or "
@@ -844,6 +916,12 @@ class ApiAgent(ModelStrategy):
         else:
             content = request.prompt
         messages.append({"role": "user", "content": content})
+        # A long conversation would otherwise exceed the context on every later turn:
+        # leave out its oldest turns instead of failing.
+        messages, dropped = fit_history(messages)
+        if dropped:
+            emit("activity", {"text": f"Left out the {dropped} oldest messages to fit the context window"})
+        first_of_turn = len(messages)
         transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
                                        if identity.ssh_host else LocalProcess())
         deadline = time.monotonic() + request.timeout
@@ -855,7 +933,17 @@ class ApiAgent(ModelStrategy):
             if remaining <= 0:
                 return ModelResult("timed_out", error_code="timed_out")
             if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
-                return ModelResult("failed", error_code="context_too_large")
+                # Long tool loops: shorten this turn's oldest tool output, then older history.
+                if shorten_tool_results(messages, first_of_turn):
+                    emit("activity", {"text": "Shortened earlier tool output to fit the context window"})
+                if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
+                    turn_part = messages[first_of_turn - 1:]
+                    fitted, more = fit_history(messages[:first_of_turn], MAX_CONTEXT_BYTES - agent_text_bytes(turn_part[1:]))
+                    if more:
+                        messages = fitted + turn_part[1:]
+                        first_of_turn = len(fitted)
+                if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
+                    return ModelResult("failed", error_code="context_too_large")
             outcome = await self._call(identity, token, messages, tools, remaining, cancelled)
             if isinstance(outcome, ModelResult):
                 return outcome

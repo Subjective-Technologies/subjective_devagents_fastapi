@@ -468,3 +468,59 @@ def test_a_turn_without_bash_or_outside_git_takes_no_snapshot(request_data, monk
     assert result.status == "completed"
     assert open(f"{ws}/plain.txt").read() == "x"
     assert not [data for kind, data in events if kind == "file_diff"]
+
+
+# --- context window ---------------------------------------------------------------------------
+
+
+def test_fit_history_drops_the_oldest_turns_and_keeps_the_definition():
+    from subjective_devagents_fastapi.language_models.strategies import DEFINITION_MARKER, agent_text_bytes, fit_history
+
+    definition = {"role": "user", "content": f"{DEFINITION_MARKER}\nYou are Coder Agent."}
+    history = [definition, {"role": "assistant", "content": "Ready."}]
+    for index in range(10):
+        history += [{"role": "user", "content": f"q{index} " + "x" * 10_000}, {"role": "assistant", "content": f"a{index}"}]
+    messages = [{"role": "system", "content": "sys"}, *history, {"role": "user", "content": "latest question"}]
+    fitted, dropped = fit_history(messages, budget=45_000)
+    assert dropped > 0 and agent_text_bytes(fitted) <= 45_000
+    assert fitted[1] == definition and fitted[2]["content"] == "Ready."
+    assert fitted[3]["role"] == "user"  # history restarts on a question
+    assert "q9" in fitted[-3]["content"]  # the newest turns survive
+    assert fitted[-1]["content"].endswith("latest question") and "oldest message(s)" in fitted[-1]["content"]
+    assert fit_history(messages, budget=10_000_000) == (messages, 0)
+
+
+def test_shorten_tool_results_keeps_the_newest_ones():
+    from subjective_devagents_fastapi.language_models.strategies import shorten_tool_results
+
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+    for index in range(8):
+        messages += [{"role": "assistant", "content": None, "tool_calls": [{"id": str(index)}]},
+                     {"role": "tool", "tool_call_id": str(index), "content": "o" * 20_000}]
+    shortened = shorten_tool_results(messages, 2, budget=100_000, keep=4)
+    tools = [m["content"] for m in messages if m["role"] == "tool"]
+    assert shortened == 4
+    assert all(text.startswith("[Earlier tool output left out") for text in tools[:4])
+    assert all(text == "o" * 20_000 for text in tools[4:])
+
+
+def test_a_conversation_larger_than_the_context_still_answers(request_data, monkeypatch):
+    """TAGGY channel agents failed with context_too_large once their history passed 512 KB."""
+    from subjective_devagents_fastapi.language_models import Message
+    from subjective_devagents_fastapi.language_models.strategies import DEFINITION_MARKER, MAX_CONTEXT_BYTES
+
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    history = [Message("user", f"{DEFINITION_MARKER}\nYou are Architect Agent."), Message("assistant", "Ready.")]
+    for index in range(12):
+        history += [Message("user", f"channel turn {index}\n" + "c" * 50_000), Message("assistant", f"answer {index}")]
+    assert sum(len(m.content) for m in history) > MAX_CONTEXT_BYTES
+    with ScriptedProxy([completion(content="Done.")]) as proxy:
+        request = replace(request_data, prompt="what now?", history=tuple(history),
+                          identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event_args: events.append(event_args), lambda: False)
+        sent = proxy.requests[0][2]["messages"]
+    assert result.status == "completed" and result.text == "Done."
+    assert DEFINITION_MARKER in sent[1]["content"]
+    assert sum(len(str(m.get("content") or "")) for m in sent) < MAX_CONTEXT_BYTES
+    assert any(kind == "activity" and "oldest messages" in data["text"] for kind, data in events)
