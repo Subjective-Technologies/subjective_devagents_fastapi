@@ -524,3 +524,21 @@ def test_a_conversation_larger_than_the_context_still_answers(request_data, monk
     assert DEFINITION_MARKER in sent[1]["content"]
     assert sum(len(str(m.get("content") or "")) for m in sent) < MAX_CONTEXT_BYTES
     assert any(kind == "activity" and "oldest messages" in data["text"] for kind, data in events)
+
+
+def test_provider_errors_say_what_the_operator_can_do(request_data, monkeypatch):
+    from subjective_devagents_fastapi.language_models.strategies import http_error_code
+
+    kimi_limit = '{"error":{"message":"You\'ve reached your 5-hour usage limit. Your quota will reset...","type":"access_terminated_error"}}'
+    assert http_error_code(403, kimi_limit) == "quota_exhausted"
+    assert http_error_code(503, "auth_unavailable: no auth available (last upstream error: ... usage limit ...)") == "quota_exhausted"
+    assert http_error_code(429, "slow down") == "rate_limited"
+    assert http_error_code(401, "bad key") == "authentication_required"
+    assert http_error_code(503, "upstream down") == "provider_unavailable"
+    assert http_error_code(500, "boom") == "api_http_error"
+
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    with ScriptedProxy([(403, 0, {"error": {"message": "You've reached your 5-hour usage limit.", "type": "access_terminated_error"}})]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+    assert result.status == "failed" and result.error_code == "quota_exhausted"

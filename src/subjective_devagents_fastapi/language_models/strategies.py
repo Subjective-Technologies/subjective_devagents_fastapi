@@ -425,9 +425,8 @@ class Api(ModelStrategy):
                 async with client.stream("POST", request.identity.api_base_url.rstrip("/") + "/chat/completions",
                                          headers={"Authorization": f"Bearer {token}"}, json=payload) as response:
                     if response.status_code != 200:
-                        code = ("authentication_required" if response.status_code in {401, 403}
-                                else "rate_limited" if response.status_code == 429 else "api_http_error")
-                        return ModelResult("failed", error_code=code)
+                        detail = (await response.aread()).decode("utf-8", "replace")[:2000]
+                        return ModelResult("failed", error_code=http_error_code(response.status_code, detail))
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
@@ -545,6 +544,27 @@ def agent_tool_set(identity) -> dict[str, dict]:
 def agent_image_block(attachment) -> dict:
     encoded = base64.b64encode(attachment.data).decode("ascii")
     return {"type": "image_url", "image_url": {"url": f"data:{attachment.mime_type};base64,{encoded}"}}
+
+
+_QUOTA_WORDS = ("usage limit", "quota", "insufficient_quota", "billing", "credit balance", "exceeded your")
+
+
+def http_error_code(status: int, body: str = "") -> str:
+    """An error code for a provider's non-200 answer that says what the operator can do.
+
+    A plan's usage limit often comes back as 403 or 503 (the proxy has no account left),
+    not 429, so the body decides it before the status does.
+    """
+    text = (body or "").lower()
+    if any(word in text for word in _QUOTA_WORDS):
+        return "quota_exhausted"
+    if status == 429:
+        return "rate_limited"
+    if status in {401, 403}:
+        return "authentication_required"
+    if status == 503:
+        return "provider_unavailable"
+    return "api_http_error"
 
 
 def agent_text_bytes(messages: list) -> int:
@@ -1020,9 +1040,7 @@ class ApiAgent(ModelStrategy):
                 response = await client.post(identity.api_base_url.rstrip("/") + "/chat/completions",
                                              headers={"Authorization": f"Bearer {token}"}, json=payload)
                 if response.status_code != 200:
-                    code = ("authentication_required" if response.status_code in {401, 403}
-                            else "rate_limited" if response.status_code == 429 else "api_http_error")
-                    return ModelResult("failed", error_code=code)
+                    return ModelResult("failed", error_code=http_error_code(response.status_code, response.text[:2000]))
                 try:
                     data = response.json()
                     choice = data["choices"][0]
