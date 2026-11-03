@@ -253,9 +253,9 @@ hold with any LLM under one roof, whether it was answered by a subscription seat
 logged in as an OS user) or a metered API key. A chat looks the same here regardless of
 which vendor served it or how it was paid for.
 
-**Provisioned** on 2026-09-06: database `devagents`, id
-`2348859b-1168-4ba9-81ba-044442898904`, region ENAM — 16 tables, 33 indexes, 4 views, and
-the provider/model catalog seeded. The binding is in `wrangler.toml`.
+The database id is `SUBJECTIVE_DEVAGENTS_D1_DATABASE_ID` on the host that owns
+that Cloudflare account. It is not stored in this repository. The binding name
+in `wrangler.toml` is `devagents`.
 
 Re-applying either file is safe and expected: the schema is entirely `IF NOT EXISTS` and
 the seed is entirely upserts, so this is also how you refresh prices or add a provider.

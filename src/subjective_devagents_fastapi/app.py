@@ -408,7 +408,7 @@ async def healthz() -> dict:
 
 @app.get("/api/auth/config")
 async def api_auth_config() -> dict:
-    return {"mode": auth.auth_mode(), "required": auth.auth_enabled()}
+    return auth.public_client_config()
 
 
 @app.get("/api/auth/session")
@@ -1776,7 +1776,7 @@ def _stamp_api_base(html: str) -> str:
                 r"\s*https?://[^\s;]+",
                 lambda match: match.group(0) if match.group(0).strip() in {
                     "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com",
-                    "https://www.googleapis.com", "https://subjectivetechnologies-login.firebaseapp.com",
+                    "https://www.googleapis.com",
                     # Cloudflare injects its Web Analytics beacon into every HTML response on
                     # the zone; the beacon posts its measurements to this origin. Dropping it
                     # here would leave script-src allowing the script and connect-src blocking
@@ -1797,11 +1797,50 @@ def _stamp_api_base(html: str) -> str:
     )
 
 
+def _firebase_auth_origin() -> str:
+    domain = os.environ.get("FIREBASE_AUTH_DOMAIN", "").strip().rstrip("/")
+    if not domain:
+        return ""
+    if domain.startswith("http://") or domain.startswith("https://"):
+        return domain
+    return f"https://{domain}"
+
+
+def _stamp_firebase_origin(html: str) -> str:
+    """Add this installation's Firebase auth host to CSP. The checkout names none."""
+    import re
+
+    origin = _firebase_auth_origin()
+    if not origin or origin in html:
+        return html
+
+    def add_origin(tag_match: "re.Match[str]") -> str:
+        tag = tag_match.group(0)
+
+        def insert(directive: str, text: str) -> str:
+            return re.sub(
+                rf"({directive}[^;\"]*)(;)",
+                lambda match: f"{match.group(1)} {origin}{match.group(2)}",
+                text,
+                count=1,
+            )
+
+        return insert("frame-src", insert("connect-src", tag))
+
+    return re.sub(
+        r'<meta\s+http-equiv="Content-Security-Policy"[^>]*>',
+        add_origin,
+        html,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def _stamp_html(html: str) -> str:
     """Replace the static placeholder so View Source / curl shows the live git SHAs."""
     import re
 
-    out = _stamp_api_base(str(html))
+    out = _stamp_firebase_origin(_stamp_api_base(str(html)))
     stamp_comment = deploy_stamp_comment()
     if "DEVAGENTS_DEPLOY_VERSION" in out:
         out = out.replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version)

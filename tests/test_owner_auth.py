@@ -13,15 +13,22 @@ sys.path.insert(0, str(Path(__file__).parents[1] / 'src'))
 from subjective_devagents_fastapi import auth, firebase_auth
 from subjective_devagents_fastapi import app as app_module
 
+TEST_OWNER_EMAIL = 'owner@example.com'
+TEST_OWNER_UID = 'uid-owner-test'
+TEST_FIREBASE_PROJECT = 'firebase-test-project'
+
 
 @pytest.fixture
 def signer(monkeypatch):
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_EMAIL', TEST_OWNER_EMAIL)
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_UID', TEST_OWNER_UID)
+    monkeypatch.setenv('FIREBASE_PROJECT_ID', TEST_FIREBASE_PROJECT)
     monkeypatch.setattr(firebase_auth, '_signing_key_for', lambda token: private.public_key())
     def issue(**overrides):
         now = int(time.time())
-        claims = dict(sub=auth.OWNER_UID, email='changed@example.com', email_verified=False,
-                      aud=firebase_auth.FIREBASE_PROJECT_ID, iss=firebase_auth.ISSUER,
+        claims = dict(sub=auth.owner_uid(), email='changed@example.com', email_verified=False,
+                      aud=firebase_auth.firebase_project_id(), iss=firebase_auth.issuer(),
                       iat=now, auth_time=now, exp=now+3600)
         claims.update(overrides)
         return jwt.encode(claims, private, algorithm='RS256', headers={'kid': 'test-key'})
@@ -30,6 +37,9 @@ def signer(monkeypatch):
 
 @pytest.fixture
 def owner_client(tmp_path, monkeypatch):
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_EMAIL', TEST_OWNER_EMAIL)
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_UID', TEST_OWNER_UID)
+    monkeypatch.setenv('FIREBASE_PROJECT_ID', TEST_FIREBASE_PROJECT)
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_AUTH_MODE', 'owner')
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_API_TOKEN', 'legacy-secret-must-not-bypass')
     monkeypatch.setenv('SUBJECTIVE_CHAT_HOME', str(tmp_path / 'home'))
@@ -53,8 +63,8 @@ def test_default_and_invalid_modes_require_owner(monkeypatch):
 
 @pytest.mark.parametrize('changes', [
     {},  # UID alone is sufficient, regardless of changed email.
-    {'sub': 'another-uid', 'email': auth.OWNER_EMAIL, 'email_verified': True},
-    {'sub': 'another-uid', 'email': auth.OWNER_EMAIL.upper(), 'email_verified': True},
+    {'sub': 'another-uid', 'email': TEST_OWNER_EMAIL, 'email_verified': True},
+    {'sub': 'another-uid', 'email': TEST_OWNER_EMAIL.upper(), 'email_verified': True},
 ])
 def test_owner_uid_or_verified_email(owner_client, signer, changes):
     assert owner_client.get('/api/auth/session', headers={'Authorization': 'Bearer '+signer(**changes)}).status_code == 200
@@ -79,7 +89,7 @@ class Relative:
 
 @pytest.mark.parametrize('changes', [
     {'sub': 'other', 'email': 'other@example.com', 'email_verified': True},
-    {'sub': 'other', 'email': auth.OWNER_EMAIL, 'email_verified': False},
+    {'sub': 'other', 'email': TEST_OWNER_EMAIL, 'email_verified': False},
     {'exp': Relative(-120)},
     {'aud': 'wrong-project'},
     {'iss': 'https://securetoken.google.com/wrong-project'},
@@ -92,7 +102,7 @@ def test_invalid_identity_and_claims_rejected(owner_client, signer, changes):
 
 
 def test_static_query_and_unsigned_tokens_cannot_bypass_owner(owner_client, signer):
-    tokens = ['legacy-secret-must-not-bypass', 'bad.token.value', jwt.encode({'sub': auth.OWNER_UID}, '', algorithm='none')]
+    tokens = ['legacy-secret-must-not-bypass', 'bad.token.value', jwt.encode({'sub': TEST_OWNER_UID}, '', algorithm='none')]
     for token in tokens:
         assert owner_client.get('/api/config', headers={'Authorization': 'Bearer '+token}).status_code == 401
     assert owner_client.get('/api/config', params={'token': signer()}).status_code == 401
@@ -115,7 +125,11 @@ def test_cors_preflight_and_denial(owner_client):
 
 def test_public_bootstrap_contains_no_credentials(owner_client):
     response = owner_client.get('/api/auth/config')
-    assert response.json() == {'mode': 'owner', 'required': True}
+    body = response.json()
+    assert body['mode'] == 'owner'
+    assert body['required'] is True
+    assert body['ownerEmail'] == TEST_OWNER_EMAIL
+    assert body['firebase']['apiKey'] == ''
     assert 'legacy-secret' not in response.text
     assert owner_client.get('/healthz').json() == {'ok': True}
 

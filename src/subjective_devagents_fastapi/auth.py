@@ -16,8 +16,16 @@ from . import firebase_auth
 PROTECTED_PREFIXES = ("/api/", "/docs", "/redoc", "/openapi.json")
 PUBLIC_PATHS = ("/healthz", "/api/auth/config")
 TOKEN_HEADER = "X-DevAgents-Token"
-OWNER_EMAIL = "subjectivetechnologies@gmail.com"
-OWNER_UID = "WO55hP1UlbRziVhokDMJyQoqVyl2"
+
+
+def owner_email() -> str:
+    """Verified owner mailbox for this installation. Empty until the operator sets it."""
+    return os.environ.get("SUBJECTIVE_DEVAGENTS_OWNER_EMAIL", "").strip().lower()
+
+
+def owner_uid() -> str:
+    """Firebase uid of this installation's owner. Empty until the operator sets it."""
+    return os.environ.get("SUBJECTIVE_DEVAGENTS_OWNER_UID", "").strip()
 
 
 def auth_mode() -> str:
@@ -34,6 +42,29 @@ def auth_enabled() -> bool:
     return auth_mode() != "development" or bool(configured_token())
 
 
+def public_client_config() -> dict:
+    """Browser sign-in settings for this installation. Nothing here is a server secret."""
+    origins = [
+        item.strip()
+        for item in os.environ.get("SUBJECTIVE_DEVAGENTS_PARENT_ORIGINS", "").split(",")
+        if item.strip()
+    ]
+    return {
+        "mode": auth_mode(),
+        "required": auth_enabled(),
+        "ownerEmail": owner_email(),
+        "ownerUid": owner_uid(),
+        "dashboardUrl": os.environ.get("SUBJECTIVE_DEVAGENTS_DASHBOARD_URL", "").strip(),
+        "parentOrigins": origins,
+        "firebase": {
+            "apiKey": os.environ.get("FIREBASE_API_KEY", "").strip(),
+            "authDomain": os.environ.get("FIREBASE_AUTH_DOMAIN", "").strip(),
+            "projectId": firebase_auth.firebase_project_id(),
+            "appId": os.environ.get("FIREBASE_APP_ID", "").strip(),
+        },
+    }
+
+
 def authenticated_claims(supplied: str) -> dict | None:
     mode = auth_mode()
     expected = configured_token()
@@ -47,10 +78,15 @@ def authenticated_claims(supplied: str) -> dict | None:
         claims = firebase_auth.verify_firebase_id_token(supplied)
     except firebase_auth.FirebaseTokenError:
         return None
-    owner_uid = claims.get("sub") == OWNER_UID
-    owner_email = (str(claims.get("email") or "").lower() == OWNER_EMAIL
-                   and claims.get("email_verified") is True)
-    if not (owner_uid or owner_email):
+    expected_uid = owner_uid()
+    expected_email = owner_email()
+    if not expected_uid and not expected_email:
+        return None
+    uid_ok = bool(expected_uid) and claims.get("sub") == expected_uid
+    email_ok = (bool(expected_email)
+                and str(claims.get("email") or "").lower() == expected_email
+                and claims.get("email_verified") is True)
+    if not (uid_ok or email_ok):
         return None
     return claims
 

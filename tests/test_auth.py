@@ -41,6 +41,9 @@ def build_client(monkeypatch, tmp_path, token: str | None):
     (tmp_path / "client" / "web").mkdir(parents=True, exist_ok=True)
     (tmp_path / "client" / "src").mkdir(parents=True, exist_ok=True)
     (tmp_path / "client" / "web" / "index.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_EMAIL", "owner@example.com")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_UID", "uid-owner-test")
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "firebase-test-project")
     if token is None:
         monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_API_TOKEN", raising=False)
     else:
@@ -191,7 +194,7 @@ def test_a_firebase_token_for_the_owner_is_accepted(guarded, monkeypatch):
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
-        lambda token: {"sub": auth.OWNER_UID, "email": auth.OWNER_EMAIL, "email_verified": True},
+        lambda token: {"sub": auth.owner_uid(), "email": auth.owner_email(), "email_verified": True},
     )
     response = guarded.get("/api/config", headers={"Authorization": "Bearer not-checked-by-the-mock"})
     assert response.status_code == 200
@@ -203,7 +206,7 @@ def test_a_firebase_token_for_the_verified_owner_email_is_accepted(guarded, monk
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
-        lambda token: {"sub": "someone-else-entirely", "email": auth.OWNER_EMAIL, "email_verified": True},
+        lambda token: {"sub": "someone-else-entirely", "email": auth.owner_email(), "email_verified": True},
     )
     response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
     assert response.status_code == 200
@@ -216,7 +219,7 @@ def test_a_firebase_token_for_the_owner_uid_is_accepted_with_a_different_email(g
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
-        lambda token: {"sub": auth.OWNER_UID, "email": "someone-else@example.com"},
+        lambda token: {"sub": auth.owner_uid(), "email": "someone-else@example.com"},
     )
     response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
     assert response.status_code == 200
