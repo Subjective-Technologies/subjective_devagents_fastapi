@@ -28,19 +28,23 @@ class Recorder(ModelStrategy):
         return ModelResult('completed', 'answer')
 
 
-def test_discovery_groups_by_owner_and_excludes_media(monkeypatch):
+def test_discovery_groups_by_family_and_owner_and_excludes_media(monkeypatch):
     monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://proxy/v1')
     monkeypatch.setenv(legacy.PROXY_KEY_ENV, 'test-only-key')
     response = httpx.Response(200, request=httpx.Request('GET', 'http://proxy/v1/models'), json={'data': [
         {'id': 'gpt-test', 'owned_by': 'openai'}, {'id': 'claude-test', 'owned_by': 'anthropic'},
         {'id': 'gpt-image-2', 'owned_by': 'openai'}, {'id': 'claude-other', 'owned_by': 'antigravity'},
+        {'id': 'gemini-test', 'owned_by': 'antigravity'},
         {'id': 'gpt-test', 'owned_by': 'openai'}, {'id': 'grok-test', 'owned_by': 'xai'}]})
     client = Mock()
     client.__enter__ = Mock(return_value=client)
     client.__exit__ = Mock(return_value=False)
     client.get.return_value = response
     monkeypatch.setattr(catalog.httpx, 'Client', lambda **kwargs: client)
-    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-test'], 'grok': ['grok-test'], 'kimi': []}
+    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': []}
+    catalog.validate_model('claude', 'claude-other')
+    with pytest.raises(ModelError, match='not available'):
+        catalog.validate_model('claude', 'gemini-test')
 
 
 def test_wrong_provider_and_unknown_model_rejected(proxy):

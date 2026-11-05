@@ -6,7 +6,7 @@ import httpx
 
 from .contracts import ModelError
 
-# CLIProxy's provider ownership metadata, not guesses based on model names.
+# Native provider owners and gateway routes are distinct from model families.
 OWNERS = {"codex": {"openai", "codex"}, "claude": {"anthropic", "claude"},
           "grok": {"xai", "grok"}, "kimi": {"moonshot", "kimi"}}
 MODEL_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -33,7 +33,12 @@ def proxy_models() -> dict[str, list[str]]:
             if not isinstance(name, str) or not MODEL_ID.fullmatch(name) or MEDIA.search(name):
                 continue
             for provider, owners in OWNERS.items():
-                if row.get("owned_by") in owners:
+                native = row.get("owned_by") in owners
+                # Antigravity exposes both Gemini and Claude. Include only its Claude
+                # family here, retaining the exact gateway ID for inference routing.
+                routed_claude = (provider == "claude" and row.get("owned_by") == "antigravity"
+                                 and name.startswith("claude-"))
+                if native or routed_claude:
                     grouped[provider].add(name)
         return {provider: sorted(models) for provider, models in grouped.items()}
     except (httpx.HTTPError, ValueError, KeyError, TypeError):
