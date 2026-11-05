@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
+
+import pytest
 from pathlib import Path
 
 from conftest import SCHEMA_PATH, SEED_PATH
@@ -10,6 +12,12 @@ from subjective_devagents_fastapi.d1_client import SqliteExecutor
 from subjective_devagents_fastapi.d1_sync import fingerprint_for, map_provider, sync_conversations
 
 SERVICE_ROOT = Path(__file__).parent.parent
+
+
+@pytest.fixture(autouse=True)
+def isolated_d1_namespace(monkeypatch):
+    """The in-memory replica must not depend on a production database ID."""
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_D1_NAMESPACE", "00000000-0000-4000-8000-000000000001")
 
 
 def _db() -> sqlite3.Connection:
