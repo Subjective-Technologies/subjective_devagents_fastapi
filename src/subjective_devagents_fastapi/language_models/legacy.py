@@ -35,7 +35,7 @@ def proxy_configured(provider: str) -> bool:
     return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and os.environ.get(model_env, "").strip())
 
 
-def proxy_identity(provider: str, username: str, workspace: str, home: str) -> Identity | None:
+def proxy_identity(provider: str, username: str, workspace: str, home: str, selected_model: str = "") -> Identity | None:
     """An ad hoc api_agent identity when the inference proxy is configured for this provider.
 
     Returns None (caller falls back to the CLI identity below) when the operator has not set
@@ -47,7 +47,7 @@ def proxy_identity(provider: str, username: str, workspace: str, home: str) -> I
     if model_env is None:
         return None
     base_url = os.environ.get(PROXY_URL_ENV, "").strip()
-    model = os.environ.get(model_env, "").strip()
+    model = selected_model or os.environ.get(model_env, "").strip()
     if not base_url or not model:
         return None
     key = hashlib.sha256(json.dumps(["api_agent", provider, username, workspace, base_url, model]).encode()).hexdigest()[:32]
@@ -85,6 +85,7 @@ class LegacyLanguageModel:
 
     def identity(self, conversation: dict) -> Identity:
         provider = conversation["provider"]
+        selected_model = conversation.get("model") or ""
         username = conversation.get("osUser") or pwd.getpwuid(os.geteuid()).pw_name
         workspace = str(Path(conversation.get("workspace") or "/tmp").absolute())
         if self.configured:
@@ -92,6 +93,8 @@ class LegacyLanguageModel:
                        if item["provider"] == provider]
             choices = [item for item in choices if item.workspace == workspace
                        and bool(item.ssh_host) == bool(conversation.get("sshConnection"))]
+            if selected_model:
+                choices = [item for item in choices if item.model == selected_model]
             # Remote accounts require an explicit saved-connection identity mapping.
             if conversation.get("sshConnection"):
                 choices = [item for item in choices if item.id == conversation["sshConnection"]]
@@ -107,7 +110,10 @@ class LegacyLanguageModel:
             raise ModelError("unsupported_provider", "No standalone driver is registered for this provider.")
         account = pwd.getpwnam(username)
         home = account.pw_dir
-        api_identity = proxy_identity(provider, username, workspace, home)
+        if selected_model:
+            from .catalog import validate_model
+            validate_model(provider, selected_model)
+        api_identity = proxy_identity(provider, username, workspace, home, selected_model)
         if api_identity is not None:
             self.model.identities.register_legacy(api_identity)
             return api_identity

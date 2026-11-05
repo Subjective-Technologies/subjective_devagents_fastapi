@@ -690,6 +690,7 @@ class LlmService:
             "description": str(payload.get("description") or f"{provider} {payload.get('kind') or 'chat'}"),
             "kind": "llm",
             "provider": provider,
+            "model": str(payload.get("model") or ""),
             "sessionId": session_id,
             "sourceFile": source_file,
             "exportPath": str(payload.get("exportPath") or file_path or ""),
@@ -1112,7 +1113,7 @@ class LlmService:
 
     def create_conversation(
         self, provider: Any = None, name: str = "", workspace: str = "", os_user: str = "",
-        ssh_connection: str = "",
+        ssh_connection: str = "", model: str = "",
     ) -> dict:
         """`os_user` picks whose CLI login answers this chat.
 
@@ -1133,6 +1134,9 @@ class LlmService:
         """
         now = time.time() * 1000
         key = provider_key(provider) if writable_provider(provider) else DEFAULT_PROVIDER
+        if model:
+            from .language_models.catalog import validate_model
+            validate_model(key, model)
         label = provider_label(key)
         me = current_username()
         owner = str(os_user or "").strip() or me
@@ -1152,6 +1156,7 @@ class LlmService:
             {
                 "target": f"llm:{key}:local:{uuid.uuid4()}",
                 "provider": key,
+                "model": model,
                 "label": str(name or f"New {label} chat").strip() or f"New {label} chat",
                 "description": (
                     f"{label} CLI conversation as {owner}" if owner != me
@@ -1177,6 +1182,25 @@ class LlmService:
             conversation["label"] = self.label_overrides[conversation["target"]]
         self.mark_active(conversation["target"])
         self._save_state()
+        return conversation
+
+    def set_model(self, target: str, model: str = "") -> dict:
+        """Change inference binding while retaining this conversation's transcript."""
+        from .language_models.contracts import ModelError
+        conversation = next((item for item in self.local if item["target"] == target), None)
+        if not conversation:
+            raise ModelError("not_found", "Local conversation was not found.")
+        if conversation.get("osUser") or conversation.get("sshConnection"):
+            raise ModelError("unsupported_model_binding", "Model selection requires a local proxy-backed conversation.")
+        candidate = {**conversation, "model": model}
+        identity = self.backend.identity(candidate)
+        with self.backend._lock:
+            with self.backend.model.store.connection() as db:
+                row = db.execute("SELECT conversation_id FROM legacy_bindings WHERE target=?", (target,)).fetchone()
+            if row:
+                self.backend.model.handoff(row[0], identity.id)
+            conversation["model"] = model
+            self._save_state()
         return conversation
 
     def create_sibling_for_user(self, source_target: str, username: str, provider: Any = None) -> dict:

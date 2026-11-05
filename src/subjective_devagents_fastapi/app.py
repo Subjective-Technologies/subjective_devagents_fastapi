@@ -569,6 +569,7 @@ async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
             body.get("workspace") or "",
             body.get("osUser") or "",
             body.get("sshConnection") or "",
+            body.get("model") or "",
         )
 
         # Store the identity_id in the conversation for future reference
@@ -580,6 +581,14 @@ async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
         return {"ok": True, "conversation": conversation}
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/set-model")
+async def api_llm_set_model(body: dict = Body(default={})) -> dict:
+    from .language_models.api import invoke
+    conversation = await asyncio.to_thread(
+        invoke, core().llm_service.set_model, str(body.get("target") or ""), body.get("model") or "")
+    return {"ok": True, "conversation": conversation}
 
 
 @app.post("/api/llm/rename-conversation")
@@ -794,9 +803,19 @@ async def api_llm_providers() -> dict:
             return proxy_configured(key)
         return f"cli:{key}" in core().llm_service.backend.model.strategies
 
+    from .language_models.catalog import proxy_models
+    from .language_models.contracts import ModelError
+    from .language_models.legacy import PROXY_MODEL_ENV
+    try:
+        models = await asyncio.to_thread(proxy_models)
+        model_error = None
+    except ModelError as error:
+        models, model_error = {}, error.code
     return {
-        "ok": True, "default": DEFAULT_PROVIDER,
-        "providers": [{"key": key, "label": provider["label"], "available": available(key)}
+        "ok": True, "default": DEFAULT_PROVIDER, "modelError": model_error,
+        "providers": [{"key": key, "label": provider["label"], "available": available(key),
+                       "models": models.get(key, []),
+                       "defaultModel": os.environ.get(PROXY_MODEL_ENV.get(key, ""), "") or None}
                       for key, provider in WRITABLE_PROVIDERS.items()],
     }
 

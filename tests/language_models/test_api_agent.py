@@ -542,3 +542,23 @@ def test_provider_errors_say_what_the_operator_can_do(request_data, monkeypatch)
         request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
         result = ApiAgent().run(request, lambda *_: None, lambda: False)
     assert result.status == "failed" and result.error_code == "quota_exhausted"
+
+
+def test_selected_proxy_model_reaches_inference(monkeypatch, tmp_path):
+    from subjective_devagents_fastapi.language_models import legacy, catalog
+    monkeypatch.delenv("SUBJECTIVE_LANGUAGE_MODELS_CONFIG", raising=False)
+    monkeypatch.setenv("SUBJECTIVE_LANGUAGE_MODELS_DB", str(tmp_path / "selected.sqlite3"))
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, "fixture-key")
+    monkeypatch.setenv(legacy.PROXY_MODEL_ENV["codex"], "gpt-default")
+    monkeypatch.setattr(catalog, "proxy_models", lambda: {"codex": ["gpt-selected"]})
+    with ScriptedProxy([completion(content="Selected model answered.")]) as proxy:
+        monkeypatch.setenv(legacy.PROXY_URL_ENV, proxy.url)
+        backend = legacy.LegacyLanguageModel(str(tmp_path))
+        try:
+            result = backend.send({"target": "selected", "provider": "codex", "model": "gpt-selected", "workspace": str(tmp_path)},
+                {}, {"prompt": "hello", "timeout": 5}, lambda *a: None, lambda *a: None, None)
+            assert result["success"]
+            assert proxy.requests[0][0] == "/v1/chat/completions"
+            assert proxy.requests[0][2]["model"] == "gpt-selected"
+        finally:
+            backend.close()
