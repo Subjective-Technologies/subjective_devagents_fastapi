@@ -1,5 +1,8 @@
 """Credential-free text-model discovery from the operator-configured proxy."""
 import os
+import hashlib
+import threading
+import time
 import re
 
 import httpx
@@ -13,11 +16,31 @@ MODEL_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 MEDIA = re.compile(r"image|video|audio|realtime|transcrib|tts|embedding", re.I)
 
 
-def proxy_models() -> dict[str, list[str]]:
+CACHE_SECONDS = 60
+_cache_lock = threading.Lock()
+_cache_key = None
+_cached_models = None
+_cache_expires = 0.0
+
+
+def proxy_models(force: bool = False) -> dict[str, list[str]]:
+    """A short, credential-scoped cache serializes concurrent gateway discovery."""
     from .legacy import PROXY_URL_ENV, PROXY_KEY_ENV
+    global _cache_key, _cached_models, _cache_expires
     url, key = os.environ.get(PROXY_URL_ENV, "").strip(), os.environ.get(PROXY_KEY_ENV, "")
     if not url or not key:
         raise ModelError("model_catalog_unavailable", "Model discovery requires a configured inference proxy.")
+    cache_key = (url, hashlib.sha256(key.encode()).digest())
+    with _cache_lock:
+        if not force and _cache_key == cache_key and _cached_models is not None and time.monotonic() < _cache_expires:
+            return {provider: list(models) for provider, models in _cached_models.items()}
+        models = _load_proxy_models(url, key)
+        _cache_key, _cached_models = cache_key, models
+        _cache_expires = time.monotonic() + CACHE_SECONDS
+        return {provider: list(ids) for provider, ids in models.items()}
+
+
+def _load_proxy_models(url: str, key: str) -> dict[str, list[str]]:
     try:
         with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as client:
             response = client.get(url.rstrip("/") + "/models", headers={"Authorization": f"Bearer {key}"})

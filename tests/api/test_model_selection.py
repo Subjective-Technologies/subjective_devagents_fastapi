@@ -47,3 +47,11 @@ def test_catalog_failure_keeps_provider_discovery(client, monkeypatch):
     assert body['ok'] and body['providers']
     assert body['modelError'] == 'model_catalog_unavailable'
     assert all(not provider['models'] for provider in body['providers'])
+
+
+def test_refresh_bypasses_discovery_cache(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(catalog, 'proxy_models', lambda force=False: calls.append(force) or {'codex': ['discovered']})
+    assert client.get('/api/llm/providers').status_code == 200
+    assert client.get('/api/llm/providers?refresh=1').status_code == 200
+    assert calls == [False, True]
