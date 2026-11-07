@@ -27,7 +27,7 @@ class LanguageModel:
             # so it stays on cli: above.
             "api_agent:codex": ApiAgent(), "api_agent:claude": ApiAgent(), "api_agent:grok": ApiAgent(),
             # Kimi has no CLI at all: the proxy is its only way in.
-            "api_agent:kimi": ApiAgent(),
+            "api_agent:kimi": ApiAgent(), "api_agent:antigravity": ApiAgent(),
         }
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="language-model")
         self._lock = threading.RLock()

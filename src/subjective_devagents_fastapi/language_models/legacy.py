@@ -24,15 +24,30 @@ PROXY_KEY_ENV = "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
 PROXY_MODEL_ENV = {"claude": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CLAUDE",
                    "codex": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CODEX",
                    "grok": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK",
-                   "kimi": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI"}
+                   "kimi": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI",
+                   "antigravity": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_ANTIGRAVITY"}
 # Providers with no CLI of their own: they run only as api_agent identities behind the proxy.
-PROXY_ONLY_PROVIDERS = frozenset({"kimi"})
+PROXY_ONLY_PROVIDERS = frozenset({"kimi", "antigravity"})
+
+
+def proxy_default_model(provider: str, models: dict | None = None) -> str:
+    """Use a configured default, or discover Antigravity's available model IDs."""
+    configured = os.environ.get(PROXY_MODEL_ENV.get(provider, ""), "").strip()
+    if configured or provider != "antigravity":
+        return configured
+    if models is None:
+        from .catalog import proxy_models
+        try:
+            models = proxy_models()
+        except ModelError:
+            return ""
+    return next(iter(models.get(provider, [])), "")
 
 
 def proxy_configured(provider: str) -> bool:
     """Whether the inference proxy and a model id are set for this provider."""
     model_env = PROXY_MODEL_ENV.get(provider)
-    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and os.environ.get(model_env, "").strip())
+    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and proxy_default_model(provider))
 
 
 def proxy_identity(provider: str, username: str, workspace: str, home: str, selected_model: str = "") -> Identity | None:
@@ -47,7 +62,7 @@ def proxy_identity(provider: str, username: str, workspace: str, home: str, sele
     if model_env is None:
         return None
     base_url = os.environ.get(PROXY_URL_ENV, "").strip()
-    model = selected_model or os.environ.get(model_env, "").strip()
+    model = selected_model or proxy_default_model(provider)
     if not base_url or not model:
         return None
     key = hashlib.sha256(json.dumps(["api_agent", provider, username, workspace, base_url, model]).encode()).hexdigest()[:32]

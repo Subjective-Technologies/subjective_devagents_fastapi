@@ -27,6 +27,7 @@ from .provider_sessions import list_provider_sessions, sessions_for_provider
 from .system_users import current_username, is_valid_username
 
 PROVIDER_ICONS = {
+    "antigravity": "../assets/providers/gemini.svg",
     "codex": "../assets/providers/codex.svg",
     "cursor": "../assets/providers/cursor.svg",
     "claude": "../assets/providers/claude.svg",
@@ -46,6 +47,7 @@ PROVIDER_ICONS = {
 }
 
 PROVIDER_LABELS = {
+    "antigravity": "Antigravity",
     "codex": "Codex",
     "cursor": "Cursor",
     "claude": "Claude",
@@ -68,6 +70,7 @@ STATE_VERSION = 2
 
 # Providers with an exported CLI datasource bundle that can create and resume sessions.
 WRITABLE_PROVIDERS = {
+    "antigravity": {"bundle": "antigravity", "label": "Antigravity"},
     "codex": {"bundle": "codex", "label": "Codex"},
     "claude": {"bundle": "claude", "label": "Claude"},
     "cursor": {"bundle": "cursor", "label": "Cursor"},

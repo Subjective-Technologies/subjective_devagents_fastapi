@@ -41,7 +41,7 @@ def test_discovery_groups_by_family_and_owner_and_excludes_media(monkeypatch):
     client.__exit__ = Mock(return_value=False)
     client.get.return_value = response
     monkeypatch.setattr(catalog.httpx, 'Client', lambda **kwargs: client)
-    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': []}
+    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': [], 'antigravity': ['claude-other', 'gemini-test']}
     catalog.validate_model('claude', 'claude-other')
     with pytest.raises(ModelError, match='not available'):
         catalog.validate_model('claude', 'gemini-test')

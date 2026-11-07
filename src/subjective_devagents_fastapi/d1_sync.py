@@ -28,6 +28,7 @@ def _namespace() -> uuid.UUID:
     return uuid.UUID(raw)
 
 PROVIDER_ALIASES = {
+    "antigravity": "antigravity",
     "codex": "codex",
     "chatgpt": "codex",
     "gpt": "codex",
@@ -45,7 +46,7 @@ PROVIDER_ALIASES = {
     "ssh": "ssh",
 }
 
-KNOWN_PROVIDERS = {"codex", "claude", "cursor", "anthropic", "openai", "gemini", "grok", "kimi", "ssh"}
+KNOWN_PROVIDERS = {"codex", "claude", "cursor", "anthropic", "openai", "gemini", "grok", "kimi", "antigravity", "ssh"}
 ALLOWED_ROLES = {"user", "assistant", "system", "tool", "tool_output"}
 
 

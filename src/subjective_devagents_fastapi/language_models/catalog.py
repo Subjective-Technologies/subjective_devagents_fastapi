@@ -11,7 +11,7 @@ from .contracts import ModelError
 
 # Native provider owners and gateway routes are distinct from model families.
 OWNERS = {"codex": {"openai", "codex"}, "claude": {"anthropic", "claude"},
-          "grok": {"xai", "grok"}, "kimi": {"moonshot", "kimi"}}
+          "grok": {"xai", "grok"}, "kimi": {"moonshot", "kimi"}, "antigravity": {"antigravity"}}
 MODEL_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 MEDIA = re.compile(r"image|video|audio|realtime|transcrib|tts|embedding", re.I)
 

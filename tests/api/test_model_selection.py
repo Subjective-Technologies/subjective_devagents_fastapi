@@ -55,3 +55,18 @@ def test_refresh_bypasses_discovery_cache(client, monkeypatch):
     assert client.get('/api/llm/providers').status_code == 200
     assert client.get('/api/llm/providers?refresh=1').status_code == 200
     assert calls == [False, True]
+
+
+def test_antigravity_discovery_creation_and_model_selection(client, monkeypatch):
+    monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://proxy/v1')
+    monkeypatch.delenv(legacy.PROXY_MODEL_ENV['antigravity'], raising=False)
+    monkeypatch.setattr(catalog, 'proxy_models', lambda: {'antigravity': ['claude-proxy', 'gemini-proxy']})
+    body = client.get('/api/llm/providers').json()
+    row = next(p for p in body['providers'] if p['key'] == 'antigravity')
+    assert row['label'] == 'Antigravity' and row['available']
+    assert row['models'] == ['claude-proxy', 'gemini-proxy']
+    assert row['defaultModel'] == 'claude-proxy'
+    created = client.post('/api/llm/create-conversation', json={'provider': 'antigravity', 'model': 'gemini-proxy'}).json()
+    assert created['ok']
+    assert created['conversation']['provider'] == 'antigravity'
+    assert created['conversation']['model'] == 'gemini-proxy'
