@@ -26,6 +26,15 @@ fi
 PATH="${HOME}/.local/bin:${PATH}"
 export PATH
 
+# Language Model Catalog Configuration (TAGGY-3451)
+if [ -z "${SUBJECTIVE_LANGUAGE_MODELS_CONFIG:-}" ]; then
+  default_catalog="${SCRIPT_DIR}/config/language-models.json"
+  if [ -f "${default_catalog}" ]; then
+    export SUBJECTIVE_LANGUAGE_MODELS_CONFIG="${default_catalog}"
+    echo "### language models: ${default_catalog}" >&2
+  fi
+fi
+
 if [ ! -f "${SCRIPT_DIR}/plugins/subjective_codex_datasource/SubjectiveCodexDataSource.py" ]; then
   echo "### datasource submodules missing — git submodule update --init --recursive" >&2
   git -C "${SCRIPT_DIR}" submodule update --init --recursive

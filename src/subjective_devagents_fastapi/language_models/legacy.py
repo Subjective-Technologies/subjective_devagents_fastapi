@@ -287,6 +287,24 @@ class LegacyLanguageModel:
         with self.model.store.connection() as db:
             return db.execute("SELECT 1 FROM legacy_bindings WHERE target=?", (target,)).fetchone() is not None
 
+    def clear_history(self, target: str, persist) -> None:
+        """Reset local execution history and its native session without touching CLI files."""
+        with self._lock, self.model.store.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            binding = db.execute("SELECT conversation_id FROM legacy_bindings WHERE target=?", (target,)).fetchone()
+            if binding:
+                identifier = binding[0]
+                active = db.execute("SELECT 1 FROM turns WHERE conversation_id=? AND status IN ('queued','running')",
+                                    (identifier,)).fetchone()
+                if active:
+                    raise ModelError("busy", "Wait for the current response to finish before clearing messages.")
+                db.execute("DELETE FROM events WHERE turn_id IN (SELECT id FROM turns WHERE conversation_id=?)", (identifier,))
+                db.execute("DELETE FROM turns WHERE conversation_id=?", (identifier,))
+                db.execute("DELETE FROM legacy_projections WHERE target=?", (target,))
+                db.execute("UPDATE legacy_bindings SET pending_turn=NULL WHERE target=?", (target,))
+                db.execute("UPDATE conversations SET session_id=NULL, needs_reconciliation=0 WHERE id=?", (identifier,))
+            persist()
+
     def status(self, provider: str) -> dict:
         candidates = [item for item in self.model.identities.public() if item["provider"] == provider]
         return {"provider": provider, "success": True, "status": "configured" if candidates else "not_checked",

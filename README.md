@@ -365,3 +365,34 @@ python -m pytest tests/ -q
   conversations cannot both claim, token rollups that add up, subscription usage that never
   moves money, a findable pending-approval inbox, and a conversation delete that leaves
   nothing behind — including rows with no turn, which imported history produces.
+# Clear messages and deployment verification
+
+`POST /api/llm/clear-conversation` clears a local chat's saved messages while retaining
+its target, name, and pane assignment. It resets the local execution transcript and
+native session, rejects busy chats, and broadcasts the empty conversation to connected
+clients. Imported provider transcripts return `read_only`; provider-owned files are not
+modified. A failed save leaves the displayed transcript intact. The D1 replica is updated
+on a best-effort basis and its outcome is returned separately as `d1`.
+
+The live DevAgents store is `${SUBJECTIVE_CHAT_HOME}/llm-conversations.json`, with
+execution state in `${SUBJECTIVE_CHAT_HOME}/language_models.sqlite3` (unless
+`SUBJECTIVE_LANGUAGE_MODELS_DB` overrides it). Imported exports live under
+`${SUBJECTIVE_CHAT_HOME}/.subjective_chat_history/context`. D1 database `devagents`
+contains replica tables including `conversations`, `conversation_sessions`, `turns`,
+and `messages`; it is not the source used to reopen a pane.
+
+HTML comments and `X-DevAgents-Version` / `X-DevAgents-Backend-Version` identify the
+frontend and backend Git revisions. `X-DevAgents-Frontend-Source` and
+`X-DevAgents-Backend-Source` identify exact source contents, including uncommitted edits.
+Run this read-only gate against the deployed URL before browser acceptance:
+
+```sh
+python scripts/verify_deployment.py https://devagents.subjectivetechnologies.com \
+  --client-root /subjective/clients/desktop/subjective_chat
+```
+
+It fails on missing or stale markers and also compares the actual served renderer.
+The legacy production checkout and canonical `clients/desktop/subjective_devagents`
+checkout must contain the same frontend changes. Source fingerprints are captured at
+backend startup; restart is required after deployment. The browser regression uses a
+temporary chat home, exercises two panes, clears one, drags it back, and reloads the page.

@@ -34,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from . import auth, shell_exec, ssh_terminal
+from .deployment import source_fingerprint
 from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
@@ -171,6 +172,8 @@ class AppState:
         self.client_root: Path = _client_root()
         self.deploy_version: str = WEB_UI_RELEASE
         self.backend_version: str = WEB_UI_RELEASE
+        self.frontend_fingerprint = ""
+        self.backend_fingerprint = ""
         # deploy_version is a git SHA and only changes on a commit — this process restarts
         # far more often than it commits (a plain reload of an uncommitted edit), so it is
         # the wrong signal for "does an open tab need to reload". A fresh id every startup
@@ -213,7 +216,7 @@ class AppState:
             finally:
                 self.history_refreshing = False
 
-    def _sync_d1(self, reason: str) -> dict:
+    def _sync_d1(self, reason: str, conversations: list[dict] | None = None) -> dict:
         """Best-effort replica. Local JSON stays the live store if D1 is down."""
         from .d1_client import D1Client, D1Error, d1_sync_enabled
         from .d1_sync import conversations_for_sync, sync_conversations
@@ -226,7 +229,8 @@ class AppState:
             return {"ok": False, "error": "ChatCore is not initialized."}
         started = time.time()
         try:
-            conversations = conversations_for_sync(self.core.llm_service)
+            if conversations is None:
+                conversations = conversations_for_sync(self.core.llm_service)
             default_log("info", "D1 conversation sync start", {"reason": reason, "conversations": len(conversations)})
             stats = sync_conversations(D1Client(), conversations)
             stats.update({"ok": True, "reason": reason, "ms": int((time.time() - started) * 1000)})
@@ -257,6 +261,8 @@ async def lifespan(application: FastAPI):
     state.deploy_version = resolve_deploy_version(state.client_root)
     # The UI can live in a different repository. Its SHA cannot identify this API.
     state.backend_version = resolve_deploy_version(Path(__file__).resolve().parents[2])
+    state.frontend_fingerprint = source_fingerprint(state.client_root, ("src", "web"))
+    state.backend_fingerprint = source_fingerprint(Path(__file__).resolve().parents[2], ("src",))
     state.instance_id = str(uuid.uuid4())
     core = ChatCore(
         root=str(state.client_root),
@@ -368,6 +374,8 @@ async def add_version_and_no_store(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-DevAgents-Version", state.deploy_version)
     response.headers.setdefault("X-DevAgents-Backend-Version", state.backend_version)
+    response.headers["X-DevAgents-Frontend-Source"] = state.frontend_fingerprint
+    response.headers["X-DevAgents-Backend-Source"] = state.backend_fingerprint
     if request.url.path.startswith("/api/"):
         # Without this a plain reload can serve a stale cached GET
         # /api/llm/conversations (e.g. a chat name from before a rename).
@@ -423,6 +431,8 @@ async def api_version() -> dict:
         "release": WEB_UI_RELEASE,
         "version": state.deploy_version,
         "backendVersion": state.backend_version,
+        "frontendSource": state.frontend_fingerprint,
+        "backendSource": state.backend_fingerprint,
         "instanceId": state.instance_id,
         "servedAt": datetime.now(timezone.utc).isoformat(),
     }
@@ -627,6 +637,21 @@ async def api_llm_delete_conversation(body: dict = Body(default={})) -> dict:
         return result
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/clear-conversation")
+async def api_llm_clear_conversation(body: dict = Body(default={})) -> dict:
+    instance = core()
+    target = str(body.get("target") or "")
+    try:
+        result = await asyncio.to_thread(instance.llm_service.clear_conversation_messages, target)
+        if result.get("ok"):
+            instance.broadcast("llm-conversation", {"conversation": result["conversation"]})
+            result["d1"] = await asyncio.to_thread(state._sync_d1, "clear-conversation", [result["conversation"]])
+        return result
+    except Exception as error:
+        default_log("error", "LLM conversation clear failed", {"target": target, "exceptionType": type(error).__name__})
+        return {"ok": False, "error": "Could not save cleared history. Please retry."}
 
 
 @app.post("/api/llm/activate-conversation")
