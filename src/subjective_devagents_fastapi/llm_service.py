@@ -1858,6 +1858,7 @@ class LlmService:
                 "action": "send",
                 "prompt": clean,
                 "files": files,
+                "coordination": (self.agent_turns.get(target) or {}).get("coordination"),
                 "target": target,
                 "session_id": original_session_id,
                 "new_session": not original_session_id,
@@ -2001,6 +2002,10 @@ class LlmService:
             reply_text = str(result.get("response") or "")
             header = (self.agent_turns.get(target) or {}).get("header")
             if header:
+                observed = agent_workflow._HEADER.match(reply_text)
+                expected = f"[WF:{header[0]}][agent:{header[1]}]"
+                if observed and observed.group(0).strip() != expected:
+                    self.log("warn", "WORKFLOW_VERSION_CONFLICT", {"target": target, "observed": observed.group(0).strip()[:256], "authoritative": expected})
                 reply_text = agent_workflow.ensure_header(reply_text, *header)
             assistant_message = {"role": "assistant", "text": reply_text, "time": time.time() * 1000}
             if result.get("turn_id"):

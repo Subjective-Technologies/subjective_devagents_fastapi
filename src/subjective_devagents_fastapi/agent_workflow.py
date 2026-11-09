@@ -118,11 +118,32 @@ def _safe_relative(path: str) -> Path | None:
     return Path(*parts)
 
 
+def _sync_runtime_identity(folder: Path, version: str) -> None:
+    """Published DB revision is authoritative; explicitly reconcile legacy file identity."""
+    identity_file = folder / "runtime_identity.json"
+    version_file = folder / "WORKFLOW_VERSION"
+    observed = version_file.read_text().strip() if version_file.is_file() else None
+    previous = json.loads(identity_file.read_text()) if identity_file.is_file() else {}
+    manifest = {"source": "published_workflow_database", "workflow_version": version,
+                "legacy_file_version": previous.get("legacy_file_version", observed),
+                "synchronized": True}
+    for name, content in (("WORKFLOW_VERSION", version + "\n"),
+                          ("runtime_identity.json", json.dumps(manifest, sort_keys=True))):
+        handle, temporary = tempfile.mkstemp(prefix=".identity-", dir=folder)
+        try:
+            with os.fdopen(handle, "w") as stream:
+                stream.write(content)
+            os.replace(temporary, folder / name)
+        finally:
+            if os.path.exists(temporary): os.unlink(temporary)
+
+
 def materialize(export: dict, company_id: str, root: Path) -> Path:
     """Write one published version to <root>/<company>/<version>/ once; it never changes after."""
     version = export["version"]["version"]
     target = root / company_id / version
     if target.is_dir():
+        _sync_runtime_identity(target, version)
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=target.parent))
@@ -134,6 +155,7 @@ def materialize(export: dict, company_id: str, root: Path) -> Path:
             destination = staging / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(str(item.get("content") or ""), encoding="utf-8")
+        _sync_runtime_identity(staging, version)
         try:
             os.replace(staging, target)
         except OSError:
@@ -195,9 +217,15 @@ def wrap_turn(definition: str, text: str) -> str:
 
 
 def ensure_header(reply: str, version: str, agent_id: str) -> str:
-    if not reply or _HEADER.match(reply):
+    if not reply:
         return reply
-    return f"[WF:{version}][agent:{agent_id}]\n{reply}"
+    canonical = f"[WF:{version}][agent:{agent_id}]"
+    matched = _HEADER.match(reply)
+    if matched:
+        if matched.group(0).strip() == canonical:
+            return reply
+        return canonical + reply[matched.end():]
+    return canonical + "\n" + reply
 
 
 def prepare_turn(state: dict, target: str, agent: dict, authorization: str, text: str, app_home: str) -> str:

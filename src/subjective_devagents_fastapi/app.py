@@ -949,6 +949,40 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
         except Exception:
             instance.llm_service.settle_send(target)
             raise
+    channel = None
+    binding = body.get("coordination")
+    journal = instance.llm_service.backend.model.store
+    with journal.connection() as db:
+        bound_channel = db.execute("SELECT channel_id,actor_id FROM channel_bindings WHERE target=?", (target,)).fetchone()
+    if bound_channel and binding is None:
+        instance.llm_service.settle_send(target)
+        return JSONResponse(status_code=409, content={"ok": False, "error": "channel_dispatch_required"})
+    if binding is not None:
+        from .channel_coordination import ChannelSession
+        from .language_models.contracts import ModelError
+        try:
+            actor = str((agent or {}).get("user_id") or binding.get("agent_id") or "")
+            channel = ChannelSession(binding, actor, request.headers.get("authorization", ""))
+            identity = await asyncio.to_thread(instance.llm_service.backend.identity, conversation)
+            # Native CLIs have private tool loops that cannot honor per-tool leases.
+            # Fail explicitly, never claim coordination enforcement on those runtimes.
+            if identity.strategy != "api_agent":
+                raise ModelError("coordinated_runtime_required", "Choose an API-agent provider for coordinated execution; native CLI tool fencing is unavailable")
+            version = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or ("inline",))[0]
+            if bound_channel and (bound_channel["channel_id"], bound_channel["actor_id"]) != (binding.get("channel_id"), actor):
+                raise ModelError("channel_binding_conflict", "Conversation belongs to another channel/agent")
+            await asyncio.to_thread(channel.start, identity, version, (instance.llm_service.agent_turns.get(target) or {}).get("agent_id"))
+            with journal.connection() as db:
+                db.execute("INSERT OR IGNORE INTO channel_bindings VALUES(?,?,?)", (target, binding["channel_id"], actor))
+            exported_identity = (instance.llm_service.agent_turns.get(target) or {}).get("workflow_identity", {})
+            if exported_identity.get("legacy_file_version") not in (None, version):
+                await asyncio.to_thread(channel.call, "gate", id="published-identity-" + binding["instance_id"],
+                    kind="WORKFLOW_VERSION_DIAGNOSTIC", result="failed", metadata=exported_identity)
+            instance.llm_service.agent_turns.setdefault(target, {})["coordination"] = channel
+        except ModelError as error:
+            (instance.llm_service.agent_turns.get(target) or {}).pop("definition", None)
+            instance.llm_service.settle_send(target)
+            return JSONResponse(status_code=409, content={"ok": False, "error": error.code})
     # Cloudflare (and most reverse proxies) close idle HTTP at ~100s with 524, while
     # Cursor/Claude/Codex turns are allowed 30 minutes. Accept here and deliver the
     # assistant reply on the WebSocket (llm-message / llm-busy / system).
@@ -973,6 +1007,12 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
         except Exception as error:  # noqa: BLE001
             default_log("error", "LLM send background crash", {"target": target, "message": str(error)})
         finally:
+            if channel and not channel.closed:
+                try:
+                    await asyncio.to_thread(channel.finish, "failed")
+                except Exception:
+                    default_log("error", "Channel dispatch requires reconciliation", {"target": target})
+            (instance.llm_service.agent_turns.get(target) or {}).pop("coordination", None)
             instance.llm_service.settle_send(target)
 
     asyncio.create_task(run_send())

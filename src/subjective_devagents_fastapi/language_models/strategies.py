@@ -515,7 +515,10 @@ AGENT_TOOLS = {
         "description": "Ask the user a clarifying question when genuinely uncertain, instead of "
                        "guessing. Ends your turn immediately; their next reply answers it.",
         "parameters": {"type": "object", "properties": {
-            "question": {"type": "string"}},
+            "question": {"type": "string"},
+            "decision_id": {"type": "string"},
+            "category": {"type": "string", "enum": ["BUSINESS_DECISION", "SECURITY_AUTHORIZATION", "DESTRUCTIVE_ACTION_AUTHORIZATION", "EXTERNAL_USER_ONLY_INFORMATION", "TECHNICAL_INTERNAL_BLOCKER"]},
+            "scope": {"type": "string"}, "discovery_id": {"type": "string"}},
             "required": ["question"]}}},
 }
 MUTATING_TOOLS = frozenset({"Bash", "Write", "Edit"})
@@ -866,8 +869,10 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
             return "Error: file_path is required."
         content = str(arguments.get("content") or "")
         before = _read_if_exists(path, identity, transport, cancelled, timeout)
-        _run_bounded(("sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "write", path),
+        written = _run_bounded(("sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "write", path),
                      content, identity, transport, cancelled, timeout)
+        if written.startswith("Error:") or "[exit code " in written:
+            return "Error: file write failed: " + written
         diff = _unified_diff(path, before, content)
         if diff:
             emit("file_diff", {"path": path, "status": "created" if not before else "modified", "diff": diff})
@@ -883,7 +888,9 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
         if occurrences != 1:
             return f"Error: old_string must match exactly once; found {occurrences} occurrence(s)."
         updated = current.replace(old, new, 1)
-        _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), updated, identity, transport, cancelled, timeout)
+        written = _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), updated, identity, transport, cancelled, timeout)
+        if written.startswith("Error:") or "[exit code " in written:
+            return "Error: file edit failed: " + written
         diff = _unified_diff(path, current, updated)
         if diff:
             emit("file_diff", {"path": path, "status": "modified", "diff": diff})
@@ -929,7 +936,15 @@ class ApiAgent(ModelStrategy):
         if not token:
             return ModelResult("failed", error_code="authentication_required")
         tools = agent_tool_set(identity)
+        coordination = request.coordination
+        if coordination:
+            from ..channel_coordination import CONTROL_TOOL
+            tools["Coordination"] = CONTROL_TOOL
+            original_cancelled = cancelled
+            cancelled = lambda: original_cancelled() or coordination.revoked()
         messages = [{"role": "system", "content": agent_system_prompt(identity)}]
+        if coordination:
+            messages[0]["content"] += "\n" + coordination.context()
         messages += [{"role": m.role, "content": m.content} for m in request.history]
         if request.attachments:
             content = [{"type": "text", "text": request.prompt}] + [agent_image_block(a) for a in request.attachments]
@@ -969,7 +984,7 @@ class ApiAgent(ModelStrategy):
                 return outcome
             message, finish_reason = outcome
             text = message.get("content") or ""
-            if isinstance(text, str) and text.strip():
+            if isinstance(text, str) and text.strip() and not (coordination and "NEEDS INPUT:" in text):
                 emit("message", {"text": text})
             calls = message.get("tool_calls") or []
             assistant_entry = {"role": "assistant", "content": message.get("content")}
@@ -977,6 +992,8 @@ class ApiAgent(ModelStrategy):
                 assistant_entry["tool_calls"] = calls
             messages.append(assistant_entry)
             if not calls:
+                if coordination and isinstance(text, str) and "NEEDS INPUT:" in text:
+                    return ModelResult("blocked", "[COORDINATION] CLASSIFIED_DECISION_REQUIRED: use AskUser with decision ID/category, or record internal discovery.")
                 if finish_reason != "stop" or not isinstance(text, str) or not text.strip():
                     return ModelResult("failed", error_code="incomplete_provider_output")
                 if snapshot:
@@ -995,14 +1012,14 @@ class ApiAgent(ModelStrategy):
                 if name == "Bash" and snapshot is None:
                     snapshot = workspace_snapshot(identity, transport, cancelled, min(30.0, remaining)) or {}
                 result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, emit,
-                                             edited)
+                                             edited, coordination)
                 if isinstance(result_text, ModelResult):
                     return result_text
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
         return ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod
-    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None):
+    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None, coordination=None):
         name = (call.get("function") or {}).get("name") or ""
         try:
             arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
@@ -1012,6 +1029,15 @@ class ApiAgent(ModelStrategy):
             return "Error: tool arguments were not valid JSON."
         if name not in tools:
             return f"Error: tool {name!r} is not permitted in this session."
+        if coordination:
+            try:
+                if name == "Coordination":
+                    return coordination.tool(arguments.get("operation"), arguments.get("data", {}))
+                if name == "AskUser":
+                    return ModelResult("completed", coordination.ask(arguments))
+                coordination.guard(name, arguments)
+            except ModelError as error:
+                return f"Error: {error.code}: {error}"
         if name == "AskUser":
             question = str(arguments.get("question") or "").strip()
             if not question:
@@ -1026,7 +1052,10 @@ class ApiAgent(ModelStrategy):
             # Already shown by the tool's own diff; the end-of-turn Bash diff skips it.
             edited.add(os.path.normpath(os.path.join(identity.workspace or "/", str(arguments["file_path"]))))
         try:
-            return execute_agent_tool(name, arguments, identity, transport, cancelled, timeout, emit)
+            result = execute_agent_tool(name, arguments, identity, transport, cancelled, timeout, emit)
+            if coordination and not result.startswith("Error:") and "[exit code " not in result:
+                coordination.observed(name, True)
+            return result
         except ToolAbort as abort:
             return abort.result
 

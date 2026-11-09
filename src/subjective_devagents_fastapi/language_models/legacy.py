@@ -203,7 +203,7 @@ class LegacyLanguageModel:
                         return self.outcome(pending)
                     else:
                         raise ModelError("projection_pending", "Reload the completed previous turn before sending another prompt.")
-                turn = self.model.submit(row[0], request["prompt"], str(uuid.uuid4()), request["timeout"], images)
+                turn = self.model.submit(row[0], request["prompt"], str(uuid.uuid4()), request["timeout"], images, request.get("coordination"))
             register(conversation["target"], lambda: bool(self.model.cancel(turn["id"])))
             cursor = 0
             try:

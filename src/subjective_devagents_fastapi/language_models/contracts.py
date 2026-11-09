@@ -82,6 +82,7 @@ class ModelRequest:
     session_id: str | None = None
     timeout: float = 300.0
     attachments: tuple[Attachment, ...] = ()
+    coordination: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

@@ -32,6 +32,7 @@ class TurnStore:
         with self.connection() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS channel_bindings (target TEXT PRIMARY KEY, channel_id TEXT NOT NULL, actor_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY, identity TEXT NOT NULL,
                     session_id TEXT, created REAL NOT NULL, needs_reconciliation INTEGER NOT NULL DEFAULT 0
