@@ -5,6 +5,7 @@ Coordination loss fails closed before executing another tool.
 """
 from __future__ import annotations
 import hashlib
+import logging
 import json
 import os
 import re
@@ -14,6 +15,8 @@ from pathlib import Path
 import time
 import httpx
 from .language_models.contracts import ModelError
+
+log = logging.getLogger(__name__)
 
 _READ_COMMANDS = {
     'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'whoami', 'date', 'true', 'false', 'echo', 'printf',
@@ -90,6 +93,7 @@ def concrete_user_decision(text):
         return False
     return bool(question)
 
+UNREACHABLE_GRACE = 30.0
 TOOL_OPERATIONS = {'task', 'recover', 'reissue', 'adopt_worktree', 'blocker', 'snapshot', 'acquire', 'release', 'fact', 'decision', 'discovery',
                    'capability', 'route', 'privilege', 'review', 'gate', 'worktree'}
 CONTROL_TOOL = {'type': 'function', 'function': {
@@ -120,6 +124,8 @@ class ChannelSession:
         self.runtime = ''
         self.lease_id = None
         self.last_check = 0.0
+        self.revocation = None
+        self._unreachable_since = None
         self.identity = None
         self.closed = False
         self.blocked = False
@@ -232,6 +238,10 @@ class ChannelSession:
         result = self.call(operation, **data)
         if operation == 'acquire':
             self.lease_id = result['lease']['id']
+        if operation == 'release' and data.get('lease_id', self.lease_id) == self.lease_id:
+            # The agent gave its own lease back. Heartbeating it afterwards fails, and that
+            # failure must not read as a revocation that stops the turn.
+            self.lease_id = None
         if operation == 'privilege':
             self.privilege = {k: data[k] for k in ('privilege_level', 'scope', 'decision_id') if k in data}
         if operation != 'snapshot':
@@ -266,8 +276,18 @@ class ChannelSession:
         self.last_check = time.monotonic()
         try:
             self.call('heartbeat')
+            self._unreachable_since = None
             return False
-        except ModelError:
+        except ModelError as error:
+            if error.code == 'coordination_unavailable':
+                # One failed request is not a revocation. Writes stay fenced by guard();
+                # only a journal that stays unreachable stops the turn.
+                self._unreachable_since = self._unreachable_since or self.last_check
+                if self.last_check - self._unreachable_since < UNREACHABLE_GRACE:
+                    return False
+            self.revocation = error.code
+            log.warning('Coordination lease lost channel=%s lease=%s code=%s',
+                        self.binding['channel_id'], self.lease_id, error.code)
             return True
 
     def observed(self, name, ok):

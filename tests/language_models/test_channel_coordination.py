@@ -166,5 +166,38 @@ def test_revocation_stops_actual_shell_before_later_write(bound,monkeypatch):
         timer.start()
         try:result=ApiAgent().run(request,lambda *_:None,lambda:False)
         finally:timer.cancel()
-    assert result.status=='cancelled'
+    assert result.status=='failed' and result.error_code=='coordination_lease_lost:LEASE_RECOVERY_REQUIRED'
     assert not later.exists()
+
+
+def test_releasing_own_lease_does_not_stop_the_turn(bound):
+    session,journal,identity=bound;session.tool('acquire',{'repository':identity.workspace,'paths':['.']})
+    session.tool('release',{})
+    journal.revoked=True;session.last_check=0
+    assert session.lease_id is None
+    assert not session.revoked()
+    with pytest.raises(ModelError):session.guard('Write',{'file_path':'file'})
+
+
+def test_brief_journal_outage_is_not_a_revocation(bound, monkeypatch):
+    session,journal,identity=bound;session.tool('acquire',{'repository':identity.workspace,'paths':['.']})
+    def unavailable(body):
+        raise ModelError('coordination_unavailable','down')
+    session._client=unavailable;session.last_check=0
+    assert not session.revoked()
+    clock=time.monotonic()+31
+    monkeypatch.setattr(time,'monotonic',lambda:clock)
+    assert session.revoked() and session.revocation=='coordination_unavailable'
+
+
+def test_lease_lost_turn_reports_failure_not_operator_stop(bound, monkeypatch):
+    session,journal,identity=bound;session.tool('acquire',{'repository':identity.workspace,'paths':['.']})
+    async def lost(self, request, emit, cancelled):
+        session.revocation='LEASE_RECOVERY_REQUIRED'
+        from subjective_devagents_fastapi.language_models import ModelResult
+        return ModelResult('cancelled', error_code='cancelled_during_request')
+    monkeypatch.setattr(ApiAgent,'_run',lost)
+    request=ModelRequest('turn',identity,'go',(),None,5,(),session)
+    result=ApiAgent().run(request,lambda *a:None,lambda:False)
+    assert result.status=='failed' and result.error_code=='coordination_lease_lost:LEASE_RECOVERY_REQUIRED'
+    assert ApiAgent().run(request,lambda *a:None,lambda:True).status=='cancelled'

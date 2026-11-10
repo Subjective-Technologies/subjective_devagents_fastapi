@@ -926,7 +926,13 @@ class ApiAgent(ModelStrategy):
         self.transport = transport
 
     def run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
-        return asyncio.run(self._run(request, emit, cancelled))
+        result = asyncio.run(self._run(request, emit, cancelled))
+        revocation = getattr(request.coordination, "revocation", None)
+        if result.status == "cancelled" and revocation and not cancelled():
+            # Nobody pressed Stop: the channel took the write lease away. Say so, instead
+            # of the operator-stop message the UI shows for a plain cancellation.
+            return ModelResult("failed", error_code="coordination_lease_lost:" + revocation)
+        return result
 
     async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
         if cancelled():
