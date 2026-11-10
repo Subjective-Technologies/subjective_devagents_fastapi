@@ -201,6 +201,19 @@ def test_invalid_import_rolls_back_conversation_and_preceding_pairs(store, ident
         assert db.execute("SELECT count(*) FROM turns").fetchone()[0] == 0
 
 
+def test_blocked_coordination_answer_ends_the_turn(store, identity):
+    conversation = store.create(identity)
+    turn = reserve(store, identity, conversation["id"])
+    assert store.claim(turn["id"])
+    store.finish(turn["id"], ModelResult("blocked", "NEEDS INPUT: which lease should be released?"))
+    saved = store.turn(turn["id"])
+    assert saved["status"] == "blocked"
+    assert saved["text"] == "NEEDS INPUT: which lease should be released?"
+    assert store.conversation(conversation["id"])["active_turn_id"] is None
+    follow = reserve(store, identity, conversation["id"], "request-2")
+    assert follow["status"] == "queued"
+
+
 @pytest.mark.parametrize("operation", ["conversation", "turn", "events", "cancel", "finish", "handoff", "reserve"])
 def test_unknown_ids_raise_public_not_found(store, identity, operation):
     calls = {

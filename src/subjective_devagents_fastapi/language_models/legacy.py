@@ -235,7 +235,8 @@ class LegacyLanguageModel:
 
     @staticmethod
     def outcome(turn: dict) -> dict:
-        return {"success": turn["status"] == "completed", "status": turn["status"],
+        # A coordination block is the agent's answer (what it needs before it can continue).
+        return {"success": turn["status"] in {"completed", "blocked"}, "status": turn["status"],
                 "response": turn["text"], "session_id": turn["session_id"] or "",
                 "error": turn["error_code"] or "", "turn_id": turn["id"],
                 "conversation_id": turn["conversation_id"]}

@@ -16,7 +16,10 @@ from pathlib import Path
 from .contracts import Identity, Message, ModelError, ModelResult
 
 ACTIVE = ("queued", "running")
-TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
+# blocked: the agent stopped on a coordination decision. It is finished work, not an
+# open turn. Leaving it out made finish() raise and the waiter poll until the heartbeat
+# ran for hours with no further step.
+TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted", "blocked"}
 
 
 class TurnStore:

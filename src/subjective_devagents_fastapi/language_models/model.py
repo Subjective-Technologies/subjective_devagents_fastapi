@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 from .contracts import MAX_ATTACHMENTS, Attachment, Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
 from .registry import IdentityRegistry, image_support
-from .store import TurnStore
+from .store import TERMINAL, TurnStore
 from .strategies import Api, ApiAgent, ClaudeCli, Cli, CodexCli, CursorCli, GrokCli, MAX_CONTEXT_BYTES
 
 log = logging.getLogger(__name__)
@@ -107,12 +107,22 @@ class LanguageModel:
             # The strategy may have started work. Preserve uncertainty; do not retry.
             log.error("LanguageModel worker exception turn_id=%s exception_type=%s", identifier, type(error).__name__)
             result = ModelResult("interrupted", error_code="worker_exception")
+        if result.status not in TERMINAL:
+            # An unlisted status used to raise out of finish() and leave the row running.
+            # The sender then polled until the process was restarted.
+            log.error("LanguageModel non-terminal status turn_id=%s status=%s", identifier, result.status)
+            result = ModelResult("interrupted", result.text, result.session_id, result.error_code or result.status)
         if coordination and result.status == "completed":
             try:
                 result = replace(result, text=coordination.canonical_reply(result.text))
             except ModelError as error:
                 result = ModelResult("interrupted", error_code=error.code)
-        self.store.finish(identifier, result)
+        try:
+            self.store.finish(identifier, result)
+        except Exception:
+            log.exception("LanguageModel could not record the turn turn_id=%s", identifier)
+            result = ModelResult("interrupted", error_code="worker_exception")
+            self.store.finish(identifier, result)
         if coordination:
             try:
                 coordination.finish(result.status, result.error_code)
