@@ -957,6 +957,12 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
     if bound_channel and binding is None:
         instance.llm_service.settle_send(target)
         return JSONResponse(status_code=409, content={"ok": False, "error": "channel_dispatch_required"})
+    if binding is not None and (target in instance.llm_service.busy or instance.llm_service.backend.active_turn(target)):
+        # Refuse before the dispatch is started: a started dispatch is spent, and the page's
+        # retry of the same dispatch would then come back as DISPATCH_SUPPRESSED.
+        instance.llm_service.settle_send(target)
+        return JSONResponse(status_code=409, content={"ok": False, "status": "busy",
+                                                      "error": "Conversation is already processing a request."})
     if binding is not None:
         from .channel_coordination import ChannelSession
         from .language_models.contracts import ModelError
@@ -971,7 +977,10 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
             version = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or ("inline",))[0]
             if bound_channel and (bound_channel["channel_id"], bound_channel["actor_id"]) != (binding.get("channel_id"), actor):
                 raise ModelError("channel_binding_conflict", "Conversation belongs to another channel/agent")
-            await asyncio.to_thread(channel.start, identity, version, (instance.llm_service.agent_turns.get(target) or {}).get("agent_id"))
+            # The role name the definition told the model to sign with (header[1]), not the AI
+            # user id: otherwise every correct reply was logged as WORKFLOW_VERSION_CONFLICT.
+            role = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or (None, None))[1]
+            await asyncio.to_thread(channel.start, identity, version, role)
             with journal.connection() as db:
                 db.execute("INSERT OR IGNORE INTO channel_bindings VALUES(?,?,?)", (target, binding["channel_id"], actor))
             exported_identity = (instance.llm_service.agent_turns.get(target) or {}).get("workflow_identity", {})

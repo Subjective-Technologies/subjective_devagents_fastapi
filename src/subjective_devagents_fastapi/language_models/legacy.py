@@ -97,6 +97,9 @@ class LegacyLanguageModel:
             db.execute("CREATE TABLE IF NOT EXISTS legacy_projections (target TEXT NOT NULL, turn_id TEXT NOT NULL, PRIMARY KEY(target,turn_id))")
             if "pending_turn" not in {row[1] for row in db.execute("PRAGMA table_info(legacy_bindings)")}:
                 db.execute("ALTER TABLE legacy_bindings ADD COLUMN pending_turn TEXT")
+        # One process owns this journal and has just started: no worker of an HTTP turn
+        # survived. Left "running", such a turn refused every later send as busy.
+        self.model.store.release_orphaned_http_turns()
 
     def identity(self, conversation: dict) -> Identity:
         provider = conversation["provider"]
@@ -240,6 +243,12 @@ class LegacyLanguageModel:
                 "response": turn["text"], "session_id": turn["session_id"] or "",
                 "error": turn["error_code"] or "", "turn_id": turn["id"],
                 "conversation_id": turn["conversation_id"]}
+
+    def active_turn(self, target: str) -> bool:
+        """The conversation bound to `target` has a queued or running turn."""
+        with self.model.store.connection() as db:
+            return db.execute("""SELECT 1 FROM turns t JOIN legacy_bindings b ON b.conversation_id=t.conversation_id
+                WHERE b.target=? AND t.status IN ('queued','running') LIMIT 1""", (target,)).fetchone() is not None
 
     def pending(self, target: str) -> dict | None:
         with self.model.store.connection() as db:

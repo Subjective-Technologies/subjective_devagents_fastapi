@@ -236,6 +236,27 @@ class TurnStore:
             db.execute("UPDATE conversations SET identity=?,session_id=NULL WHERE id=?", (snapshot, identifier))
         return self.conversation(identifier)
 
+    def release_orphaned_http_turns(self) -> list[str]:
+        """Close HTTP turns (api, api_agent) still queued or running when the service starts.
+
+        Their worker was a thread of the previous process and ran no remote job or CLI that
+        could outlive it, so there is nothing to reconcile. CLI turns are left alone: their
+        process may still be running.
+        """
+        released = []
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT id,conversation_id,identity FROM turns WHERE status IN ('queued','running')").fetchall():
+                if json.loads(row["identity"]).get("strategy") not in {"api", "api_agent"}:
+                    continue
+                db.execute("UPDATE turns SET status='interrupted',error_code='service_restarted',updated=? WHERE id=?",
+                           (time.time(), row["id"]))
+                db.execute("UPDATE conversations SET session_id=NULL,needs_reconciliation=0 WHERE id=?",
+                           (row["conversation_id"],))
+                self._event(db, row["id"], "state", {"status": "interrupted", "error_code": "service_restarted"})
+                released.append(row["id"])
+        return released
+
     def reconcile(self, identifier: str) -> dict:
         """Operator has independently verified the old worker/remote job is stopped."""
         with self.connection() as db:

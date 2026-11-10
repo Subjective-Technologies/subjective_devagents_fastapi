@@ -228,3 +228,22 @@ def test_unknown_ids_raise_public_not_found(store, identity, operation):
     with pytest.raises(ModelError) as error:
         calls[operation]()
     assert error.value.code == "not_found"
+
+
+def test_restart_releases_http_turns_and_keeps_cli_turns(store, identity):
+    http = replace(identity, id="grok-proxy", provider="grok", strategy="api_agent")
+    http_conversation = store.create(http)
+    cli_conversation = store.create(identity)
+    stuck = reserve(store, http, http_conversation["id"])
+    assert store.claim(stuck["id"])
+    cli_turn = reserve(store, identity, cli_conversation["id"])
+    assert store.claim(cli_turn["id"])
+
+    assert TurnStore(store.path).release_orphaned_http_turns() == [stuck["id"]]
+
+    released = store.turn(stuck["id"])
+    assert (released["status"], released["error_code"]) == ("interrupted", "service_restarted")
+    assert store.conversation(http_conversation["id"])["needs_reconciliation"] == 0
+    assert store.turn(cli_turn["id"])["status"] == "running"
+    follow = reserve(store, http, http_conversation["id"], "request-2")
+    assert follow["status"] == "queued"
