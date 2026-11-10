@@ -60,11 +60,36 @@ def test_real_file_write_requires_lease_and_forwards_canonical_context(bound,mon
 def test_guard_bash_is_global_and_paths_canonicalized(bound):
     session,journal,identity=bound
     session.tool('acquire',{'repository':identity.workspace,'paths':['.']})
-    session.guard('Bash',{'command':'echo hi'})
-    assert journal.calls[-1]['path']=='/'
+    session.guard('Bash',{'command':'rm note'})
+    assert journal.calls[-1]['path']==identity.workspace
     session.guard('Write',{'file_path':'sub/../file'})
     assert journal.calls[-1]['path']==identity.workspace+'/file'
     with pytest.raises(ModelError):session.tool('acquire',{'repository':'/unrelated','paths':['.']})
+
+
+def test_read_only_shell_does_not_require_a_write_lease(bound):
+    from subjective_devagents_fastapi.channel_coordination import shell_effect
+    session, journal, _identity = bound
+    before = len(journal.calls)
+    for command in ('pwd', 'ls', 'git status', 'cat README', 'npm test'):
+        assert shell_effect(command) == 'READ_ONLY'
+        session.guard('Bash', {'command': command})
+    assert len(journal.calls) == before
+    for command in ('rm file', 'git checkout main', "sed -i 's/a/b/' file"):
+        assert shell_effect(command) == 'WRITE'
+        with pytest.raises(ModelError, match='write lease') as error:
+            session.guard('Bash', {'command': command})
+        assert error.value.code == 'WRITE_LEASE_REQUIRED'
+
+
+def test_status_chatter_is_not_a_decision(bound):
+    from subjective_devagents_fastapi.channel_coordination import concrete_user_decision
+    session, journal, _identity = bound
+    for phrase in ('what is the status of this?', 'retry', 'continue', 'you there?'):
+        assert session.ask({'question': phrase}) == phrase
+        assert concrete_user_decision('NEEDS INPUT: ' + phrase) is False
+    assert journal.state['decisions'] == {}
+    assert concrete_user_decision('NEEDS INPUT: decision_id=cloudflare_scoped_token_creation May an agent create a scoped token?') is True
 
 
 def test_revocation_or_network_loss_stops_execution(bound):

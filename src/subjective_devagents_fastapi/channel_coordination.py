@@ -7,11 +7,88 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 from pathlib import Path
 import time
 import httpx
 from .language_models.contracts import ModelError
+
+_READ_COMMANDS = {
+    'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'whoami', 'date', 'true', 'false', 'echo', 'printf',
+    'which', 'type', 'file', 'stat', 'test', 'rg', 'grep', 'find', 'du', 'df', 'uname', 'id',
+    'printenv', 'env', 'nl',
+}
+_WRITE_COMMANDS = {
+    'rm', 'mv', 'cp', 'mkdir', 'rmdir', 'touch', 'chmod', 'chown', 'tee', 'truncate', 'dd', 'install',
+    'ln', 'unlink',
+}
+_GIT_READ = {'status', 'diff', 'log', 'show', 'rev-parse', 'branch', 'remote', 'ls-files', 'describe', 'blame', 'shortlog'}
+_GIT_WRITE = {'checkout', 'switch', 'commit', 'push', 'reset', 'clean', 'rebase', 'merge', 'cherry-pick', 'am', 'apply', 'stash', 'add', 'rm', 'mv', 'restore'}
+_STATUS_LINE = re.compile(
+    r"^\s*(?:what(?:'s| is) the status(?: of this)?|status|continue|retry|try again|"
+    r"is it done|what happened|verify this|you there)\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _segments(command):
+    parts = [piece.strip() for piece in re.split(r'\s*(?:&&|\|\||;|\|)\s*', command or '')]
+    return [piece for piece in parts if piece] or ['']
+
+
+def _segment_effect(part):
+    try:
+        tokens = shlex.split(part, posix=True)
+    except ValueError:
+        return 'UNKNOWN'
+    if not tokens:
+        return 'READ_ONLY'
+    base = tokens[0].rsplit('/', 1)[-1]
+    if base in {'sudo', 'command', 'time', 'nohup'} and len(tokens) > 1:
+        return _segment_effect(' '.join(tokens[1:]))
+    if base == 'git':
+        sub = next((token for token in tokens[1:] if not token.startswith('-')), '')
+        if sub in _GIT_WRITE:
+            return 'WRITE'
+        if sub in _GIT_READ:
+            return 'READ_ONLY'
+        return 'UNKNOWN'
+    if base in {'npm', 'pnpm', 'yarn'} and 'test' in tokens[1:3]:
+        return 'READ_ONLY'
+    if base == 'sed':
+        return 'WRITE' if '-i' in tokens or any(token.startswith('--in-place') for token in tokens) else 'READ_ONLY'
+    if base in _WRITE_COMMANDS:
+        return 'WRITE'
+    if base in _READ_COMMANDS:
+        return 'READ_ONLY'
+    return 'UNKNOWN'
+
+
+def shell_effect(command):
+    """READ_ONLY, WRITE, or UNKNOWN. A read-only command does not need a write lease."""
+    effects = [_segment_effect(part) for part in _segments(command)]
+    if any(item == 'WRITE' for item in effects):
+        return 'WRITE'
+    if any(item == 'UNKNOWN' for item in effects):
+        return 'UNKNOWN'
+    return 'READ_ONLY'
+
+
+def is_status_chatter(question):
+    return bool(_STATUS_LINE.match(str(question or '').strip()))
+
+
+def concrete_user_decision(text):
+    """A user decision needs an explicit id and a question that is not status chatter."""
+    raw = text or ''
+    question = raw.split('NEEDS INPUT:', 1)[-1].strip() if 'NEEDS INPUT:' in raw else raw.strip()
+    if is_status_chatter(question) or is_status_chatter(raw):
+        return False
+    if not re.search(r'(?i)\bdecision[_ -]?id\b\s*[:=]\s*[A-Za-z0-9_-]{3,}', raw):
+        return False
+    return bool(question)
 
 TOOL_OPERATIONS = {'task', 'recover', 'reissue', 'adopt_worktree', 'blocker', 'snapshot', 'acquire', 'release', 'fact', 'decision', 'discovery',
                    'capability', 'route', 'privilege', 'review', 'gate', 'worktree'}
@@ -24,8 +101,9 @@ CONTROL_TOOL = {'type': 'function', 'function': {
         'specialists_consulted); capability (capability,status,target,source); review '
         '(id,repository,sha,artifact_fact_id,test_revision,verdict); gate (id,kind,result,metadata); '
         'worktree (path,lease_id,base_sha,branch,state,dirty,pushed). '
-        'Before Write/Edit acquire a covering write lease. Bash requires repository / and paths [.] '
-        'because shell paths cannot be inferred safely. Release after reconciling worktrees. '
+        'Before Write/Edit acquire a covering write lease. Read-only shell (pwd, ls, git status, cat, npm test) '
+        'needs no write lease. A mutating or unknown shell needs a write lease covering the paths it changes, '
+        'not the filesystem root. Release after reconciling worktrees. '
         'Never submit credentials. Security decisions require explicit IDs; agents cannot resolve them.'),
     'parameters': {'type': 'object', 'properties': {'operation': {'type': 'string'},
         'data': {'type': 'object'}}, 'required': ['operation', 'data']}}}
@@ -100,7 +178,7 @@ class ChannelSession:
 
     def context(self):
         state = self.call('snapshot')['state']
-        state['leases'] = {key: lease for key, lease in state['leases'].items() if lease['status'] in {'active', 'revoking', 'recovery_required'}}
+        state['leases'] = {key: lease for key, lease in state['leases'].items() if lease['status'] in {'active', 'revoking', 'recovery_required', 'expired'}}
         # The state is supplied separately on every turn; never rely on transcript replay.
         return '\nCHANNEL RUNTIME CONTEXT (authoritative journal; reported facts retain provenance):\n' + json.dumps({
             'workflow_id': state['workflow_id'], 'workflow_version': state['workflow_version'],
@@ -161,8 +239,9 @@ class ChannelSession:
         return json.dumps(result, sort_keys=True)
 
     def guard(self, name, arguments):
-        # All shell commands are treated as possible writes. No regex pretending to be a sandbox.
         if name not in {'Bash', 'Write', 'Edit'}:
+            return
+        if name == 'Bash' and shell_effect(str(arguments.get('command', ''))) == 'READ_ONLY':
             return
         if self.privilege and self.privilege['privilege_level'] != 'scoped':
             self.call('privilege', **self.privilege)
@@ -170,7 +249,8 @@ class ChannelSession:
             raise ModelError('WRITE_LEASE_REQUIRED', 'Acquire a covering Coordination write lease before executing')
         if self.identity.ssh_host:
             raise ModelError('remote_scope_unverified', 'Remote execution scopes are not verified')
-        target = '/' if name == 'Bash' else str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
+        # Unknown or mutating shell is checked against the workspace, not the filesystem root.
+        target = str(Path(self.identity.workspace).resolve()) if name == 'Bash' else str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
         state = self.call('check', path=target)['state']
         for tree in state['worktrees'].values():
             foreign = tree['instance_id'] != self.binding['instance_id']
@@ -206,6 +286,8 @@ class ChannelSession:
         question = str(arguments.get('question', '')).strip()
         if not question:
             raise ModelError('invalid_question', 'Question is required')
+        if is_status_chatter(question):
+            return question
         category = arguments.get('category', 'TECHNICAL_INTERNAL_BLOCKER')
         identifier = arguments.get('decision_id')
         if category in {'SECURITY_AUTHORIZATION', 'DESTRUCTIVE_ACTION_AUTHORIZATION'} and not identifier:

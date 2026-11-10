@@ -984,7 +984,9 @@ class ApiAgent(ModelStrategy):
                 return outcome
             message, finish_reason = outcome
             text = message.get("content") or ""
-            if isinstance(text, str) and text.strip() and not (coordination and "NEEDS INPUT:" in text):
+            from ..channel_coordination import concrete_user_decision
+            user_decision = bool(coordination and isinstance(text, str) and "NEEDS INPUT:" in text and concrete_user_decision(text))
+            if isinstance(text, str) and text.strip() and not user_decision:
                 emit("message", {"text": text})
             calls = message.get("tool_calls") or []
             assistant_entry = {"role": "assistant", "content": message.get("content")}
@@ -992,7 +994,7 @@ class ApiAgent(ModelStrategy):
                 assistant_entry["tool_calls"] = calls
             messages.append(assistant_entry)
             if not calls:
-                if coordination and isinstance(text, str) and "NEEDS INPUT:" in text:
+                if user_decision:
                     return ModelResult("blocked", "[COORDINATION] CLASSIFIED_DECISION_REQUIRED: use AskUser with decision ID/category, or record internal discovery.")
                 if finish_reason != "stop" or not isinstance(text, str) or not text.strip():
                     return ModelResult("failed", error_code="incomplete_provider_output")
