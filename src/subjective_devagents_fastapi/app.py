@@ -359,13 +359,16 @@ async def require_api_token(request: Request, call_next):
             return JSONResponse(status_code=401, content={"ok": False, "error": "A workflow read token is required."})
         return await call_next(request)
     if auth.path_requires_token(request.url.path):
-        supplied = auth.token_from_request(request.headers)
-        if not await asyncio.to_thread(auth.token_is_valid, supplied):
+        try:
+            claims = await asyncio.to_thread(auth.authenticate_headers, request.headers)
+        except auth.AuthFailure as failure:
+            headers = {"WWW-Authenticate": "Bearer"} if failure.status == 401 else {}
             return JSONResponse(
-                status_code=401,
-                content={"ok": False, "error": "Unauthorized."},
-                headers={"WWW-Authenticate": "Bearer"},
+                status_code=failure.status,
+                content={"ok": False, "error": failure.message},
+                headers=headers,
             )
+        request.state.devagents_claims = claims
     return await call_next(request)
 
 
@@ -1223,30 +1226,36 @@ async def api_exec(body: dict = Body(default={})) -> dict:
 async def _authenticate_socket(socket: WebSocket) -> tuple[bool, dict | None]:
     """Accept and authenticate a socket, or close it and report failure.
 
-    Returns `(ok, claims)`. Owner browsers send credentials in the first frame rather
-    than the query string, because URLs are logged and a token in one outlives the
-    request. Shared by every socket this service exposes so a new one cannot quietly
-    ship with weaker authentication than /ws.
+    Returns `(ok, claims)`. Browsers send the Firebase identity in the first frame
+    (``token``, ``user_id``, ``company_name``) rather than the query string, because
+    URLs are logged and a token in one outlives the request. Header credentials are
+    accepted when the caller can set them. Shared by every socket this service
+    exposes so a new one cannot quietly ship with weaker authentication than /ws.
     """
     accepted = False
     claims = None
     if auth.auth_enabled():
-        supplied = auth.token_from_request(socket.headers, socket.query_params)
-        if auth.auth_mode() in {"owner", "token"} and not supplied:
+        try:
+            claims = await asyncio.to_thread(auth.authenticate_headers, socket.headers, socket.query_params)
+        except auth.AuthFailure as failure:
+            if not failure.incomplete or auth.auth_mode() not in {"owner", "token"}:
+                await socket.close(code=4403 if failure.status == 403 else 1008)
+                return False, None
             await socket.accept()
             accepted = True
             try:
                 message = await asyncio.wait_for(socket.receive_json(), timeout=5)
                 if not isinstance(message, dict) or message.get("type") != "auth":
                     raise ValueError("Expected authentication")
-                supplied = message.get("token", "")
+                claims = await asyncio.to_thread(
+                    auth.authenticate_headers, socket.headers, socket.query_params, message,
+                )
+            except auth.AuthFailure as presented:
+                await socket.close(code=4403 if presented.status == 403 else 4401)
+                return False, None
             except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
                 await socket.close(code=4401)
                 return False, None
-        claims = await asyncio.to_thread(auth.authenticated_claims, supplied)
-        if claims is None:
-            await socket.close(code=4401 if accepted else 1008)
-            return False, None
     if not accepted:
         await socket.accept()
     return True, claims
@@ -1311,7 +1320,7 @@ async def websocket_ssh_terminal(socket: WebSocket) -> None:
     """A live shell on another machine, for the duration of this socket.
 
     Protocol, client to server:
-      {"type": "auth",      "token": "..."}          (only when the socket needs it)
+      {"type": "auth", "token": "...", "user_id": "...", "company_name": "..."}
       {"type": "open",      "host": "...", ...}      connection fields; host required
                             "pty": true, "cols": 120, "rows": 32   for terminal mode
       {"type": "input",     "command": "ls -la"}     one command (both modes)

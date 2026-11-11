@@ -165,7 +165,7 @@ A WebSocket that opens a live shell on another machine through
 commands and output streams back as the remote writes it.
 
 ```
-client → {"type":"auth","token":"…"}            (when the socket needs it)
+client → {"type":"auth","token":"…","user_id":"…","company_name":"…"}
 client → {"type":"open","host":"subjective-agents"}
 server → {"type":"hello"|"opening"|"ready", …}
 client → {"type":"input","command":"ls -la"}
@@ -220,9 +220,10 @@ CSP and gates itself behind Firebase. Open it with the token already filled in �
 xdg-open "http://127.0.0.1:8090/ssh?token=$(grep -m1 '^SUBJECTIVE_DEVAGENTS_API_TOKEN=' /subjective/.env | cut -d= -f2-)"
 ```
 
-A Firebase ID token for the project also authenticates, in every mode — `authenticated_claims`
-falls through from the static secret to Firebase verification — but it expires in an
-hour and cannot be revoked before it does, so use the static token locally.
+A Firebase sign-in also authenticates, in every mode, when the caller sends the
+user id, the token, and this server's company name. The token subject must be
+that user id. The token expires in an hour and cannot be revoked before it
+does, so use the static token locally.
 
 The remote shell is closed when the socket closes, including when the browser tab
 disappears: the endpoint's cleanup does no `await` before unregistering and closing,

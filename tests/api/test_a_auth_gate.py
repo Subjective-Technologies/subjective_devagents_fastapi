@@ -47,6 +47,7 @@ def signer(monkeypatch):
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_EMAIL", TEST_OWNER_EMAIL)
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_UID", TEST_OWNER_UID)
     monkeypatch.setenv("FIREBASE_PROJECT_ID", TEST_FIREBASE_PROJECT)
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_COMPANY_NAME", "acme")
     monkeypatch.setattr(firebase_auth, "_signing_key_for", lambda token: private.public_key())
 
     def issue(**overrides) -> str:
@@ -209,7 +210,12 @@ def test_a7_an_absurdly_long_credential_is_refused_without_verification(bare_tok
     ],
 )
 def test_a8_any_firebase_account_is_accepted(owner_client, signer, changes):
-    response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer(**changes)}"})
+    token = signer(**changes)
+    response = owner_client.get("/api/config", headers={
+        "Authorization": f"Bearer {token}",
+        "X-User-Id": changes.get("sub", "firebase-user"),
+        "X-Company-Name": "acme",
+    })
     assert response.status_code == 200
 
 
@@ -222,9 +228,14 @@ def test_a8_any_firebase_account_is_accepted(owner_client, signer, changes):
     ],
 )
 def test_a8_a_firebase_token_with_bad_claims_is_refused(owner_client, signer, changes):
-    response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer(**changes)}"})
+    token = signer(**changes)
+    response = owner_client.get("/api/config", headers={
+        "Authorization": f"Bearer {token}",
+        "X-User-Id": changes.get("sub", "firebase-user"),
+        "X-Company-Name": "acme",
+    })
     assert response.status_code == 401
-    assert response.json() == UNAUTHORIZED
+    assert response.json()["error"] == "invalid firebase token"
 
 
 def test_a8_a_static_token_cannot_bypass_owner_mode(owner_client):

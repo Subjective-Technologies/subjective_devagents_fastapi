@@ -191,12 +191,17 @@ def test_the_token_is_never_stamped_into_the_served_page(guarded):
 def test_any_firebase_account_is_accepted(guarded, monkeypatch):
     from subjective_devagents_fastapi import firebase_auth
 
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_COMPANY_NAME", "acme")
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
         lambda token: {"sub": "someone-else-entirely", "email": "user@example.com", "email_verified": False},
     )
-    response = guarded.get("/api/config", headers={"Authorization": "Bearer not-checked-by-the-mock"})
+    response = guarded.get("/api/config", headers={
+        "Authorization": "Bearer not-checked-by-the-mock",
+        "X-User-Id": "someone-else-entirely",
+        "X-Company-Name": "acme",
+    })
     assert response.status_code == 200
 
 

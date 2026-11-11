@@ -16,6 +16,20 @@ from subjective_devagents_fastapi import app as app_module
 TEST_OWNER_EMAIL = 'owner@example.com'
 TEST_OWNER_UID = 'uid-owner-test'
 TEST_FIREBASE_PROJECT = 'firebase-test-project'
+TEST_COMPANY = 'acme'
+FIREBASE_USER = 'firebase-user'
+
+
+def identity(token, user_id=FIREBASE_USER, company=TEST_COMPANY):
+    return {
+        'Authorization': 'Bearer ' + token,
+        'X-User-Id': user_id,
+        'X-Company-Name': company,
+    }
+
+
+def auth_frame(token, user_id=FIREBASE_USER, company=TEST_COMPANY):
+    return {'type': 'auth', 'token': token, 'user_id': user_id, 'company_name': company}
 
 
 @pytest.fixture
@@ -24,6 +38,7 @@ def signer(monkeypatch):
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_EMAIL', TEST_OWNER_EMAIL)
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_UID', TEST_OWNER_UID)
     monkeypatch.setenv('FIREBASE_PROJECT_ID', TEST_FIREBASE_PROJECT)
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_COMPANY_NAME', TEST_COMPANY)
     monkeypatch.setattr(firebase_auth, '_signing_key_for', lambda token: private.public_key())
     def issue(**overrides):
         now = int(time.time())
@@ -40,6 +55,7 @@ def owner_client(tmp_path, monkeypatch):
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_EMAIL', TEST_OWNER_EMAIL)
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_OWNER_UID', TEST_OWNER_UID)
     monkeypatch.setenv('FIREBASE_PROJECT_ID', TEST_FIREBASE_PROJECT)
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_COMPANY_NAME', TEST_COMPANY)
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_AUTH_MODE', 'owner')
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_API_TOKEN', 'legacy-secret-must-not-bypass')
     monkeypatch.setenv('SUBJECTIVE_CHAT_HOME', str(tmp_path / 'home'))
@@ -67,7 +83,8 @@ def test_default_and_invalid_modes_require_owner(monkeypatch):
     {'sub': 'another-uid', 'email': 'Other@Example.com', 'email_verified': False},
 ])
 def test_any_firebase_account_is_accepted(owner_client, signer, changes):
-    assert owner_client.get('/api/auth/session', headers={'Authorization': 'Bearer '+signer(**changes)}).status_code == 200
+    token = signer(**changes)
+    assert owner_client.get('/api/auth/session', headers=identity(token, changes.get('sub', FIREBASE_USER))).status_code == 200
 
 
 class Relative:
@@ -96,7 +113,10 @@ class Relative:
 def test_invalid_identity_and_claims_rejected(owner_client, signer, changes):
     changes = {key: value.resolve() if isinstance(value, Relative) else value
                for key, value in changes.items()}
-    assert owner_client.get('/api/config', headers={'Authorization': 'Bearer '+signer(**changes)}).status_code == 401
+    token = signer(**changes)
+    response = owner_client.get('/api/config', headers=identity(token, changes.get('sub', FIREBASE_USER)))
+    assert response.status_code == 401
+    assert response.json()['error'] == 'invalid firebase token'
 
 
 def test_static_query_and_unsigned_tokens_cannot_bypass_owner(owner_client, signer):
@@ -127,6 +147,7 @@ def test_public_bootstrap_contains_no_credentials(owner_client):
     assert body['mode'] == 'owner'
     assert body['required'] is True
     assert body['ownerEmail'] == TEST_OWNER_EMAIL
+    assert body['companyName'] == TEST_COMPANY
     assert body['firebase']['apiKey'] == ''
     assert 'legacy-secret' not in response.text
     assert owner_client.get('/healthz').json() == {'ok': True}
@@ -134,7 +155,7 @@ def test_public_bootstrap_contains_no_credentials(owner_client):
 
 def test_socket_authenticates_first_frame_before_data(owner_client, signer):
     with owner_client.websocket_connect('/ws') as socket:
-        socket.send_json({'type': 'auth', 'token': signer()})
+        socket.send_json(auth_frame(signer()))
         assert socket.receive_json()['type'] == 'config'
 
 
@@ -151,7 +172,7 @@ def test_socket_denies_before_broadcast_registration(owner_client, message):
 def test_socket_closes_at_token_expiry(owner_client, signer):
     token = signer(exp=time.time()+0.5)
     with owner_client.websocket_connect('/ws') as socket:
-        socket.send_json({'type': 'auth', 'token': token})
+        socket.send_json(auth_frame(token))
         assert socket.receive_json()['type'] == 'config'
         with pytest.raises(WebSocketDisconnect) as closed:
             while True:
@@ -163,5 +184,24 @@ def test_tampered_signature_is_rejected(owner_client, signer):
     token = signer()
     header, payload, signature = token.split('.')
     signature = ('A' if signature[0] != 'A' else 'B') + signature[1:]
-    response = owner_client.get('/api/auth/session', headers={'Authorization': f'Bearer {header}.{payload}.{signature}'})
+    response = owner_client.get('/api/auth/session', headers=identity(f'{header}.{payload}.{signature}'))
     assert response.status_code == 401
+    assert response.json()['error'] == 'invalid firebase token'
+
+
+def test_firebase_token_alone_is_refused(owner_client, signer):
+    response = owner_client.get('/api/config', headers={'Authorization': 'Bearer ' + signer()})
+    assert response.status_code == 401
+    assert response.json()['error'] == 'user id, firebase token, and company name are required'
+
+
+def test_user_id_must_be_the_token_subject(owner_client, signer):
+    response = owner_client.get('/api/config', headers=identity(signer(), 'not-the-subject'))
+    assert response.status_code == 401
+    assert response.json()['error'] == 'invalid firebase token'
+
+
+def test_company_must_match_this_server(owner_client, signer):
+    response = owner_client.get('/api/config', headers=identity(signer(), company='other'))
+    assert response.status_code == 403
+    assert response.json()['error'] == 'company name does not match this server'

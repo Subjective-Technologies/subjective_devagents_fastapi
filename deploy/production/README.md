@@ -96,25 +96,29 @@ unset static-token configuration no longer opens the API. Static secrets cannot
 bypass owner mode. Direct execution remains disabled.
 
 A valid, unexpired Firebase ID token for this machine's `FIREBASE_PROJECT_ID`
-is enough. There is no owner email or UID allowlist: each account uses its own
-machine. JWT signature, issuer, audience, issue/expiry time and authentication
-time are checked. Authentication uses Firebase's public signing keys; it does
-not mint tokens or need account keys. None of those values are stored in this
-repository.
+is enough once it is presented with the user id and the company name. There is
+no owner email or UID allowlist: each account uses its own machine. JWT
+signature, issuer, audience, issue/expiry time and authentication time are
+checked, and the token subject must equal the user id. Authentication uses
+Firebase's public signing keys; it does not mint tokens or need account keys.
+None of those values are stored in this repository.
 
-The dashboard sends its current Firebase token to its exact DevAgents iframe via
-`postMessage`. The frame validates sender origin/window, then asks FastAPI to
-validate the token before loading chat code. Refresh requests return to the
-dashboard's Firebase SDK. The standalone page also supports Firebase Google and
-email/password sign-in. If Google rejects the standalone hostname because it is
-not in Firebase's authorized-domain list, the page goes to dashboard My Agents;
-a persistent "Continue in dashboard" link is also available. Existing dashboard
-sessions work without adding a new Firebase authorized domain. Google sign-in for
-new sessions still requires the hostname used for that sign-in to be authorized
-in Firebase; no domain settings were changed by this deployment.
+A Firebase caller sends `X-User-Id`, `X-Company-Name`, and the token
+(`Authorization: Bearer` or `X-Firebase-Token`). The company must match this
+server (`SUBJECTIVE_DEVAGENTS_COMPANY_NAME`, or `/company_name` when that
+variable is unset). Public `GET /api/auth/config` returns that company name so
+the sign-in form can prefill it. The name does not authorize anyone by itself.
 
-REST credentials use `Authorization: Bearer`. Owner WebSockets receive the token
-in their first frame and join the event hub only after verification. Connections
+The standalone page asks for those three values. It does not open a Google
+popup or an email form. The dashboard posts them to its exact DevAgents iframe
+via `postMessage` (`devagents:auth`). The frame validates sender origin and
+window, then asks FastAPI to validate the identity before loading chat code.
+Refresh requests return to the dashboard's Firebase SDK. A persistent
+"Continue in dashboard" link stays on the sign-in panel.
+
+REST credentials use those headers. WebSockets receive `token`, `user_id`, and
+`company_name` in their first frame and join the event hub only after
+verification. Connections
 close at token expiry and the browser reconnects with a refreshed token. HTTP
 query-string credentials are not accepted. `/healthz`, `/api/auth/config`, and
 the static login shell remain public; chat data, action endpoints, documentation,
