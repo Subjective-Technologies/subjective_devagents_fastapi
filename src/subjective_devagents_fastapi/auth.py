@@ -1,10 +1,12 @@
-"""Fail-closed owner authentication for HTTP and WebSocket data access.
+"""Fail-closed Firebase authentication for HTTP and WebSocket data access.
 
-The default and production mode is ``owner``: only a verified Firebase ID token
-for the configured owner is accepted. A static secret cannot bypass this mode.
-``token`` explicitly permits the existing automation credential alongside owner
-Firebase tokens. ``development`` is an explicit local/test opt-out when no static
-secret is configured. No credentials are included in public HTML or auth config.
+The default and production mode is ``owner``: any Firebase ID token that verifies
+for this machine's Firebase project is accepted. The virtual machine is the
+account boundary, so a new VM does not need a hardcoded owner email or UID.
+A static secret cannot bypass this mode. ``token`` explicitly permits the
+existing automation credential alongside Firebase tokens. ``development`` is an
+explicit local/test opt-out when no static secret is configured. No credentials
+are included in public HTML or auth config.
 """
 from __future__ import annotations
 
@@ -19,12 +21,12 @@ TOKEN_HEADER = "X-DevAgents-Token"
 
 
 def owner_email() -> str:
-    """Verified owner mailbox for this installation. Empty until the operator sets it."""
+    """Optional address published to the browser as a sign-in hint. Not an allowlist."""
     return os.environ.get("SUBJECTIVE_DEVAGENTS_OWNER_EMAIL", "").strip().lower()
 
 
 def owner_uid() -> str:
-    """Firebase uid of this installation's owner. Empty until the operator sets it."""
+    """Optional uid published to the browser as a sign-in hint. Not an allowlist."""
     return os.environ.get("SUBJECTIVE_DEVAGENTS_OWNER_UID", "").strip()
 
 
@@ -77,16 +79,6 @@ def authenticated_claims(supplied: str) -> dict | None:
     try:
         claims = firebase_auth.verify_firebase_id_token(supplied)
     except firebase_auth.FirebaseTokenError:
-        return None
-    expected_uid = owner_uid()
-    expected_email = owner_email()
-    if not expected_uid and not expected_email:
-        return None
-    uid_ok = bool(expected_uid) and claims.get("sub") == expected_uid
-    email_ok = (bool(expected_email)
-                and str(claims.get("email") or "").lower() == expected_email
-                and claims.get("email_verified") is True)
-    if not (uid_ok or email_ok):
         return None
     return claims
 

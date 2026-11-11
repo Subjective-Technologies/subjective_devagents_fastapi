@@ -220,7 +220,7 @@ CSP and gates itself behind Firebase. Open it with the token already filled in �
 xdg-open "http://127.0.0.1:8090/ssh?token=$(grep -m1 '^SUBJECTIVE_DEVAGENTS_API_TOKEN=' /subjective/.env | cut -d= -f2-)"
 ```
 
-An owner Firebase ID token also authenticates, in every mode — `authenticated_claims`
+A Firebase ID token for the project also authenticates, in every mode — `authenticated_claims`
 falls through from the static secret to Firebase verification — but it expires in an
 hour and cannot be revoked before it does, so use the static token locally.
 

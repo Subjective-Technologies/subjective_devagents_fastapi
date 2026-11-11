@@ -27,7 +27,7 @@ def signer(monkeypatch):
     monkeypatch.setattr(firebase_auth, '_signing_key_for', lambda token: private.public_key())
     def issue(**overrides):
         now = int(time.time())
-        claims = dict(sub=auth.owner_uid(), email='changed@example.com', email_verified=False,
+        claims = dict(sub='firebase-user', email='user@example.com', email_verified=True,
                       aud=firebase_auth.firebase_project_id(), iss=firebase_auth.issuer(),
                       iat=now, auth_time=now, exp=now+3600)
         claims.update(overrides)
@@ -62,11 +62,11 @@ def test_default_and_invalid_modes_require_owner(monkeypatch):
 
 
 @pytest.mark.parametrize('changes', [
-    {},  # UID alone is sufficient, regardless of changed email.
-    {'sub': 'another-uid', 'email': TEST_OWNER_EMAIL, 'email_verified': True},
-    {'sub': 'another-uid', 'email': TEST_OWNER_EMAIL.upper(), 'email_verified': True},
+    {},
+    {'sub': 'another-uid', 'email': 'other@example.com', 'email_verified': True},
+    {'sub': 'another-uid', 'email': 'Other@Example.com', 'email_verified': False},
 ])
-def test_owner_uid_or_verified_email(owner_client, signer, changes):
+def test_any_firebase_account_is_accepted(owner_client, signer, changes):
     assert owner_client.get('/api/auth/session', headers={'Authorization': 'Bearer '+signer(**changes)}).status_code == 200
 
 
@@ -88,8 +88,6 @@ class Relative:
 
 
 @pytest.mark.parametrize('changes', [
-    {'sub': 'other', 'email': 'other@example.com', 'email_verified': True},
-    {'sub': 'other', 'email': TEST_OWNER_EMAIL, 'email_verified': False},
     {'exp': Relative(-120)},
     {'aud': 'wrong-project'},
     {'iss': 'https://securetoken.google.com/wrong-project'},
@@ -102,7 +100,7 @@ def test_invalid_identity_and_claims_rejected(owner_client, signer, changes):
 
 
 def test_static_query_and_unsigned_tokens_cannot_bypass_owner(owner_client, signer):
-    tokens = ['legacy-secret-must-not-bypass', 'bad.token.value', jwt.encode({'sub': TEST_OWNER_UID}, '', algorithm='none')]
+    tokens = ['legacy-secret-must-not-bypass', 'bad.token.value', jwt.encode({'sub': 'firebase-user'}, '', algorithm='none')]
     for token in tokens:
         assert owner_client.get('/api/config', headers={'Authorization': 'Bearer '+token}).status_code == 401
     assert owner_client.get('/api/config', params={'token': signer()}).status_code == 401

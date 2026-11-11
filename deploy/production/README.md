@@ -95,13 +95,12 @@ then reload systemd and restart the backend. Owner mode is also the code default
 unset static-token configuration no longer opens the API. Static secrets cannot
 bypass owner mode. Direct execution remains disabled.
 
-A valid, unexpired Firebase ID token must match this installation's
-`SUBJECTIVE_DEVAGENTS_OWNER_UID` or the verified
-`SUBJECTIVE_DEVAGENTS_OWNER_EMAIL`. The Firebase project is
-`FIREBASE_PROJECT_ID`. JWT signature, issuer, audience, issue/expiry time and
-authentication time are checked. Authentication uses Firebase's public signing
-keys; it does not mint tokens or need account keys. None of those values are
-stored in this repository.
+A valid, unexpired Firebase ID token for this machine's `FIREBASE_PROJECT_ID`
+is enough. There is no owner email or UID allowlist: each account uses its own
+machine. JWT signature, issuer, audience, issue/expiry time and authentication
+time are checked. Authentication uses Firebase's public signing keys; it does
+not mint tokens or need account keys. None of those values are stored in this
+repository.
 
 The dashboard sends its current Firebase token to its exact DevAgents iframe via
 `postMessage`. The frame validates sender origin/window, then asks FastAPI to

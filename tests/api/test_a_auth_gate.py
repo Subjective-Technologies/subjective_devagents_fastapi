@@ -52,8 +52,8 @@ def signer(monkeypatch):
     def issue(**overrides) -> str:
         now = int(time.time())
         claims = {
-            "sub": auth.owner_uid(),
-            "email": auth.owner_email(),
+            "sub": "firebase-user",
+            "email": "user@example.com",
             "email_verified": True,
             "aud": firebase_auth.firebase_project_id(),
             "iss": firebase_auth.issuer(),
@@ -194,31 +194,37 @@ def test_a7_an_absurdly_long_credential_is_refused_without_verification(bare_tok
     assert response.status_code == 401
 
 
-# --- A8: a non-owner identity ----------------------------------------------------------
+# --- A8: which Firebase identities the gate accepts ------------------------------------
 
 
 @pytest.mark.parametrize(
     "changes",
     [
+        pytest.param({}, id="default-account"),
         pytest.param({"sub": "someone-else", "email": "someone@example.com"}, id="another-account"),
         pytest.param(
-            {"sub": "someone-else", "email": TEST_OWNER_EMAIL, "email_verified": False},
-            id="owner-email-unverified",
+            {"sub": "someone-else", "email": "other@example.com", "email_verified": False},
+            id="unverified-email",
         ),
+    ],
+)
+def test_a8_any_firebase_account_is_accepted(owner_client, signer, changes):
+    response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer(**changes)}"})
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
         pytest.param({"exp": int(time.time()) - 60}, id="expired"),
         pytest.param({"aud": "some-other-project"}, id="wrong-audience"),
         pytest.param({"iss": "https://securetoken.google.com/other"}, id="wrong-issuer"),
     ],
 )
-def test_a8_a_non_owner_firebase_token_is_refused(owner_client, signer, changes):
+def test_a8_a_firebase_token_with_bad_claims_is_refused(owner_client, signer, changes):
     response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer(**changes)}"})
     assert response.status_code == 401
     assert response.json() == UNAUTHORIZED
-
-
-def test_a8_the_owner_is_accepted(owner_client, signer):
-    response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer()}"})
-    assert response.status_code == 200
 
 
 def test_a8_a_static_token_cannot_bypass_owner_mode(owner_client):
