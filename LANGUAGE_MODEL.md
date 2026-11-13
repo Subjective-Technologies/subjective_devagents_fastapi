@@ -198,8 +198,9 @@ explicit handoff, exactly as for any other identity-configuration edit (see
 ## Use the API
 
 All routes inherit the existing FastAPI authentication policy. In production owner
-mode, use the owner's Firebase bearer token. Automation tokens work only when
-the existing service is explicitly configured to accept them.
+mode, use a Firebase bearer token for the machine's project. Any account that
+token verifies for is accepted. Automation tokens work only when the existing
+service is explicitly configured to accept them.
 
 | Method | Path | Purpose |
 |---|---|---|

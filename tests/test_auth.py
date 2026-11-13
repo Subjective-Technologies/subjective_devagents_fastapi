@@ -41,6 +41,9 @@ def build_client(monkeypatch, tmp_path, token: str | None):
     (tmp_path / "client" / "web").mkdir(parents=True, exist_ok=True)
     (tmp_path / "client" / "src").mkdir(parents=True, exist_ok=True)
     (tmp_path / "client" / "web" / "index.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_EMAIL", "owner@example.com")
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_UID", "uid-owner-test")
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", "firebase-test-project")
     if token is None:
         monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_API_TOKEN", raising=False)
     else:
@@ -176,49 +179,29 @@ def test_the_token_is_never_stamped_into_the_served_page(guarded):
     assert TOKEN not in html
 
 
-# --- Firebase owner sign-in, alongside the static secret --------------------------------------
+# --- Firebase sign-in, alongside the static secret --------------------------------------------
 #
 # firebase_auth.verify_firebase_id_token is mocked throughout: it is a verbatim port of the
 # same RS256/JWKS verification already used (and already exercised against the real Firebase
-# project) by subjective_pipeline_fastapi and friends. What is new and actually needs testing
-# here is auth.py's own logic layered on top of it — the owner allowlist, and that a bad or
-# mismatched token cannot substitute for the real operator.
+# project) by subjective_pipeline_fastapi and friends. What needs testing here is auth.py's
+# own logic layered on top of it — any verified Firebase account is accepted, and a bad
+# token cannot substitute for one.
 
 
-def test_a_firebase_token_for_the_owner_is_accepted(guarded, monkeypatch):
-    from subjective_devagents_fastapi import auth, firebase_auth
+def test_any_firebase_account_is_accepted(guarded, monkeypatch):
+    from subjective_devagents_fastapi import firebase_auth
 
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_COMPANY_NAME", "acme")
     monkeypatch.setattr(
         firebase_auth,
         "verify_firebase_id_token",
-        lambda token: {"sub": auth.OWNER_UID, "email": auth.OWNER_EMAIL, "email_verified": True},
+        lambda token: {"sub": "someone-else-entirely", "email": "user@example.com", "email_verified": False},
     )
-    response = guarded.get("/api/config", headers={"Authorization": "Bearer not-checked-by-the-mock"})
-    assert response.status_code == 200
-
-
-def test_a_firebase_token_for_the_verified_owner_email_is_accepted(guarded, monkeypatch):
-    from subjective_devagents_fastapi import auth, firebase_auth
-
-    monkeypatch.setattr(
-        firebase_auth,
-        "verify_firebase_id_token",
-        lambda token: {"sub": "someone-else-entirely", "email": auth.OWNER_EMAIL, "email_verified": True},
-    )
-    response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
-    assert response.status_code == 200
-
-
-def test_a_firebase_token_for_the_owner_uid_is_accepted_with_a_different_email(guarded, monkeypatch):
-    """The configured UID remains sufficient when the owner changes email."""
-    from subjective_devagents_fastapi import auth, firebase_auth
-
-    monkeypatch.setattr(
-        firebase_auth,
-        "verify_firebase_id_token",
-        lambda token: {"sub": auth.OWNER_UID, "email": "someone-else@example.com"},
-    )
-    response = guarded.get("/api/config", headers={"Authorization": "Bearer whatever"})
+    response = guarded.get("/api/config", headers={
+        "Authorization": "Bearer not-checked-by-the-mock",
+        "X-User-Id": "someone-else-entirely",
+        "X-Company-Name": "acme",
+    })
     assert response.status_code == 200
 
 

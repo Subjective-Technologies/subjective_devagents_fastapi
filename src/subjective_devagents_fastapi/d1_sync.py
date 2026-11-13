@@ -16,7 +16,16 @@ from typing import Any, Iterable
 
 from .d1_client import SqlExecutor
 
-NAMESPACE = uuid.UUID("2348859b-1168-4ba9-81ba-044442898904")
+def _namespace() -> uuid.UUID:
+    """Stable id salt for this company's D1 database. Not a shared default."""
+    raw = (
+        os.environ.get("SUBJECTIVE_DEVAGENTS_D1_NAMESPACE")
+        or os.environ.get("SUBJECTIVE_DEVAGENTS_D1_DATABASE_ID")
+        or ""
+    ).strip()
+    if not raw:
+        raise ValueError("D1 namespace is not configured")
+    return uuid.UUID(raw)
 
 PROVIDER_ALIASES = {
     "antigravity": "antigravity",
@@ -42,7 +51,7 @@ ALLOWED_ROLES = {"user", "assistant", "system", "tool", "tool_output"}
 
 
 def stable_id(*parts: str) -> str:
-    return str(uuid.uuid5(NAMESPACE, ":".join(str(part) for part in parts)))
+    return str(uuid.uuid5(_namespace(), ":".join(str(part) for part in parts)))
 
 
 def iso_from_ms(value: Any) -> str:

@@ -178,6 +178,7 @@ def owner_client(monkeypatch, tmp_path):
         tmp_path,
         SUBJECTIVE_DEVAGENTS_AUTH_MODE="owner",
         SUBJECTIVE_DEVAGENTS_API_TOKEN=TOKEN,
+        SUBJECTIVE_DEVAGENTS_COMPANY_NAME="acme",
     ) as test_client:
         yield test_client
 

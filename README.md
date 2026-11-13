@@ -165,7 +165,7 @@ A WebSocket that opens a live shell on another machine through
 commands and output streams back as the remote writes it.
 
 ```
-client → {"type":"auth","token":"…"}            (when the socket needs it)
+client → {"type":"auth","token":"…","user_id":"…","company_name":"…"}
 client → {"type":"open","host":"subjective-agents"}
 server → {"type":"hello"|"opening"|"ready", …}
 client → {"type":"input","command":"ls -la"}
@@ -220,9 +220,10 @@ CSP and gates itself behind Firebase. Open it with the token already filled in �
 xdg-open "http://127.0.0.1:8090/ssh?token=$(grep -m1 '^SUBJECTIVE_DEVAGENTS_API_TOKEN=' /subjective/.env | cut -d= -f2-)"
 ```
 
-An owner Firebase ID token also authenticates, in every mode — `authenticated_claims`
-falls through from the static secret to Firebase verification — but it expires in an
-hour and cannot be revoked before it does, so use the static token locally.
+A Firebase sign-in also authenticates, in every mode, when the caller sends the
+user id, the token, and this server's company name. The token subject must be
+that user id. The token expires in an hour and cannot be revoked before it
+does, so use the static token locally.
 
 The remote shell is closed when the socket closes, including when the browser tab
 disappears: the endpoint's cleanup does no `await` before unregistering and closing,
@@ -253,9 +254,9 @@ hold with any LLM under one roof, whether it was answered by a subscription seat
 logged in as an OS user) or a metered API key. A chat looks the same here regardless of
 which vendor served it or how it was paid for.
 
-**Provisioned** on 2026-09-06: database `devagents`, id
-`2348859b-1168-4ba9-81ba-044442898904`, region ENAM — 16 tables, 33 indexes, 4 views, and
-the provider/model catalog seeded. The binding is in `wrangler.toml`.
+The database id is `SUBJECTIVE_DEVAGENTS_D1_DATABASE_ID` on the host that owns
+that Cloudflare account. It is not stored in this repository. The binding name
+in `wrangler.toml` is `devagents`.
 
 Re-applying either file is safe and expected: the schema is entirely `IF NOT EXISTS` and
 the seed is entirely upserts, so this is also how you refresh prices or add a provider.
@@ -365,3 +366,34 @@ python -m pytest tests/ -q
   conversations cannot both claim, token rollups that add up, subscription usage that never
   moves money, a findable pending-approval inbox, and a conversation delete that leaves
   nothing behind — including rows with no turn, which imported history produces.
+# Clear messages and deployment verification
+
+`POST /api/llm/clear-conversation` clears a local chat's saved messages while retaining
+its target, name, and pane assignment. It resets the local execution transcript and
+native session, rejects busy chats, and broadcasts the empty conversation to connected
+clients. Imported provider transcripts return `read_only`; provider-owned files are not
+modified. A failed save leaves the displayed transcript intact. The D1 replica is updated
+on a best-effort basis and its outcome is returned separately as `d1`.
+
+The live DevAgents store is `${SUBJECTIVE_CHAT_HOME}/llm-conversations.json`, with
+execution state in `${SUBJECTIVE_CHAT_HOME}/language_models.sqlite3` (unless
+`SUBJECTIVE_LANGUAGE_MODELS_DB` overrides it). Imported exports live under
+`${SUBJECTIVE_CHAT_HOME}/.subjective_chat_history/context`. D1 database `devagents`
+contains replica tables including `conversations`, `conversation_sessions`, `turns`,
+and `messages`; it is not the source used to reopen a pane.
+
+HTML comments and `X-DevAgents-Version` / `X-DevAgents-Backend-Version` identify the
+frontend and backend Git revisions. `X-DevAgents-Frontend-Source` and
+`X-DevAgents-Backend-Source` identify exact source contents, including uncommitted edits.
+Run this read-only gate against the deployed URL before browser acceptance:
+
+```sh
+python scripts/verify_deployment.py https://devagents.subjectivetechnologies.com \
+  --client-root /subjective/clients/desktop/subjective_chat
+```
+
+It fails on missing or stale markers and also compares the actual served renderer.
+The legacy production checkout and canonical `clients/desktop/subjective_devagents`
+checkout must contain the same frontend changes. Source fingerprints are captured at
+backend startup; restart is required after deployment. The browser regression uses a
+temporary chat home, exercises two panes, clears one, drags it back, and reloads the page.

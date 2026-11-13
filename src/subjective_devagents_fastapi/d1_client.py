@@ -13,10 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 CF_API = "https://api.cloudflare.com/client/v4"
-DEFAULT_ACCOUNT_ID = "5d3bde66e7070ff31dd195de1c8d04cf"
-DEFAULT_DATABASE_ID = "2348859b-1168-4ba9-81ba-044442898904"
 DEFAULT_DATABASE_NAME = "devagents"
-USER_EMAIL = "subjectivetechnologies@gmail.com"
 
 
 class SqlExecutor(Protocol):
@@ -62,8 +59,9 @@ def d1_auth_headers(env: dict[str, str]) -> dict[str, str]:
     # Global API key is what can actually query D1 on this account. Scoped
     # deploy tokens often 401/403 against /d1/database.
     api_key = env.get("CLOUDFLARE_API_KEY_1") or env.get("CLOUDFLARE_API_KEY") or ""
-    if api_key:
-        return {"X-Auth-Email": env.get("CLOUDFLARE_EMAIL") or USER_EMAIL, "X-Auth-Key": api_key}
+    email = (env.get("CLOUDFLARE_EMAIL") or "").strip()
+    if api_key and email:
+        return {"X-Auth-Email": email, "X-Auth-Key": api_key}
     for key in (
         "CLOUDFLARE_API_TOKEN",
         "CLOUDFLARE_API_TOKEN_5",
@@ -84,16 +82,18 @@ class D1Error(RuntimeError):
 class D1Client:
     def __init__(self, env: dict[str, str] | None = None):
         self.env = env or load_cloudflare_env()
-        self.account_id = self.env.get("CLOUDFLARE_ACCOUNT_ID") or DEFAULT_ACCOUNT_ID
+        self.account_id = (self.env.get("CLOUDFLARE_ACCOUNT_ID") or "").strip()
         self.database_id = (
             self.env.get("SUBJECTIVE_DEVAGENTS_D1_DATABASE_ID")
             or self.env.get("DEVAGENTS_D1_DATABASE_ID")
-            or DEFAULT_DATABASE_ID
-        )
+            or ""
+        ).strip()
         self.database_name = self.env.get("SUBJECTIVE_DEVAGENTS_D1_DATABASE_NAME") or DEFAULT_DATABASE_NAME
         self._headers = {"Content-Type": "application/json", **d1_auth_headers(self.env)}
         if "Authorization" not in self._headers and "X-Auth-Key" not in self._headers:
             raise D1Error("No Cloudflare token/key available for D1.")
+        if not self.account_id or not self.database_id:
+            raise D1Error("CLOUDFLARE_ACCOUNT_ID and SUBJECTIVE_DEVAGENTS_D1_DATABASE_ID are required.")
 
     def _url(self) -> str:
         return f"{CF_API}/accounts/{self.account_id}/d1/database/{self.database_id}/query"

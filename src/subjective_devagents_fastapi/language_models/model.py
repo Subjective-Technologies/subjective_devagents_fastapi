@@ -1,5 +1,6 @@
 """LanguageModel facade: identity selection and durable, supervised turn lifecycle."""
 from __future__ import annotations
+from dataclasses import replace
 
 import logging
 import math
@@ -8,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 from .contracts import MAX_ATTACHMENTS, Attachment, Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
 from .registry import IdentityRegistry, image_support
-from .store import TurnStore
+from .store import TERMINAL, TurnStore
 from .strategies import Api, ApiAgent, ClaudeCli, Cli, CodexCli, CursorCli, GrokCli, MAX_CONTEXT_BYTES
 
 log = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class LanguageModel:
         self._futures: dict[str, Future] = {}
         # Image bytes never enter SQLite; an accepted turn's images live here until it starts.
         self._attachments: dict[str, tuple[Attachment, ...]] = {}
+        self._coordination: dict[str, object] = {}
         self._stopping = threading.Event()
 
     def create(self, identity_id: str, history: tuple[Message, ...] = ()) -> dict:
@@ -45,7 +47,7 @@ class LanguageModel:
         return self.store.handoff(conversation_id, self.identities.get(identity_id))
 
     def submit(self, conversation_id: str, prompt: str, request_id: str, timeout: float = 300,
-               attachments: tuple[Attachment, ...] = ()) -> dict:
+               attachments: tuple[Attachment, ...] = (), coordination=None) -> dict:
         if not prompt.strip() or len(prompt.encode()) > MAX_CONTEXT_BYTES:
             raise ModelError("invalid_request", "Prompt must be nonempty and at most 512 KiB.")
         if not request_id or len(request_id) > 128 or not math.isfinite(timeout) or not 1 <= timeout <= 1800:
@@ -61,6 +63,8 @@ class LanguageModel:
                 raise ModelError("unsupported_attachments", "This identity cannot receive images.")
             turn, created = self.store.reserve(conversation_id, identity, request_id, prompt, timeout)
             if created:
+                if coordination is not None:
+                    self._coordination[turn["id"]] = coordination
                 if attachments:
                     self._attachments[turn["id"]] = tuple(attachments)
                     self.store.event(turn["id"], "attachments", {"images": [item.metadata() for item in attachments]})
@@ -70,6 +74,7 @@ class LanguageModel:
                     future.add_done_callback(lambda done, key=turn["id"]: self._forget(key))
                 except RuntimeError:
                     self._attachments.pop(turn["id"], None)
+                    self._coordination.pop(turn["id"], None)
                     self.store.finish(turn["id"], ModelResult("failed", error_code="dispatch_failed"))
                     raise ModelError("unavailable", "Could not dispatch the accepted turn.")
             return turn
@@ -81,6 +86,7 @@ class LanguageModel:
     def _execute(self, identifier: str):
         with self._lock:
             attachments = self._attachments.pop(identifier, ())
+            coordination = self._coordination.pop(identifier, None)
         if not self.store.claim(identifier):
             return
         turn = self.store.turn(identifier)
@@ -89,7 +95,7 @@ class LanguageModel:
             identity = Identity(**turn["identity"])
             history = tuple(Message(**item) for item in self.store.conversation(turn["conversation_id"])["messages"])
             request = ModelRequest(identifier, identity, turn["prompt"], history, turn["session_id"], turn["timeout"],
-                                   attachments)
+                                   attachments, coordination)
             strategy = self.strategies.get(f"{identity.strategy}:{identity.provider}") or self.strategies.get(identity.strategy)
             if strategy is None:
                 raise ModelError("unsupported_provider", "No execution strategy is registered.")
@@ -101,7 +107,27 @@ class LanguageModel:
             # The strategy may have started work. Preserve uncertainty; do not retry.
             log.error("LanguageModel worker exception turn_id=%s exception_type=%s", identifier, type(error).__name__)
             result = ModelResult("interrupted", error_code="worker_exception")
-        self.store.finish(identifier, result)
+        if result.status not in TERMINAL:
+            # An unlisted status used to raise out of finish() and leave the row running.
+            # The sender then polled until the process was restarted.
+            log.error("LanguageModel non-terminal status turn_id=%s status=%s", identifier, result.status)
+            result = ModelResult("interrupted", result.text, result.session_id, result.error_code or result.status)
+        if coordination and result.status == "completed":
+            try:
+                result = replace(result, text=coordination.canonical_reply(result.text))
+            except ModelError as error:
+                result = ModelResult("interrupted", error_code=error.code)
+        try:
+            self.store.finish(identifier, result)
+        except Exception:
+            log.exception("LanguageModel could not record the turn turn_id=%s", identifier)
+            result = ModelResult("interrupted", error_code="worker_exception")
+            self.store.finish(identifier, result)
+        if coordination:
+            try:
+                coordination.finish(result.status, result.error_code)
+            except ModelError as error:
+                self.store.event(identifier, "coordination_reconciliation_required", {"code": error.code})
         log.info("LanguageModel turn finished turn_id=%s status=%s error_code=%s",
                  identifier, result.status, result.error_code)
 

@@ -1,0 +1,98 @@
+{
+  "$schema": "language-models-config-v1",
+  "$comment": "Managed model catalog for TAGGY-3451. Each identity represents one provider+model combination.",
+  "updated_at": "2026-10-06",
+  "identities": [
+    {
+      "id": "claude-opus-4",
+      "provider": "claude",
+      "model": "claude-opus-4",
+      "strategy": "cli",
+      "home": "/home/subjective/.claude",
+      "config_dir": "/home/subjective/.claude",
+      "workspace": "/subjective/workspaces",
+      "executable": "/usr/local/bin/claude",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "provider": "claude",
+      "model": "claude-sonnet-4-5",
+      "strategy": "cli",
+      "home": "/home/subjective/.claude",
+      "config_dir": "/home/subjective/.claude",
+      "workspace": "/subjective/workspaces",
+      "executable": "/usr/local/bin/claude",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    },
+    {
+      "id": "claude-haiku-3-5",
+      "provider": "claude",
+      "model": "claude-haiku-3-5",
+      "strategy": "cli",
+      "home": "/home/subjective/.claude",
+      "config_dir": "/home/subjective/.claude",
+      "workspace": "/subjective/workspaces",
+      "executable": "/usr/local/bin/claude",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    },
+    {
+      "id": "codex-standard",
+      "provider": "codex",
+      "model": "codex-standard",
+      "strategy": "cli",
+      "home": "/home/subjective/.codex",
+      "config_dir": "/home/subjective/.codex",
+      "workspace": "/subjective/workspaces",
+      "executable": "/usr/local/bin/codex",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    },
+    {
+      "id": "cursor-default",
+      "provider": "cursor",
+      "model": "cursor-default",
+      "strategy": "cli",
+      "home": "/home/subjective",
+      "config_dir": "/home/subjective/.config/cursor",
+      "workspace": "/subjective/workspaces",
+      "executable": "/home/subjective/.local/bin/cursor",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    },
+    {
+      "id": "grok-2",
+      "provider": "grok",
+      "model": "grok-2",
+      "strategy": "cli",
+      "home": "/home/subjective",
+      "config_dir": "/home/subjective/.grok",
+      "workspace": "/subjective/workspaces",
+      "executable": "/usr/local/bin/grok",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    },
+    {
+      "id": "grok-2-mini",
+      "provider": "grok",
+      "model": "grok-2-mini",
+      "strategy": "cli",
+      "home": "/home/subjective",
+      "config_dir": "/home/subjective/.grok",
+      "workspace": "/subjective/workspaces",
+      "executable": "/usr/local/bin/grok",
+      "os_user": "subjective",
+      "sandbox": "workspace-write",
+      "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    }
+  ]
+}

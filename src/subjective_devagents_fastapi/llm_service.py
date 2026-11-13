@@ -542,6 +542,7 @@ class LlmService:
         self._history_cache: list[dict] | None = None
         self._sorted_cache: dict | None = None
         self._state_lock = threading.RLock()
+        self._conversation_locks: dict[str, threading.RLock] = {}
         self.on_progress: Callable[[dict], None] | None = None
         Path(self.app_home).mkdir(parents=True, exist_ok=True)
         saved = self._load_state()
@@ -971,6 +972,42 @@ class LlmService:
         self.log("info", "LLM conversation renamed", {"target": key, "label": clean, "local": bool(local)})
         return {"ok": True, "conversation": self.find_conversation(key)}
 
+    def _conversation_lock(self, target: str):
+        with self._state_lock:
+            return self._conversation_locks.setdefault(target, threading.RLock())
+
+    def clear_conversation_messages(self, target: str) -> dict:
+        key = str(target or "")
+        if not key:
+            return {"ok": False, "status": "invalid_request", "error": "Missing conversation target."}
+        lock = self._conversation_lock(key)
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "status": "busy", "error": "Wait for the current response or reload to finish before clearing messages."}
+        try:
+            with self._state_lock:
+                conversation = next((item for item in self.local if item["target"] == key), None)
+                if conversation is None or conversation.get("historyExportPath"):
+                    if conversation or self.find_conversation(key):
+                        return {"ok": False, "status": "read_only", "error": "This is an imported provider transcript. Clear its history in the application that owns it."}
+                    return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+                if key in self.busy:
+                    return {"ok": False, "status": "busy", "error": "Wait for the current response to finish before clearing messages."}
+                before = dict(conversation)
+                def persist():
+                    conversation.update(messages=[], messageCount=0, sessionId="", sourceFile="", exportPath="",
+                                        historyExportPath="", loaded=True, updatedAt=time.time() * 1000)
+                    self._save_state()
+                try:
+                    self.backend.clear_history(key, persist)
+                except Exception:
+                    conversation.clear()
+                    conversation.update(before)
+                    raise
+                self.log("info", "LLM conversation messages cleared", {"target": key, "messageCount": len(before["messages"])})
+                return {"ok": True, "target": key, "conversation": dict(conversation)}
+        finally:
+            lock.release()
+
     def delete_conversation(self, target: str) -> dict:
         """Remove a chat created here, and everything that still refers to it.
 
@@ -1371,6 +1408,15 @@ class LlmService:
         )
 
     def reload_conversation(self, target: str) -> dict | None:
+        lock = self._conversation_lock(target)
+        if not lock.acquire(blocking=False):
+            return self.find_conversation(target, include_messages=True)
+        try:
+            return self._reload_conversation(target)
+        finally:
+            lock.release()
+
+    def _reload_conversation(self, target: str) -> dict | None:
         if self.backend.is_bound(target):
             pending = self.backend.pending(target)
             local = next((item for item in self.local if item["target"] == target), None)
@@ -1700,6 +1746,15 @@ class LlmService:
         return {"ok": True, "target": key, "running": running, "stopped": stopped}
 
     def send_message(self, target: str, text: str, files: list | None = None) -> dict:
+        lock = self._conversation_lock(target)
+        if not lock.acquire(blocking=False):
+            return {"ok": False, "status": "busy", "error": "Conversation is already processing a request."}
+        try:
+            return self._send_message(target, text, files)
+        finally:
+            lock.release()
+
+    def _send_message(self, target: str, text: str, files: list | None = None) -> dict:
         files = files or []
         clean = str(text or "").strip()
         if not clean:
@@ -1803,6 +1858,7 @@ class LlmService:
                 "action": "send",
                 "prompt": clean,
                 "files": files,
+                "coordination": (self.agent_turns.get(target) or {}).get("coordination"),
                 "target": target,
                 "session_id": original_session_id,
                 "new_session": not original_session_id,
@@ -1948,6 +2004,10 @@ class LlmService:
             agent_state = self.agent_turns.get(target) or {}
             header = agent_state.get("header")
             if header:
+                observed = agent_workflow._HEADER.match(reply_text)
+                expected = f"[WF:{header[0]}][agent:{header[1]}]"
+                if observed and observed.group(0).strip() != expected:
+                    self.log("warn", "WORKFLOW_VERSION_CONFLICT", {"target": target, "observed": observed.group(0).strip()[:256], "authoritative": expected})
                 reply_text = agent_workflow.ensure_header(reply_text, *header)
                 evidence = result.get("execution_evidence") if isinstance(result.get("execution_evidence"), dict) else {}
                 if not agent_workflow.execution_claim_has_runtime_evidence(

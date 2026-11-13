@@ -99,6 +99,9 @@ class LegacyLanguageModel:
             db.execute("CREATE TABLE IF NOT EXISTS legacy_projections (target TEXT NOT NULL, turn_id TEXT NOT NULL, PRIMARY KEY(target,turn_id))")
             if "pending_turn" not in {row[1] for row in db.execute("PRAGMA table_info(legacy_bindings)")}:
                 db.execute("ALTER TABLE legacy_bindings ADD COLUMN pending_turn TEXT")
+        # One process owns this journal and has just started: no worker of an HTTP turn
+        # survived. Left "running", such a turn refused every later send as busy.
+        self.model.store.release_orphaned_http_turns()
 
     def identity(self, conversation: dict, execution_required: bool = False) -> Identity:
         provider = conversation["provider"]
@@ -222,7 +225,7 @@ class LegacyLanguageModel:
                         return self.outcome(pending)
                     else:
                         raise ModelError("projection_pending", "Reload the completed previous turn before sending another prompt.")
-                turn = self.model.submit(row[0], request["prompt"], str(uuid.uuid4()), request["timeout"], images)
+                turn = self.model.submit(row[0], request["prompt"], str(uuid.uuid4()), request["timeout"], images, request.get("coordination"))
             register(conversation["target"], lambda: bool(self.model.cancel(turn["id"])))
             cursor = 0
             try:
@@ -272,11 +275,18 @@ class LegacyLanguageModel:
         }
 
     def outcome(self, turn: dict) -> dict:
-        return {"success": turn["status"] == "completed", "status": turn["status"],
+        # A coordination block is the agent's answer, with its runtime evidence retained.
+        return {"success": turn["status"] in {"completed", "blocked"}, "status": turn["status"],
                 "response": turn["text"], "session_id": turn["session_id"] or "",
                 "error": turn["error_code"] or "", "turn_id": turn["id"],
                 "conversation_id": turn["conversation_id"],
                 "execution_evidence": self.execution_evidence(turn)}
+
+    def active_turn(self, target: str) -> bool:
+        """The conversation bound to `target` has a queued or running turn."""
+        with self.model.store.connection() as db:
+            return db.execute("""SELECT 1 FROM turns t JOIN legacy_bindings b ON b.conversation_id=t.conversation_id
+                WHERE b.target=? AND t.status IN ('queued','running') LIMIT 1""", (target,)).fetchone() is not None
 
     def pending(self, target: str) -> dict | None:
         with self.model.store.connection() as db:
@@ -328,6 +338,24 @@ class LegacyLanguageModel:
     def is_bound(self, target: str) -> bool:
         with self.model.store.connection() as db:
             return db.execute("SELECT 1 FROM legacy_bindings WHERE target=?", (target,)).fetchone() is not None
+
+    def clear_history(self, target: str, persist) -> None:
+        """Reset local execution history and its native session without touching CLI files."""
+        with self._lock, self.model.store.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            binding = db.execute("SELECT conversation_id FROM legacy_bindings WHERE target=?", (target,)).fetchone()
+            if binding:
+                identifier = binding[0]
+                active = db.execute("SELECT 1 FROM turns WHERE conversation_id=? AND status IN ('queued','running')",
+                                    (identifier,)).fetchone()
+                if active:
+                    raise ModelError("busy", "Wait for the current response to finish before clearing messages.")
+                db.execute("DELETE FROM events WHERE turn_id IN (SELECT id FROM turns WHERE conversation_id=?)", (identifier,))
+                db.execute("DELETE FROM turns WHERE conversation_id=?", (identifier,))
+                db.execute("DELETE FROM legacy_projections WHERE target=?", (target,))
+                db.execute("UPDATE legacy_bindings SET pending_turn=NULL WHERE target=?", (target,))
+                db.execute("UPDATE conversations SET session_id=NULL, needs_reconciliation=0 WHERE id=?", (identifier,))
+            persist()
 
     def status(self, provider: str) -> dict:
         candidates = [item for item in self.model.identities.public() if item["provider"] == provider]

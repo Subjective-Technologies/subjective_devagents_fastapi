@@ -34,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from . import auth, shell_exec, ssh_terminal
+from .deployment import source_fingerprint
 from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
@@ -171,6 +172,8 @@ class AppState:
         self.client_root: Path = _client_root()
         self.deploy_version: str = WEB_UI_RELEASE
         self.backend_version: str = WEB_UI_RELEASE
+        self.frontend_fingerprint = ""
+        self.backend_fingerprint = ""
         # deploy_version is a git SHA and only changes on a commit — this process restarts
         # far more often than it commits (a plain reload of an uncommitted edit), so it is
         # the wrong signal for "does an open tab need to reload". A fresh id every startup
@@ -213,7 +216,7 @@ class AppState:
             finally:
                 self.history_refreshing = False
 
-    def _sync_d1(self, reason: str) -> dict:
+    def _sync_d1(self, reason: str, conversations: list[dict] | None = None) -> dict:
         """Best-effort replica. Local JSON stays the live store if D1 is down."""
         from .d1_client import D1Client, D1Error, d1_sync_enabled
         from .d1_sync import conversations_for_sync, sync_conversations
@@ -226,7 +229,8 @@ class AppState:
             return {"ok": False, "error": "ChatCore is not initialized."}
         started = time.time()
         try:
-            conversations = conversations_for_sync(self.core.llm_service)
+            if conversations is None:
+                conversations = conversations_for_sync(self.core.llm_service)
             default_log("info", "D1 conversation sync start", {"reason": reason, "conversations": len(conversations)})
             stats = sync_conversations(D1Client(), conversations)
             stats.update({"ok": True, "reason": reason, "ms": int((time.time() - started) * 1000)})
@@ -257,6 +261,8 @@ async def lifespan(application: FastAPI):
     state.deploy_version = resolve_deploy_version(state.client_root)
     # The UI can live in a different repository. Its SHA cannot identify this API.
     state.backend_version = resolve_deploy_version(Path(__file__).resolve().parents[2])
+    state.frontend_fingerprint = source_fingerprint(state.client_root, ("src", "web"))
+    state.backend_fingerprint = source_fingerprint(Path(__file__).resolve().parents[2], ("src",))
     state.instance_id = str(uuid.uuid4())
     core = ChatCore(
         root=str(state.client_root),
@@ -353,13 +359,16 @@ async def require_api_token(request: Request, call_next):
             return JSONResponse(status_code=401, content={"ok": False, "error": "A workflow read token is required."})
         return await call_next(request)
     if auth.path_requires_token(request.url.path):
-        supplied = auth.token_from_request(request.headers)
-        if not await asyncio.to_thread(auth.token_is_valid, supplied):
+        try:
+            claims = await asyncio.to_thread(auth.authenticate_headers, request.headers)
+        except auth.AuthFailure as failure:
+            headers = {"WWW-Authenticate": "Bearer"} if failure.status == 401 else {}
             return JSONResponse(
-                status_code=401,
-                content={"ok": False, "error": "Unauthorized."},
-                headers={"WWW-Authenticate": "Bearer"},
+                status_code=failure.status,
+                content={"ok": False, "error": failure.message},
+                headers=headers,
             )
+        request.state.devagents_claims = claims
     return await call_next(request)
 
 
@@ -368,6 +377,8 @@ async def add_version_and_no_store(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-DevAgents-Version", state.deploy_version)
     response.headers.setdefault("X-DevAgents-Backend-Version", state.backend_version)
+    response.headers["X-DevAgents-Frontend-Source"] = state.frontend_fingerprint
+    response.headers["X-DevAgents-Backend-Source"] = state.backend_fingerprint
     if request.url.path.startswith("/api/"):
         # Without this a plain reload can serve a stale cached GET
         # /api/llm/conversations (e.g. a chat name from before a rename).
@@ -408,7 +419,7 @@ async def healthz() -> dict:
 
 @app.get("/api/auth/config")
 async def api_auth_config() -> dict:
-    return {"mode": auth.auth_mode(), "required": auth.auth_enabled()}
+    return auth.public_client_config()
 
 
 @app.get("/api/auth/session")
@@ -423,6 +434,8 @@ async def api_version() -> dict:
         "release": WEB_UI_RELEASE,
         "version": state.deploy_version,
         "backendVersion": state.backend_version,
+        "frontendSource": state.frontend_fingerprint,
+        "backendSource": state.backend_fingerprint,
         "instanceId": state.instance_id,
         "servedAt": datetime.now(timezone.utc).isoformat(),
     }
@@ -627,6 +640,21 @@ async def api_llm_delete_conversation(body: dict = Body(default={})) -> dict:
         return result
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/clear-conversation")
+async def api_llm_clear_conversation(body: dict = Body(default={})) -> dict:
+    instance = core()
+    target = str(body.get("target") or "")
+    try:
+        result = await asyncio.to_thread(instance.llm_service.clear_conversation_messages, target)
+        if result.get("ok"):
+            instance.broadcast("llm-conversation", {"conversation": result["conversation"]})
+            result["d1"] = await asyncio.to_thread(state._sync_d1, "clear-conversation", [result["conversation"]])
+        return result
+    except Exception as error:
+        default_log("error", "LLM conversation clear failed", {"target": target, "exceptionType": type(error).__name__})
+        return {"ok": False, "error": "Could not save cleared history. Please retry."}
 
 
 @app.post("/api/llm/activate-conversation")
@@ -924,6 +952,49 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
         except Exception:
             instance.llm_service.settle_send(target)
             raise
+    channel = None
+    binding = body.get("coordination")
+    journal = instance.llm_service.backend.model.store
+    with journal.connection() as db:
+        bound_channel = db.execute("SELECT channel_id,actor_id FROM channel_bindings WHERE target=?", (target,)).fetchone()
+    if bound_channel and binding is None:
+        instance.llm_service.settle_send(target)
+        return JSONResponse(status_code=409, content={"ok": False, "error": "channel_dispatch_required"})
+    if binding is not None and (target in instance.llm_service.busy or instance.llm_service.backend.active_turn(target)):
+        # Refuse before the dispatch is started: a started dispatch is spent, and the page's
+        # retry of the same dispatch would then come back as DISPATCH_SUPPRESSED.
+        instance.llm_service.settle_send(target)
+        return JSONResponse(status_code=409, content={"ok": False, "status": "busy",
+                                                      "error": "Conversation is already processing a request."})
+    if binding is not None:
+        from .channel_coordination import ChannelSession
+        from .language_models.contracts import ModelError
+        try:
+            actor = str((agent or {}).get("user_id") or binding.get("agent_id") or "")
+            channel = ChannelSession(binding, actor, request.headers.get("authorization", ""))
+            identity = await asyncio.to_thread(instance.llm_service.backend.identity, conversation)
+            # Native CLIs have private tool loops that cannot honor per-tool leases.
+            # Fail explicitly, never claim coordination enforcement on those runtimes.
+            if identity.strategy != "api_agent":
+                raise ModelError("coordinated_runtime_required", "Choose an API-agent provider for coordinated execution; native CLI tool fencing is unavailable")
+            version = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or ("inline",))[0]
+            if bound_channel and (bound_channel["channel_id"], bound_channel["actor_id"]) != (binding.get("channel_id"), actor):
+                raise ModelError("channel_binding_conflict", "Conversation belongs to another channel/agent")
+            # The role name the definition told the model to sign with (header[1]), not the AI
+            # user id: otherwise every correct reply was logged as WORKFLOW_VERSION_CONFLICT.
+            role = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or (None, None))[1]
+            await asyncio.to_thread(channel.start, identity, version, role)
+            with journal.connection() as db:
+                db.execute("INSERT OR IGNORE INTO channel_bindings VALUES(?,?,?)", (target, binding["channel_id"], actor))
+            exported_identity = (instance.llm_service.agent_turns.get(target) or {}).get("workflow_identity", {})
+            if exported_identity.get("legacy_file_version") not in (None, version):
+                await asyncio.to_thread(channel.call, "gate", id="published-identity-" + binding["instance_id"],
+                    kind="WORKFLOW_VERSION_DIAGNOSTIC", result="failed", metadata=exported_identity)
+            instance.llm_service.agent_turns.setdefault(target, {})["coordination"] = channel
+        except ModelError as error:
+            (instance.llm_service.agent_turns.get(target) or {}).pop("definition", None)
+            instance.llm_service.settle_send(target)
+            return JSONResponse(status_code=409, content={"ok": False, "error": error.code})
     # Cloudflare (and most reverse proxies) close idle HTTP at ~100s with 524, while
     # Cursor/Claude/Codex turns are allowed 30 minutes. Accept here and deliver the
     # assistant reply on the WebSocket (llm-message / llm-busy / system).
@@ -948,6 +1019,12 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
         except Exception as error:  # noqa: BLE001
             default_log("error", "LLM send background crash", {"target": target, "message": str(error)})
         finally:
+            if channel and not channel.closed:
+                try:
+                    await asyncio.to_thread(channel.finish, "failed")
+                except Exception:
+                    default_log("error", "Channel dispatch requires reconciliation", {"target": target})
+            (instance.llm_service.agent_turns.get(target) or {}).pop("coordination", None)
             instance.llm_service.settle_send(target)
 
     asyncio.create_task(run_send())
@@ -1149,30 +1226,36 @@ async def api_exec(body: dict = Body(default={})) -> dict:
 async def _authenticate_socket(socket: WebSocket) -> tuple[bool, dict | None]:
     """Accept and authenticate a socket, or close it and report failure.
 
-    Returns `(ok, claims)`. Owner browsers send credentials in the first frame rather
-    than the query string, because URLs are logged and a token in one outlives the
-    request. Shared by every socket this service exposes so a new one cannot quietly
-    ship with weaker authentication than /ws.
+    Returns `(ok, claims)`. Browsers send the Firebase identity in the first frame
+    (``token``, ``user_id``, ``company_name``) rather than the query string, because
+    URLs are logged and a token in one outlives the request. Header credentials are
+    accepted when the caller can set them. Shared by every socket this service
+    exposes so a new one cannot quietly ship with weaker authentication than /ws.
     """
     accepted = False
     claims = None
     if auth.auth_enabled():
-        supplied = auth.token_from_request(socket.headers, socket.query_params)
-        if auth.auth_mode() in {"owner", "token"} and not supplied:
+        try:
+            claims = await asyncio.to_thread(auth.authenticate_headers, socket.headers, socket.query_params)
+        except auth.AuthFailure as failure:
+            if not failure.incomplete or auth.auth_mode() not in {"owner", "token"}:
+                await socket.close(code=4403 if failure.status == 403 else 1008)
+                return False, None
             await socket.accept()
             accepted = True
             try:
                 message = await asyncio.wait_for(socket.receive_json(), timeout=5)
                 if not isinstance(message, dict) or message.get("type") != "auth":
                     raise ValueError("Expected authentication")
-                supplied = message.get("token", "")
+                claims = await asyncio.to_thread(
+                    auth.authenticate_headers, socket.headers, socket.query_params, message,
+                )
+            except auth.AuthFailure as presented:
+                await socket.close(code=4403 if presented.status == 403 else 4401)
+                return False, None
             except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
                 await socket.close(code=4401)
                 return False, None
-        claims = await asyncio.to_thread(auth.authenticated_claims, supplied)
-        if claims is None:
-            await socket.close(code=4401 if accepted else 1008)
-            return False, None
     if not accepted:
         await socket.accept()
     return True, claims
@@ -1237,7 +1320,7 @@ async def websocket_ssh_terminal(socket: WebSocket) -> None:
     """A live shell on another machine, for the duration of this socket.
 
     Protocol, client to server:
-      {"type": "auth",      "token": "..."}          (only when the socket needs it)
+      {"type": "auth", "token": "...", "user_id": "...", "company_name": "..."}
       {"type": "open",      "host": "...", ...}      connection fields; host required
                             "pty": true, "cols": 120, "rows": 32   for terminal mode
       {"type": "input",     "command": "ls -la"}     one command (both modes)
@@ -1794,7 +1877,7 @@ def _stamp_api_base(html: str) -> str:
                 r"\s*https?://[^\s;]+",
                 lambda match: match.group(0) if match.group(0).strip() in {
                     "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com",
-                    "https://www.googleapis.com", "https://subjectivetechnologies-login.firebaseapp.com",
+                    "https://www.googleapis.com",
                     # Cloudflare injects its Web Analytics beacon into every HTML response on
                     # the zone; the beacon posts its measurements to this origin. Dropping it
                     # here would leave script-src allowing the script and connect-src blocking
@@ -1815,11 +1898,50 @@ def _stamp_api_base(html: str) -> str:
     )
 
 
+def _firebase_auth_origin() -> str:
+    domain = os.environ.get("FIREBASE_AUTH_DOMAIN", "").strip().rstrip("/")
+    if not domain:
+        return ""
+    if domain.startswith("http://") or domain.startswith("https://"):
+        return domain
+    return f"https://{domain}"
+
+
+def _stamp_firebase_origin(html: str) -> str:
+    """Add this installation's Firebase auth host to CSP. The checkout names none."""
+    import re
+
+    origin = _firebase_auth_origin()
+    if not origin or origin in html:
+        return html
+
+    def add_origin(tag_match: "re.Match[str]") -> str:
+        tag = tag_match.group(0)
+
+        def insert(directive: str, text: str) -> str:
+            return re.sub(
+                rf"({directive}[^;\"]*)(;)",
+                lambda match: f"{match.group(1)} {origin}{match.group(2)}",
+                text,
+                count=1,
+            )
+
+        return insert("frame-src", insert("connect-src", tag))
+
+    return re.sub(
+        r'<meta\s+http-equiv="Content-Security-Policy"[^>]*>',
+        add_origin,
+        html,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def _stamp_html(html: str) -> str:
     """Replace the static placeholder so View Source / curl shows the live git SHAs."""
     import re
 
-    out = _stamp_api_base(str(html))
+    out = _stamp_firebase_origin(_stamp_api_base(str(html)))
     stamp_comment = deploy_stamp_comment()
     if "DEVAGENTS_DEPLOY_VERSION" in out:
         out = out.replace("DEVAGENTS_DEPLOY_VERSION", state.deploy_version)

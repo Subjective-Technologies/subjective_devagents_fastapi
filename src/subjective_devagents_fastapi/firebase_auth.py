@@ -15,14 +15,22 @@ import time
 import jwt
 from jwt import PyJWKClient, PyJWKClientError
 
-# Matches the marketing site's config/firebaseConfig.js and subjective_user_service.
-FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "subjectivetechnologies-login")
+# Google's public Firebase token signing keys. Not a customer service account.
 JWKS_URL = (
     "https://www.googleapis.com/service_accounts/v1/jwk/"
     "securetoken@system.gserviceaccount.com"
 )
-ISSUER = f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
 _LEEWAY_SECONDS = 30
+
+
+def firebase_project_id() -> str:
+    """This installation's Firebase project. Empty until the operator sets it."""
+    return os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+
+
+def issuer() -> str:
+    project = firebase_project_id()
+    return f"https://securetoken.google.com/{project}" if project else ""
 
 _jwk_client = PyJWKClient(JWKS_URL, cache_keys=True, max_cached_keys=16, lifespan=3600, timeout=5)
 
@@ -48,12 +56,16 @@ def verify_firebase_id_token(token: str) -> dict:
         header = jwt.get_unverified_header(token)
         if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str) or not 0 < len(header["kid"]) <= 256:
             raise FirebaseTokenError("bad_header")
+        project = firebase_project_id()
+        expected_issuer = issuer()
+        if not project or not expected_issuer:
+            raise FirebaseTokenError("project_unconfigured")
         payload = jwt.decode(
             token,
             _signing_key_for(token),
             algorithms=["RS256"],
-            audience=FIREBASE_PROJECT_ID,
-            issuer=ISSUER,
+            audience=project,
+            issuer=expected_issuer,
             options={"require": ["exp", "iat", "iss", "aud", "sub", "auth_time"]},
             leeway=_LEEWAY_SECONDS,
         )

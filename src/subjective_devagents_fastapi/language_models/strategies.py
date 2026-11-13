@@ -425,9 +425,8 @@ class Api(ModelStrategy):
                 async with client.stream("POST", request.identity.api_base_url.rstrip("/") + "/chat/completions",
                                          headers={"Authorization": f"Bearer {token}"}, json=payload) as response:
                     if response.status_code != 200:
-                        code = ("authentication_required" if response.status_code in {401, 403}
-                                else "rate_limited" if response.status_code == 429 else "api_http_error")
-                        return ModelResult("failed", error_code=code)
+                        detail = (await response.aread()).decode("utf-8", "replace")[:2000]
+                        return ModelResult("failed", error_code=http_error_code(response.status_code, detail))
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
@@ -516,7 +515,10 @@ AGENT_TOOLS = {
         "description": "Ask the user a clarifying question when genuinely uncertain, instead of "
                        "guessing. Ends your turn immediately; their next reply answers it.",
         "parameters": {"type": "object", "properties": {
-            "question": {"type": "string"}},
+            "question": {"type": "string"},
+            "decision_id": {"type": "string"},
+            "category": {"type": "string", "enum": ["BUSINESS_DECISION", "SECURITY_AUTHORIZATION", "DESTRUCTIVE_ACTION_AUTHORIZATION", "EXTERNAL_USER_ONLY_INFORMATION", "TECHNICAL_INTERNAL_BLOCKER"]},
+            "scope": {"type": "string"}, "discovery_id": {"type": "string"}},
             "required": ["question"]}}},
 }
 MUTATING_TOOLS = frozenset({"Bash", "Write", "Edit"})
@@ -547,6 +549,27 @@ def agent_image_block(attachment) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:{attachment.mime_type};base64,{encoded}"}}
 
 
+_QUOTA_WORDS = ("usage limit", "quota", "insufficient_quota", "billing", "credit balance", "exceeded your")
+
+
+def http_error_code(status: int, body: str = "") -> str:
+    """An error code for a provider's non-200 answer that says what the operator can do.
+
+    A plan's usage limit often comes back as 403 or 503 (the proxy has no account left),
+    not 429, so the body decides it before the status does.
+    """
+    text = (body or "").lower()
+    if any(word in text for word in _QUOTA_WORDS):
+        return "quota_exhausted"
+    if status == 429:
+        return "rate_limited"
+    if status in {401, 403}:
+        return "authentication_required"
+    if status == 503:
+        return "provider_unavailable"
+    return "api_http_error"
+
+
 def agent_text_bytes(messages: list) -> int:
     """Context-size accounting that counts prompt/history/tool-result text, not image bytes.
 
@@ -564,6 +587,78 @@ def agent_text_bytes(messages: list) -> int:
                 if isinstance(part, dict) and part.get("type") == "text":
                     total += len(str(part.get("text") or "").encode())
     return total
+
+
+# The conversation is replayed on every request. Its earlier turns may use this much of the
+# context, so the current turn's tool rounds keep the rest.
+HISTORY_BUDGET_BYTES = int(MAX_CONTEXT_BYTES * 0.6)
+# Tool results of the current turn kept whole when older ones are shortened to fit.
+KEEP_RECENT_TOOL_RESULTS = 4
+# The first message of a workflow agent's conversation carries its definition (its role).
+DEFINITION_MARKER = "[[subjective-agent-definition]]"
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+def fit_history(messages: list, budget: int = HISTORY_BUDGET_BYTES) -> tuple[list, int]:
+    """Drop the oldest earlier turns until the request fits `budget`; returns (messages, dropped).
+
+    `messages` is [system, *history, latest user message]. The agent definition (a history
+    message carrying DEFINITION_MARKER) is kept, the latest message always is, and history
+    restarts on a user message so roles keep alternating. A note on the latest message says
+    how much was dropped, so the agent knows its memory of this conversation is partial.
+    """
+    if agent_text_bytes(messages) <= budget or len(messages) <= 2:
+        return messages, 0
+    system, history, latest = messages[0], list(messages[1:-1]), messages[-1]
+    pinned = [m for m in history[:1] if m.get("role") == "user" and DEFINITION_MARKER in _text_of(m.get("content"))]
+    # A pinned definition keeps the answer that followed it, so the pair stays a pair.
+    if pinned and len(history) > 1 and history[1].get("role") == "assistant":
+        pinned.append(history[1])
+    rest = history[len(pinned):]
+    dropped = 0
+    while rest and agent_text_bytes([system, *pinned, *rest, latest]) > budget:
+        rest.pop(0)
+        dropped += 1
+    while rest and rest[0].get("role") != "user":
+        rest.pop(0)
+        dropped += 1
+    if not dropped:
+        return messages, 0
+    note = (f"[Note: the {dropped} oldest message(s) of this conversation were left out to fit the "
+            "context window. The channel history in this message is the record; ask if you need more.]\n")
+    content = latest.get("content")
+    if isinstance(content, list):
+        content = [{"type": "text", "text": note}, *content]
+    else:
+        content = note + str(content or "")
+    return [system, *pinned, *rest, {**latest, "content": content}], dropped
+
+
+def shorten_tool_results(messages: list, first_of_turn: int, budget: int = MAX_CONTEXT_BYTES,
+                         keep: int = KEEP_RECENT_TOOL_RESULTS) -> int:
+    """Replace this turn's oldest tool results with a short note until the request fits.
+
+    The newest `keep` results stay whole. Returns how many were shortened.
+    """
+    tool_indexes = [index for index in range(first_of_turn, len(messages)) if messages[index].get("role") == "tool"]
+    shortened = 0
+    for index in tool_indexes[:-keep] if keep else tool_indexes:
+        if agent_text_bytes(messages) <= budget:
+            break
+        text = _text_of(messages[index].get("content"))
+        if text.startswith("[Earlier tool output left out"):
+            continue
+        messages[index] = {**messages[index],
+                           "content": f"[Earlier tool output left out to fit the context window: {len(text)} chars. Run it again if you need it.]"}
+        shortened += 1
+    return shortened
 
 
 def agent_system_prompt(identity) -> str:
@@ -774,8 +869,10 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
             return "Error: file_path is required."
         content = str(arguments.get("content") or "")
         before = _read_if_exists(path, identity, transport, cancelled, timeout)
-        _run_bounded(("sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "write", path),
+        written = _run_bounded(("sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "write", path),
                      content, identity, transport, cancelled, timeout)
+        if written.startswith("Error:") or "[exit code " in written:
+            return "Error: file write failed: " + written
         diff = _unified_diff(path, before, content)
         if diff:
             emit("file_diff", {"path": path, "status": "created" if not before else "modified", "diff": diff})
@@ -791,7 +888,9 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
         if occurrences != 1:
             return f"Error: old_string must match exactly once; found {occurrences} occurrence(s)."
         updated = current.replace(old, new, 1)
-        _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), updated, identity, transport, cancelled, timeout)
+        written = _run_bounded(("sh", "-c", 'cat > "$1"', "write", path), updated, identity, transport, cancelled, timeout)
+        if written.startswith("Error:") or "[exit code " in written:
+            return "Error: file edit failed: " + written
         diff = _unified_diff(path, current, updated)
         if diff:
             emit("file_diff", {"path": path, "status": "modified", "diff": diff})
@@ -827,7 +926,13 @@ class ApiAgent(ModelStrategy):
         self.transport = transport
 
     def run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
-        return asyncio.run(self._run(request, emit, cancelled))
+        result = asyncio.run(self._run(request, emit, cancelled))
+        revocation = getattr(request.coordination, "revocation", None)
+        if result.status == "cancelled" and revocation and not cancelled():
+            # Nobody pressed Stop: the channel took the write lease away. Say so, instead
+            # of the operator-stop message the UI shows for a plain cancellation.
+            return ModelResult("failed", error_code="coordination_lease_lost:" + revocation)
+        return result
 
     async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
         if cancelled():
@@ -837,6 +942,12 @@ class ApiAgent(ModelStrategy):
         if not token:
             return ModelResult("failed", error_code="authentication_required")
         tools = agent_tool_set(identity)
+        coordination = request.coordination
+        if coordination:
+            from ..channel_coordination import CONTROL_TOOL
+            tools["Coordination"] = CONTROL_TOOL
+            original_cancelled = cancelled
+            cancelled = lambda: original_cancelled() or coordination.revoked()
         emit("runtime", {
             "identity_id": identity.id,
             "strategy": identity.strategy,
@@ -845,12 +956,20 @@ class ApiAgent(ModelStrategy):
             "effective_tools": sorted(tools),
         })
         messages = [{"role": "system", "content": agent_system_prompt(identity)}]
+        if coordination:
+            messages[0]["content"] += "\n" + coordination.context()
         messages += [{"role": m.role, "content": m.content} for m in request.history]
         if request.attachments:
             content = [{"type": "text", "text": request.prompt}] + [agent_image_block(a) for a in request.attachments]
         else:
             content = request.prompt
         messages.append({"role": "user", "content": content})
+        # A long conversation would otherwise exceed the context on every later turn:
+        # leave out its oldest turns instead of failing.
+        messages, dropped = fit_history(messages)
+        if dropped:
+            emit("activity", {"text": f"Left out the {dropped} oldest messages to fit the context window"})
+        first_of_turn = len(messages)
         transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
                                        if identity.ssh_host else LocalProcess())
         deadline = time.monotonic() + request.timeout
@@ -862,13 +981,25 @@ class ApiAgent(ModelStrategy):
             if remaining <= 0:
                 return ModelResult("timed_out", error_code="timed_out")
             if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
-                return ModelResult("failed", error_code="context_too_large")
+                # Long tool loops: shorten this turn's oldest tool output, then older history.
+                if shorten_tool_results(messages, first_of_turn):
+                    emit("activity", {"text": "Shortened earlier tool output to fit the context window"})
+                if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
+                    turn_part = messages[first_of_turn - 1:]
+                    fitted, more = fit_history(messages[:first_of_turn], MAX_CONTEXT_BYTES - agent_text_bytes(turn_part[1:]))
+                    if more:
+                        messages = fitted + turn_part[1:]
+                        first_of_turn = len(fitted)
+                if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
+                    return ModelResult("failed", error_code="context_too_large")
             outcome = await self._call(identity, token, messages, tools, remaining, cancelled)
             if isinstance(outcome, ModelResult):
                 return outcome
             message, finish_reason = outcome
             text = message.get("content") or ""
-            if isinstance(text, str) and text.strip():
+            from ..channel_coordination import concrete_user_decision
+            user_decision = bool(coordination and isinstance(text, str) and "NEEDS INPUT:" in text and concrete_user_decision(text))
+            if isinstance(text, str) and text.strip() and not user_decision:
                 emit("message", {"text": text})
             calls = message.get("tool_calls") or []
             assistant_entry = {"role": "assistant", "content": message.get("content")}
@@ -876,6 +1007,8 @@ class ApiAgent(ModelStrategy):
                 assistant_entry["tool_calls"] = calls
             messages.append(assistant_entry)
             if not calls:
+                if user_decision:
+                    return ModelResult("blocked", "[COORDINATION] CLASSIFIED_DECISION_REQUIRED: use AskUser with decision ID/category, or record internal discovery.")
                 if finish_reason != "stop" or not isinstance(text, str) or not text.strip():
                     return ModelResult("failed", error_code="incomplete_provider_output")
                 if snapshot:
@@ -894,14 +1027,14 @@ class ApiAgent(ModelStrategy):
                 if name == "Bash" and snapshot is None:
                     snapshot = workspace_snapshot(identity, transport, cancelled, min(30.0, remaining)) or {}
                 result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, emit,
-                                             edited)
+                                             edited, coordination)
                 if isinstance(result_text, ModelResult):
                     return result_text
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
         return ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod
-    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None):
+    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None, coordination=None):
         name = (call.get("function") or {}).get("name") or ""
         call_id = str(call.get("id") or "")
         try:
@@ -912,6 +1045,15 @@ class ApiAgent(ModelStrategy):
             return "Error: tool arguments were not valid JSON."
         if name not in tools:
             return f"Error: tool {name!r} is not permitted in this session."
+        if coordination:
+            try:
+                if name == "Coordination":
+                    return coordination.tool(arguments.get("operation"), arguments.get("data", {}))
+                if name == "AskUser":
+                    return ModelResult("completed", coordination.ask(arguments))
+                coordination.guard(name, arguments)
+            except ModelError as error:
+                return f"Error: {error.code}: {error}"
         if name == "AskUser":
             question = str(arguments.get("question") or "").strip()
             if not question:
@@ -935,6 +1077,8 @@ class ApiAgent(ModelStrategy):
             })
             return abort.result
         ok = not result.startswith("Error:") and "[exit code " not in result
+        if coordination and ok:
+            coordination.observed(name, True)
         emit("tool_result", {
             "tool_call_id": call_id,
             "name": name,
@@ -953,9 +1097,7 @@ class ApiAgent(ModelStrategy):
                 response = await client.post(identity.api_base_url.rstrip("/") + "/chat/completions",
                                              headers={"Authorization": f"Bearer {token}"}, json=payload)
                 if response.status_code != 200:
-                    code = ("authentication_required" if response.status_code in {401, 403}
-                            else "rate_limited" if response.status_code == 429 else "api_http_error")
-                    return ModelResult("failed", error_code=code)
+                    return ModelResult("failed", error_code=http_error_code(response.status_code, response.text[:2000]))
                 try:
                     data = response.json()
                     choice = data["choices"][0]

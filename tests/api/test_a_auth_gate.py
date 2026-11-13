@@ -17,6 +17,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from subjective_devagents_fastapi import auth, firebase_auth
 
 from .conftest import TOKEN, build_client
+
+TEST_OWNER_EMAIL = "owner@example.com"
+TEST_OWNER_UID = "uid-owner-test"
+TEST_FIREBASE_PROJECT = "firebase-test-project"
 from .helpers import UNAUTHORIZED
 
 # One path per protected prefix, plus the endpoints that actually expose data or act.
@@ -40,16 +44,20 @@ PROTECTED_PATHS = [
 def signer(monkeypatch):
     """Issue real RS256 tokens the app verifies for real, against a key we hold."""
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_EMAIL", TEST_OWNER_EMAIL)
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_OWNER_UID", TEST_OWNER_UID)
+    monkeypatch.setenv("FIREBASE_PROJECT_ID", TEST_FIREBASE_PROJECT)
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_COMPANY_NAME", "acme")
     monkeypatch.setattr(firebase_auth, "_signing_key_for", lambda token: private.public_key())
 
     def issue(**overrides) -> str:
         now = int(time.time())
         claims = {
-            "sub": auth.OWNER_UID,
-            "email": auth.OWNER_EMAIL,
+            "sub": "firebase-user",
+            "email": "user@example.com",
             "email_verified": True,
-            "aud": firebase_auth.FIREBASE_PROJECT_ID,
-            "iss": firebase_auth.ISSUER,
+            "aud": firebase_auth.firebase_project_id(),
+            "iss": firebase_auth.issuer(),
             "iat": now,
             "auth_time": now,
             "exp": now + 3600,
@@ -89,7 +97,9 @@ def test_a2_public_paths_answer_without_a_credential(bare_token_client, path):
 
 def test_a2_the_auth_config_endpoint_never_leaks_the_token(bare_token_client):
     body = bare_token_client.get("/api/auth/config").json()
-    assert body == {"mode": "token", "required": True}
+    assert body["mode"] == "token"
+    assert body["required"] is True
+    assert body["firebase"]["apiKey"] == ""
     assert TOKEN not in bare_token_client.get("/api/auth/config").text
 
 
@@ -185,31 +195,47 @@ def test_a7_an_absurdly_long_credential_is_refused_without_verification(bare_tok
     assert response.status_code == 401
 
 
-# --- A8: a non-owner identity ----------------------------------------------------------
+# --- A8: which Firebase identities the gate accepts ------------------------------------
 
 
 @pytest.mark.parametrize(
     "changes",
     [
+        pytest.param({}, id="default-account"),
         pytest.param({"sub": "someone-else", "email": "someone@example.com"}, id="another-account"),
         pytest.param(
-            {"sub": "someone-else", "email": auth.OWNER_EMAIL, "email_verified": False},
-            id="owner-email-unverified",
+            {"sub": "someone-else", "email": "other@example.com", "email_verified": False},
+            id="unverified-email",
         ),
+    ],
+)
+def test_a8_any_firebase_account_is_accepted(owner_client, signer, changes):
+    token = signer(**changes)
+    response = owner_client.get("/api/config", headers={
+        "Authorization": f"Bearer {token}",
+        "X-User-Id": changes.get("sub", "firebase-user"),
+        "X-Company-Name": "acme",
+    })
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
         pytest.param({"exp": int(time.time()) - 60}, id="expired"),
         pytest.param({"aud": "some-other-project"}, id="wrong-audience"),
         pytest.param({"iss": "https://securetoken.google.com/other"}, id="wrong-issuer"),
     ],
 )
-def test_a8_a_non_owner_firebase_token_is_refused(owner_client, signer, changes):
-    response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer(**changes)}"})
+def test_a8_a_firebase_token_with_bad_claims_is_refused(owner_client, signer, changes):
+    token = signer(**changes)
+    response = owner_client.get("/api/config", headers={
+        "Authorization": f"Bearer {token}",
+        "X-User-Id": changes.get("sub", "firebase-user"),
+        "X-Company-Name": "acme",
+    })
     assert response.status_code == 401
-    assert response.json() == UNAUTHORIZED
-
-
-def test_a8_the_owner_is_accepted(owner_client, signer):
-    response = owner_client.get("/api/config", headers={"Authorization": f"Bearer {signer()}"})
-    assert response.status_code == 200
+    assert response.json()["error"] == "invalid firebase token"
 
 
 def test_a8_a_static_token_cannot_bypass_owner_mode(owner_client):
@@ -241,7 +267,9 @@ def test_a9_development_mode_is_the_only_open_one(monkeypatch, tmp_path):
         SUBJECTIVE_DEVAGENTS_API_TOKEN=None,
     ) as client:
         assert client.get("/api/config").status_code == 200
-        assert client.get("/api/auth/config").json() == {"mode": "development", "required": False}
+        body = client.get("/api/auth/config").json()
+        assert body["mode"] == "development"
+        assert body["required"] is False
 
 
 def test_a9_development_mode_with_a_token_still_requires_it(monkeypatch, tmp_path):

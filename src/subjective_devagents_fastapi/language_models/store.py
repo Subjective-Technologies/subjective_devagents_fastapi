@@ -16,7 +16,10 @@ from pathlib import Path
 from .contracts import Identity, Message, ModelError, ModelResult
 
 ACTIVE = ("queued", "running")
-TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
+# blocked: the agent stopped on a coordination decision. It is finished work, not an
+# open turn. Leaving it out made finish() raise and the waiter poll until the heartbeat
+# ran for hours with no further step.
+TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted", "blocked"}
 
 
 class TurnStore:
@@ -32,6 +35,7 @@ class TurnStore:
         with self.connection() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS channel_bindings (target TEXT PRIMARY KEY, channel_id TEXT NOT NULL, actor_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY, identity TEXT NOT NULL,
                     session_id TEXT, created REAL NOT NULL, needs_reconciliation INTEGER NOT NULL DEFAULT 0
@@ -231,6 +235,27 @@ class TurnStore:
                        "VALUES(?,?,?,?,?)", (identifier, previous["identity"], snapshot, previous["session_id"], time.time()))
             db.execute("UPDATE conversations SET identity=?,session_id=NULL WHERE id=?", (snapshot, identifier))
         return self.conversation(identifier)
+
+    def release_orphaned_http_turns(self) -> list[str]:
+        """Close HTTP turns (api, api_agent) still queued or running when the service starts.
+
+        Their worker was a thread of the previous process and ran no remote job or CLI that
+        could outlive it, so there is nothing to reconcile. CLI turns are left alone: their
+        process may still be running.
+        """
+        released = []
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT id,conversation_id,identity FROM turns WHERE status IN ('queued','running')").fetchall():
+                if json.loads(row["identity"]).get("strategy") not in {"api", "api_agent"}:
+                    continue
+                db.execute("UPDATE turns SET status='interrupted',error_code='service_restarted',updated=? WHERE id=?",
+                           (time.time(), row["id"]))
+                db.execute("UPDATE conversations SET session_id=NULL,needs_reconciliation=0 WHERE id=?",
+                           (row["conversation_id"],))
+                self._event(db, row["id"], "state", {"status": "interrupted", "error_code": "service_restarted"})
+                released.append(row["id"])
+        return released
 
     def reconcile(self, identifier: str) -> dict:
         """Operator has independently verified the old worker/remote job is stopped."""
