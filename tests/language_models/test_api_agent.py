@@ -89,6 +89,16 @@ def test_tool_loop_runs_bash_then_answers(request_data, monkeypatch):
     assert result.status == "completed"
     assert result.text == "The command printed hi."
     assert ("activity", {"text": "Running: echo hi"}) in events
+    [runtime] = [data for kind, data in events if kind == "runtime"]
+    assert runtime["strategy"] == "api_agent"
+    assert runtime["workspace"] == request_data.identity.workspace
+    assert "Bash" in runtime["effective_tools"]
+    [call] = [data for kind, data in events if kind == "tool_call"]
+    assert call == {"tool_call_id": "1", "name": "Bash"}
+    [tool_result] = [data for kind, data in events if kind == "tool_result"]
+    assert tool_result["tool_call_id"] == "1"
+    assert tool_result["name"] == "Bash"
+    assert tool_result["ok"] is True
     # Second request carries the tool result back, per the documented wire format.
     second_messages = proxy.requests[1][2]["messages"]
     assert second_messages[-1]["role"] == "tool" and "hi" in second_messages[-1]["content"]
@@ -468,3 +478,23 @@ def test_a_turn_without_bash_or_outside_git_takes_no_snapshot(request_data, monk
     assert result.status == "completed"
     assert open(f"{ws}/plain.txt").read() == "x"
     assert not [data for kind, data in events if kind == "file_diff"]
+
+
+def test_selected_proxy_model_reaches_inference(monkeypatch, tmp_path):
+    from subjective_devagents_fastapi.language_models import legacy, catalog
+    monkeypatch.delenv("SUBJECTIVE_LANGUAGE_MODELS_CONFIG", raising=False)
+    monkeypatch.setenv("SUBJECTIVE_LANGUAGE_MODELS_DB", str(tmp_path / "selected.sqlite3"))
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, "fixture-key")
+    monkeypatch.setenv(legacy.PROXY_MODEL_ENV["codex"], "gpt-default")
+    monkeypatch.setattr(catalog, "proxy_models", lambda: {"codex": ["gpt-selected"]})
+    with ScriptedProxy([completion(content="Selected model answered.")]) as proxy:
+        monkeypatch.setenv(legacy.PROXY_URL_ENV, proxy.url)
+        backend = legacy.LegacyLanguageModel(str(tmp_path))
+        try:
+            result = backend.send({"target": "selected", "provider": "codex", "model": "gpt-selected", "workspace": str(tmp_path)},
+                {}, {"prompt": "hello", "timeout": 5}, lambda *a: None, lambda *a: None, None)
+            assert result["success"]
+            assert proxy.requests[0][0] == "/v1/chat/completions"
+            assert proxy.requests[0][2]["model"] == "gpt-selected"
+        finally:
+            backend.close()

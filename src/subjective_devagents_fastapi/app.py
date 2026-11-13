@@ -569,6 +569,7 @@ async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
             body.get("workspace") or "",
             body.get("osUser") or "",
             body.get("sshConnection") or "",
+            body.get("model") or "",
         )
 
         # Store the identity_id in the conversation for future reference
@@ -580,6 +581,14 @@ async def api_llm_create_conversation(body: dict = Body(default={})) -> dict:
         return {"ok": True, "conversation": conversation}
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "error": str(error)}
+
+
+@app.post("/api/llm/set-model")
+async def api_llm_set_model(body: dict = Body(default={})) -> dict:
+    from .language_models.api import invoke
+    conversation = await asyncio.to_thread(
+        invoke, core().llm_service.set_model, str(body.get("target") or ""), body.get("model") or "")
+    return {"ok": True, "conversation": conversation}
 
 
 @app.post("/api/llm/rename-conversation")
@@ -782,21 +791,30 @@ async def api_llm_cancel_message(body: dict = Body(default={})) -> dict:
 
 
 @app.get("/api/llm/providers")
-async def api_llm_providers() -> dict:
+async def api_llm_providers(refresh: bool = False) -> dict:
     """Stable provider discovery, backed by standalone drivers."""
-    from .language_models.legacy import PROXY_ONLY_PROVIDERS, proxy_configured
+    from .language_models.legacy import PROXY_ONLY_PROVIDERS, proxy_default_model
     from .llm_service import DEFAULT_PROVIDER, WRITABLE_PROVIDERS
 
     def available(key: str) -> bool:
         if key == "ssh":
             return True
         if key in PROXY_ONLY_PROVIDERS:
-            return proxy_configured(key)
+            return bool(os.environ.get("SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL", "").strip() and proxy_default_model(key, models))
         return f"cli:{key}" in core().llm_service.backend.model.strategies
 
+    from .language_models.catalog import proxy_models
+    from .language_models.contracts import ModelError
+    try:
+        models = await asyncio.to_thread(proxy_models, True) if refresh else await asyncio.to_thread(proxy_models)
+        model_error = None
+    except ModelError as error:
+        models, model_error = {}, error.code
     return {
-        "ok": True, "default": DEFAULT_PROVIDER,
-        "providers": [{"key": key, "label": provider["label"], "available": available(key)}
+        "ok": True, "default": DEFAULT_PROVIDER, "modelError": model_error,
+        "providers": [{"key": key, "label": provider["label"], "available": available(key),
+                       "models": models.get(key, []),
+                       "defaultModel": proxy_default_model(key, models) or None}
                       for key, provider in WRITABLE_PROVIDERS.items()],
     }
 

@@ -837,6 +837,13 @@ class ApiAgent(ModelStrategy):
         if not token:
             return ModelResult("failed", error_code="authentication_required")
         tools = agent_tool_set(identity)
+        emit("runtime", {
+            "identity_id": identity.id,
+            "strategy": identity.strategy,
+            "workspace": identity.workspace,
+            "sandbox": identity.sandbox,
+            "effective_tools": sorted(tools),
+        })
         messages = [{"role": "system", "content": agent_system_prompt(identity)}]
         messages += [{"role": m.role, "content": m.content} for m in request.history]
         if request.attachments:
@@ -896,6 +903,7 @@ class ApiAgent(ModelStrategy):
     @staticmethod
     def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None):
         name = (call.get("function") or {}).get("name") or ""
+        call_id = str(call.get("id") or "")
         try:
             arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
             if not isinstance(arguments, dict):
@@ -911,6 +919,7 @@ class ApiAgent(ModelStrategy):
             emit("activity", {"text": f"Asking: {short(question)}"})
             emit("message", {"text": question})
             return ModelResult("completed", question)
+        emit("tool_call", {"tool_call_id": call_id, "name": name})
         step = ClaudeCli.tool_step(name, arguments)
         if step:
             emit("activity", {"text": step})
@@ -918,9 +927,21 @@ class ApiAgent(ModelStrategy):
             # Already shown by the tool's own diff; the end-of-turn Bash diff skips it.
             edited.add(os.path.normpath(os.path.join(identity.workspace or "/", str(arguments["file_path"]))))
         try:
-            return execute_agent_tool(name, arguments, identity, transport, cancelled, timeout, emit)
+            result = execute_agent_tool(name, arguments, identity, transport, cancelled, timeout, emit)
         except ToolAbort as abort:
+            emit("tool_result", {
+                "tool_call_id": call_id, "name": name, "ok": False,
+                "status": abort.result.status,
+            })
             return abort.result
+        ok = not result.startswith("Error:") and "[exit code " not in result
+        emit("tool_result", {
+            "tool_call_id": call_id,
+            "name": name,
+            "ok": ok,
+            "output_chars": len(result),
+        })
+        return result
 
     async def _call(self, identity, token: str, messages: list, tools: dict, timeout: float, cancelled: Cancelled):
         payload = {"model": identity.model, "messages": messages, "stream": False}

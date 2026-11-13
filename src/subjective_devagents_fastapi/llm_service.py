@@ -27,6 +27,7 @@ from .provider_sessions import list_provider_sessions, sessions_for_provider
 from .system_users import current_username, is_valid_username
 
 PROVIDER_ICONS = {
+    "antigravity": "../assets/providers/gemini.svg",
     "codex": "../assets/providers/codex.svg",
     "cursor": "../assets/providers/cursor.svg",
     "claude": "../assets/providers/claude.svg",
@@ -46,6 +47,7 @@ PROVIDER_ICONS = {
 }
 
 PROVIDER_LABELS = {
+    "antigravity": "Antigravity",
     "codex": "Codex",
     "cursor": "Cursor",
     "claude": "Claude",
@@ -68,6 +70,7 @@ STATE_VERSION = 2
 
 # Providers with an exported CLI datasource bundle that can create and resume sessions.
 WRITABLE_PROVIDERS = {
+    "antigravity": {"bundle": "antigravity", "label": "Antigravity"},
     "codex": {"bundle": "codex", "label": "Codex"},
     "claude": {"bundle": "claude", "label": "Claude"},
     "cursor": {"bundle": "cursor", "label": "Cursor"},
@@ -690,6 +693,7 @@ class LlmService:
             "description": str(payload.get("description") or f"{provider} {payload.get('kind') or 'chat'}"),
             "kind": "llm",
             "provider": provider,
+            "model": str(payload.get("model") or ""),
             "sessionId": session_id,
             "sourceFile": source_file,
             "exportPath": str(payload.get("exportPath") or file_path or ""),
@@ -1112,7 +1116,7 @@ class LlmService:
 
     def create_conversation(
         self, provider: Any = None, name: str = "", workspace: str = "", os_user: str = "",
-        ssh_connection: str = "",
+        ssh_connection: str = "", model: str = "",
     ) -> dict:
         """`os_user` picks whose CLI login answers this chat.
 
@@ -1133,6 +1137,9 @@ class LlmService:
         """
         now = time.time() * 1000
         key = provider_key(provider) if writable_provider(provider) else DEFAULT_PROVIDER
+        if model:
+            from .language_models.catalog import validate_model
+            validate_model(key, model)
         label = provider_label(key)
         me = current_username()
         owner = str(os_user or "").strip() or me
@@ -1152,6 +1159,7 @@ class LlmService:
             {
                 "target": f"llm:{key}:local:{uuid.uuid4()}",
                 "provider": key,
+                "model": model,
                 "label": str(name or f"New {label} chat").strip() or f"New {label} chat",
                 "description": (
                     f"{label} CLI conversation as {owner}" if owner != me
@@ -1177,6 +1185,25 @@ class LlmService:
             conversation["label"] = self.label_overrides[conversation["target"]]
         self.mark_active(conversation["target"])
         self._save_state()
+        return conversation
+
+    def set_model(self, target: str, model: str = "") -> dict:
+        """Change inference binding while retaining this conversation's transcript."""
+        from .language_models.contracts import ModelError
+        conversation = next((item for item in self.local if item["target"] == target), None)
+        if not conversation:
+            raise ModelError("not_found", "Local conversation was not found.")
+        if conversation.get("osUser") or conversation.get("sshConnection"):
+            raise ModelError("unsupported_model_binding", "Model selection requires a local proxy-backed conversation.")
+        candidate = {**conversation, "model": model}
+        identity = self.backend.identity(candidate)
+        with self.backend._lock:
+            with self.backend.model.store.connection() as db:
+                row = db.execute("SELECT conversation_id FROM legacy_bindings WHERE target=?", (target,)).fetchone()
+            if row:
+                self.backend.model.handoff(row[0], identity.id)
+            conversation["model"] = model
+            self._save_state()
         return conversation
 
     def create_sibling_for_user(self, source_target: str, username: str, provider: Any = None) -> dict:
@@ -1781,6 +1808,7 @@ class LlmService:
                 "new_session": not original_session_id,
                 "working_directory": conversation.get("workspace"),
                 "source_file": conversation.get("sourceFile") or source.get("sourceFile") or "",
+                "execution_required": bool((self.agent_turns.get(target) or {}).get("execution_required")),
                 "timeout": AGENT_TURN_TIMEOUT_SECONDS,
             }
             # Preserve legacy request metadata while standalone drivers own execution.
@@ -1917,10 +1945,23 @@ class LlmService:
                 return failure
             conversation["sessionId"] = str(result.get("session_id") or "")
             reply_text = str(result.get("response") or "")
-            header = (self.agent_turns.get(target) or {}).get("header")
+            agent_state = self.agent_turns.get(target) or {}
+            header = agent_state.get("header")
             if header:
                 reply_text = agent_workflow.ensure_header(reply_text, *header)
+                evidence = result.get("execution_evidence") if isinstance(result.get("execution_evidence"), dict) else {}
+                if not agent_workflow.execution_claim_has_runtime_evidence(
+                    str(agent_state.get("agent_id") or ""), reply_text, evidence
+                ):
+                    reply_text = agent_workflow.ensure_header(
+                        "EVIDENCE_REJECTED — this execution-state claim was not accepted because "
+                        "the backend recorded no successful real tool call for this turn.",
+                        *header,
+                    )
+                reply_text = agent_workflow.ensure_runtime_attestation(reply_text, evidence)
             assistant_message = {"role": "assistant", "text": reply_text, "time": time.time() * 1000}
+            if isinstance(result.get("execution_evidence"), dict):
+                assistant_message["executionEvidence"] = result["execution_evidence"]
             if result.get("turn_id"):
                 user_message["turnId"] = result["turn_id"]
                 assistant_message["turnId"] = result["turn_id"]

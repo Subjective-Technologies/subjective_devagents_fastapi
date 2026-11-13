@@ -198,6 +198,41 @@ def test_configured_identity_requires_exact_account_and_workspace(tmp_path, monk
         adapter.close()
 
 
+def test_execution_required_prefers_api_agent_and_rejects_inference_only_identity(tmp_path, monkeypatch, conversation):
+    base = {
+        "provider": "codex",
+        "model": "test-model",
+        "workspace": str(tmp_path),
+        "api_base_url": "http://127.0.0.1:9",
+        "api_key_env": "TEST_AGENT_KEY",
+    }
+    config = tmp_path / "agentic-identities.json"
+    config.write_text(json.dumps({"identities": [
+        {**base, "id": "inference", "strategy": "api"},
+        {**base, "id": "agentic", "strategy": "api_agent",
+         "home": str(tmp_path / "agent-home"), "sandbox": "workspace-write"},
+    ]}))
+    monkeypatch.setenv("SUBJECTIVE_LANGUAGE_MODELS_CONFIG", str(config))
+    monkeypatch.setenv("SUBJECTIVE_LANGUAGE_MODELS_DB", str(tmp_path / "configured-agentic.sqlite3"))
+    adapter = legacy.LegacyLanguageModel(str(tmp_path))
+    try:
+        chosen = adapter.identity({**conversation, "osUser": None}, execution_required=True)
+        assert chosen.id == "agentic"
+        assert chosen.strategy == "api_agent"
+    finally:
+        adapter.close()
+
+    config.write_text(json.dumps({"identities": [{**base, "id": "inference", "strategy": "api"}]}))
+    monkeypatch.setenv("SUBJECTIVE_LANGUAGE_MODELS_DB", str(tmp_path / "configured-inference.sqlite3"))
+    inference_only = legacy.LegacyLanguageModel(str(tmp_path))
+    try:
+        with pytest.raises(legacy.ModelError, match="tool-capable") as error:
+            inference_only.identity({**conversation, "osUser": None}, execution_required=True)
+        assert error.value.code == "execution_runtime_required"
+    finally:
+        inference_only.close()
+
+
 def test_completed_turn_recovers_without_post_dispatch_binding_write(backend, conversation):
     strategy = RecordingStrategy()
     backend.model.strategies = {"cli:codex": strategy}

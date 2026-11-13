@@ -43,6 +43,11 @@ _VERSION = re.compile(r"^\d{14}$")
 # header block with the git version. The version now comes from the database.
 _STAMPED_BLOCK = re.compile(r"<!-- workflow-header:begin[^\n]*-->.*?<!-- workflow-header:end -->\n*", re.S)
 _HEADER = re.compile(r"^\s*\[WF:[^\]]*\]\[agent:[^\]]*\]")
+_RUNTIME_ATTESTATION = re.compile(r"(?m)^\[RT:[^\n]*\]\n?")
+_EXECUTION_CLAIM = re.compile(
+    r"\b(?:EXECUTION_STARTED|IMPLEMENTATION_COMPLETE|COMMITTED|PUSHED|DEPLOYED|DEPLOY_VERIFIED)\b"
+)
+_ATTESTED_EXECUTORS = frozenset({"git_agent", "coder_agent", "workspace_executor_agent"})
 
 
 class WorkflowUnavailable(Exception):
@@ -200,6 +205,39 @@ def ensure_header(reply: str, version: str, agent_id: str) -> str:
     return f"[WF:{version}][agent:{agent_id}]\n{reply}"
 
 
+def ensure_runtime_attestation(reply: str, evidence: dict | None) -> str:
+    """Insert one backend-owned runtime line and remove model-authored lookalikes.
+
+    The model is allowed to summarize tool output, but it must not be able to manufacture
+    the marker that Manager uses to distinguish prose from a turn that actually reached a
+    tool-capable runtime.
+    """
+    evidence = evidence or {}
+    clean = _RUNTIME_ATTESTATION.sub("", str(reply or "")).lstrip()
+    tools = ",".join(str(item) for item in evidence.get("toolsUsed") or []) or "-"
+    line = (
+        f"[RT:turn={evidence.get('turnId') or '-'};strategy={evidence.get('strategy') or '-'};"
+        f"tool_calls={int(evidence.get('toolCallsCount') or 0)};"
+        f"successful={int(evidence.get('successfulToolCalls') or 0)};tools={tools}]"
+    )
+    rows = clean.splitlines()
+    if rows and _HEADER.match(rows[0]):
+        return "\n".join([rows[0], line, *rows[1:]])
+    return f"{line}\n{clean}" if clean else line
+
+
+def execution_claim_has_runtime_evidence(agent_id: str, reply: str, evidence: dict | None) -> bool:
+    """False only for executable-role state claims with no successful real tool call.
+
+    Manager and review-only roles may summarize independently verified evidence. Git/Coder/
+    Workspace Executor, however, may not advance an execution state by merely printing text
+    that resembles command output.
+    """
+    if agent_id not in _ATTESTED_EXECUTORS or not _EXECUTION_CLAIM.search(str(reply or "")):
+        return True
+    return int((evidence or {}).get("successfulToolCalls") or 0) > 0
+
+
 def prepare_turn(state: dict, target: str, agent: dict, authorization: str, text: str, app_home: str) -> str:
     """The prompt to send for this turn, and the header the reply must carry.
 
@@ -213,7 +251,12 @@ def prepare_turn(state: dict, target: str, agent: dict, authorization: str, text
     definition = compose_definition(export, agent, workflow_dir)
     digest = definition_hash(definition)
     entry = state.setdefault(target, {})
-    entry["header"] = (export["version"]["version"], agent_id_for(str(agent.get("role_file"))))
+    agent_id = agent_id_for(str(agent.get("role_file")))
+    entry["agent_id"] = agent_id
+    entry["header"] = (export["version"]["version"], agent_id)
+    # Workflow agents are executable agents, not inference-only chatbots. The legacy
+    # adapter uses this bit to refuse/upgrade a plain `api` identity.
+    entry["execution_required"] = True
     if entry.get("definition") == digest:
         return text
     entry["definition"] = digest

@@ -19,6 +19,7 @@ from .d1_client import SqlExecutor
 NAMESPACE = uuid.UUID("2348859b-1168-4ba9-81ba-044442898904")
 
 PROVIDER_ALIASES = {
+    "antigravity": "antigravity",
     "codex": "codex",
     "chatgpt": "codex",
     "gpt": "codex",
@@ -36,7 +37,7 @@ PROVIDER_ALIASES = {
     "ssh": "ssh",
 }
 
-KNOWN_PROVIDERS = {"codex", "claude", "cursor", "anthropic", "openai", "gemini", "grok", "kimi", "ssh"}
+KNOWN_PROVIDERS = {"codex", "claude", "cursor", "anthropic", "openai", "gemini", "grok", "kimi", "antigravity", "ssh"}
 ALLOWED_ROLES = {"user", "assistant", "system", "tool", "tool_output"}
 
 

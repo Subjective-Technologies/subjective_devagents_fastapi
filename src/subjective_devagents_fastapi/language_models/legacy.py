@@ -24,30 +24,47 @@ PROXY_KEY_ENV = "SUBJECTIVE_DEVAGENTS_LLM_PROXY_API_KEY"
 PROXY_MODEL_ENV = {"claude": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CLAUDE",
                    "codex": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CODEX",
                    "grok": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK",
-                   "kimi": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI"}
+                   "kimi": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI",
+                   "antigravity": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_ANTIGRAVITY"}
 # Providers with no CLI of their own: they run only as api_agent identities behind the proxy.
-PROXY_ONLY_PROVIDERS = frozenset({"kimi"})
+PROXY_ONLY_PROVIDERS = frozenset({"kimi", "antigravity"})
+
+
+def proxy_default_model(provider: str, models: dict | None = None) -> str:
+    """Use a configured default, or discover Antigravity's available model IDs."""
+    configured = os.environ.get(PROXY_MODEL_ENV.get(provider, ""), "").strip()
+    if configured or provider != "antigravity":
+        return configured
+    if models is None:
+        from .catalog import proxy_models
+        try:
+            models = proxy_models()
+        except ModelError:
+            return ""
+    return next(iter(models.get(provider, [])), "")
 
 
 def proxy_configured(provider: str) -> bool:
-    """Whether the inference proxy and a model id are set for this provider."""
+    """Whether the inference proxy has a configured or discoverable model."""
     model_env = PROXY_MODEL_ENV.get(provider)
-    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and os.environ.get(model_env, "").strip())
+    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and proxy_default_model(provider))
+EXECUTION_STRATEGIES = frozenset({"cli", "api_agent"})
 
 
-def proxy_identity(provider: str, username: str, workspace: str, home: str) -> Identity | None:
+def proxy_identity(provider: str, username: str, workspace: str, home: str, selected_model: str = "") -> Identity | None:
     """An ad hoc api_agent identity when the inference proxy is configured for this provider.
 
     Returns None (caller falls back to the CLI identity below) when the operator has not set
     SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL and the per-provider model id: this keeps every existing
-    deployment on its current CLI behavior until it explicitly opts in. Cursor has no backend
+    deployment on its current CLI behavior until it explicitly opts in. Antigravity can
+    discover its default from the proxy catalog. Cursor has no backend
     behind the proxy, so it is never offered one here.
     """
     model_env = PROXY_MODEL_ENV.get(provider)
     if model_env is None:
         return None
     base_url = os.environ.get(PROXY_URL_ENV, "").strip()
-    model = os.environ.get(model_env, "").strip()
+    model = selected_model or proxy_default_model(provider)
     if not base_url or not model:
         return None
     key = hashlib.sha256(json.dumps(["api_agent", provider, username, workspace, base_url, model]).encode()).hexdigest()[:32]
@@ -83,8 +100,9 @@ class LegacyLanguageModel:
             if "pending_turn" not in {row[1] for row in db.execute("PRAGMA table_info(legacy_bindings)")}:
                 db.execute("ALTER TABLE legacy_bindings ADD COLUMN pending_turn TEXT")
 
-    def identity(self, conversation: dict) -> Identity:
+    def identity(self, conversation: dict, execution_required: bool = False) -> Identity:
         provider = conversation["provider"]
+        selected_model = conversation.get("model") or ""
         username = conversation.get("osUser") or pwd.getpwuid(os.geteuid()).pw_name
         workspace = str(Path(conversation.get("workspace") or "/tmp").absolute())
         if self.configured:
@@ -92,13 +110,24 @@ class LegacyLanguageModel:
                        if item["provider"] == provider]
             choices = [item for item in choices if item.workspace == workspace
                        and bool(item.ssh_host) == bool(conversation.get("sshConnection"))]
+            if selected_model:
+                choices = [item for item in choices if item.model == selected_model]
             # Remote accounts require an explicit saved-connection identity mapping.
             if conversation.get("sshConnection"):
                 choices = [item for item in choices if item.id == conversation["sshConnection"]]
             else:
                 choices = [item for item in choices
                            if (item.os_user or pwd.getpwuid(os.geteuid()).pw_name) == username]
+            if execution_required:
+                choices = [item for item in choices if item.strategy in EXECUTION_STRATEGIES]
+                # Prefer the backend-owned tool loop when both a CLI identity and ApiAgent
+                # identity point at the same workspace/account. It gives us durable tool events.
+                api_agents = [item for item in choices if item.strategy == "api_agent"]
+                if api_agents:
+                    choices = api_agents
             if len(choices) != 1:
+                if execution_required and not choices:
+                    raise ModelError("execution_runtime_required", "This workflow agent requires a tool-capable cli/api_agent identity; inference-only api identities are not executable.")
                 raise ModelError("configuration_required", "Configure exactly one matching provider/account/workspace identity; remote identity id must match the saved connection id.")
             return choices[0]
         if conversation.get("sshConnection"):
@@ -107,7 +136,10 @@ class LegacyLanguageModel:
             raise ModelError("unsupported_provider", "No standalone driver is registered for this provider.")
         account = pwd.getpwnam(username)
         home = account.pw_dir
-        api_identity = proxy_identity(provider, username, workspace, home)
+        if selected_model:
+            from .catalog import validate_model
+            validate_model(provider, selected_model)
+        api_identity = proxy_identity(provider, username, workspace, home, selected_model)
         if api_identity is not None:
             self.model.identities.register_legacy(api_identity)
             return api_identity
@@ -161,7 +193,8 @@ class LegacyLanguageModel:
         try:
             images = self.attachments(request.get("files"))
             with self._lock:
-                identity = self.identity(conversation)
+                execution_required = bool(request.get("execution_required"))
+                identity = self.identity(conversation, execution_required=execution_required)
                 if images and not image_support(identity):
                     where = " over SSH" if identity.ssh_host else ""
                     raise ModelError("unsupported_attachments",
@@ -175,7 +208,14 @@ class LegacyLanguageModel:
                         row = db.execute("SELECT conversation_id FROM legacy_bindings WHERE target=?", (conversation["target"],)).fetchone()
                 bound = self.model.store.conversation(row[0])
                 if bound["identity"] != identity.snapshot():
-                    raise ModelError("identity_changed", "Execution identity changed. Use explicit account handoff before sending.")
+                    previous_strategy = str((bound.get("identity") or {}).get("strategy") or "")
+                    if execution_required and previous_strategy == "api" and identity.strategy in EXECUTION_STRATEGIES:
+                        # Existing agent chats created before this fix may already be bound to
+                        # an inference-only identity. Upgrade them safely while retaining history.
+                        self.model.handoff(row[0], identity.id)
+                        bound = self.model.store.conversation(row[0])
+                    else:
+                        raise ModelError("identity_changed", "Execution identity changed. Use explicit account handoff before sending.")
                 pending = self.pending(conversation["target"])
                 if pending and pending["status"] == "completed":
                     if pending["prompt"] == request["prompt"]:
@@ -212,12 +252,31 @@ class LegacyLanguageModel:
         except ModelError as error:
             return {"success": False, "status": error.code, "error": str(error)}
 
-    @staticmethod
-    def outcome(turn: dict) -> dict:
+    def execution_evidence(self, turn: dict) -> dict:
+        """Backend-owned summary of the actual runtime/tool events for one durable turn."""
+        events = self.model.store.events(turn["id"])
+        runtime = next((item["data"] for item in events if item["kind"] == "runtime"), {})
+        calls = [item["data"] for item in events if item["kind"] == "tool_call"]
+        results = [item["data"] for item in events if item["kind"] == "tool_result"]
+        successful = sum(1 for item in results if item.get("ok") is True)
+        identity = turn.get("identity") if isinstance(turn.get("identity"), dict) else {}
+        return {
+            "turnId": turn["id"],
+            "identityId": runtime.get("identity_id") or identity.get("id") or "",
+            "strategy": runtime.get("strategy") or identity.get("strategy") or "",
+            "workspace": runtime.get("workspace") or identity.get("workspace") or "",
+            "effectiveTools": list(runtime.get("effective_tools") or []),
+            "toolCallsCount": len(calls),
+            "successfulToolCalls": successful,
+            "toolsUsed": sorted({str(item.get("name") or "") for item in calls if item.get("name")}),
+        }
+
+    def outcome(self, turn: dict) -> dict:
         return {"success": turn["status"] == "completed", "status": turn["status"],
                 "response": turn["text"], "session_id": turn["session_id"] or "",
                 "error": turn["error_code"] or "", "turn_id": turn["id"],
-                "conversation_id": turn["conversation_id"]}
+                "conversation_id": turn["conversation_id"],
+                "execution_evidence": self.execution_evidence(turn)}
 
     def pending(self, target: str) -> dict | None:
         with self.model.store.connection() as db:
@@ -236,7 +295,7 @@ class LegacyLanguageModel:
             db.execute("UPDATE legacy_bindings SET pending_turn=NULL WHERE target=? AND pending_turn=?", (target, turn_id))
 
     def turn_details(self, turn_ids: list[str]) -> dict[str, dict]:
-        """Per turn, what the agent did: its steps and the unified diffs of the files it changed."""
+        """Per turn, steps/diffs plus backend-owned runtime execution evidence."""
         ids = sorted({str(item) for item in turn_ids if item})
         found: dict[str, dict] = {}
         if not ids:
@@ -260,6 +319,10 @@ class LegacyLanguageModel:
                         text = str(data["text"])
                         if (not entry["steps"] or entry["steps"][-1] != text) and len(entry["steps"]) < 200:
                             entry["steps"].append(text)
+        for turn_id in ids:
+            turn = self.model.store.turn(turn_id)
+            evidence = self.execution_evidence(turn)
+            found.setdefault(turn_id, {"steps": [], "diffs": []})["executionEvidence"] = evidence
         return found
 
     def is_bound(self, target: str) -> bool:

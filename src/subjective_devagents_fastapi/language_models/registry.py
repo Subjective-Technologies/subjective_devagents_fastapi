@@ -66,7 +66,7 @@ class IdentityRegistry:
                 # forbidding them. The endpoint itself is inference-only (operator-trusted,
                 # often a private non-TLS proxy); only credential-in-URL and malformed-URL
                 # shapes are rejected here.
-                if identity.provider not in {"codex", "claude", "grok", "kimi"}:
+                if identity.provider not in {"codex", "claude", "grok", "kimi", "antigravity"}:
                     raise ValueError("Unsupported api_agent provider")
                 if (not identity.workspace.startswith("/") or "\x00" in identity.workspace
                         or ".." in PurePosixPath(identity.workspace).parts):
