@@ -87,3 +87,27 @@ def test_busy_refused_before_dispatch_start_and_role_header_expected(client, mon
     assert '[RT:turn=' in answers[0]['text']
     assert [data['agent_role'] for op,data in calls if op=='start']==['coder_agent']
     assert not any(op=='gate' and data['kind']=='WORKFLOW_VERSION_DIAGNOSTIC' for op,data in calls)
+
+
+def test_server_dispatch_endpoint_rejects_unsigned_requests(client, monkeypatch):
+    from subjective_devagents_fastapi.app import core
+    monkeypatch.setenv('COORDINATION_SERVICE_SECRET', 'api-fixture-signing-secret-over-32-characters')
+    before = dict(core().llm_service.backend.model._futures)
+    response = client.post('/api/collaboration/execute', json={'binding': {}, 'execution': {}})
+    assert response.status_code == 409
+    assert response.json()['error'] == 'invalid_runtime_grant'
+    assert core().llm_service.backend.model._futures == before
+
+
+def test_durable_attachment_endpoint_keeps_authenticated_owner(client, monkeypatch):
+    import base64
+    from subjective_devagents_fastapi import auth
+    from subjective_devagents_fastapi.app import core
+    from subjective_devagents_fastapi.collaboration import load_attachments
+    monkeypatch.setattr(auth, 'authenticate_headers', lambda *_args, **_kwargs: {'sub': 'fixture-owner'})
+    files = [{'filename': 'fixture.png', 'mime_type': 'image/png', 'content': base64.b64encode(b'fixture-image').decode()}]
+    response = client.post('/api/collaboration/attachments', json={'files': files})
+    assert response.status_code == 200
+    reference = response.json()['reference']
+    assert load_attachments(core().llm_service, reference, 'fixture-owner')[0].data == b'fixture-image'
+    assert client.post('/api/collaboration/attachments', json={'files': []}).status_code == 422
