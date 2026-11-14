@@ -337,10 +337,10 @@ class ChannelSession:
 
     def _headers(self):
         if self.delegation:
-            import jwt
-            signed = jwt.encode({**self.delegation, 'aud': 'chat-coordination', 'exp': int(time.time()) + 60},
-                                os.environ['COORDINATION_SERVICE_SECRET'], algorithm='HS256')
-            return {'X-Collaboration-Grant': signed}
+            token = os.environ.get('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', '')
+            if not token:
+                raise ModelError('coordination_unavailable', 'Existing workflow service identity is unavailable')
+            return {'X-Workflow-Service-Token': token}
         return {'Authorization': self._authorization}
 
     def defer_start(self, identity, version, agent_role=None):

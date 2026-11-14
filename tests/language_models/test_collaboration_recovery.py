@@ -3,7 +3,6 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio
-import hashlib
 import json
 import subprocess
 import sys
@@ -18,7 +17,7 @@ pytest.importorskip("subjective_chat_api", reason="Cross-service acceptance requ
 from subjective_chat_api.coordination import ChannelCoordination, ACTIVE_DISPATCH
 from subjective_chat_api.db import Database
 from subjective_chat_api.repository import ChatRepository
-from subjective_chat_api.execution_queue import ExecutionQueue, grant
+from subjective_chat_api.execution_queue import ExecutionQueue
 from subjective_devagents_fastapi import collaboration, agent_workflow
 from subjective_devagents_fastapi.channel_coordination import ChannelSession
 from subjective_devagents_fastapi.language_models import LanguageModel, Identity, ModelResult, ModelStrategy
@@ -35,7 +34,7 @@ def git(repo, *args):
 @pytest.fixture
 def system(tmp_path, monkeypatch):
     monkeypatch.setenv('COORDINATION_RUNTIME_URL', 'http://fixture.invalid')
-    monkeypatch.setenv('COORDINATION_SERVICE_SECRET', 'integration-only-service-signing-key-32')
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', 'existing-service-token')
     monkeypatch.setenv('COORDINATION_COMPANY_ID', 'company_test')
     monkeypatch.setenv('SUBJECTIVE_CHAT_HOME', str(tmp_path / 'home'))
     repo = tmp_path / 'repo'; repo.mkdir()
@@ -83,6 +82,8 @@ def system(tmp_path, monkeypatch):
     class Hub:
         async def broadcast_room(self, *args): pass
     app = SimpleNamespace(state=SimpleNamespace(database=database, repo=repository, hub=Hub()))
+    from subjective_chat_api.service_auth import approved_job
+    monkeypatch.setattr(collaboration, 'fetch_assignment', lambda hint: approved_job(app, hint['binding']['channel_id'], hint['binding']['dispatch_id'], ready=True))
     yield SimpleNamespace(**locals())
     model.close(); database.close()
 
@@ -104,7 +105,7 @@ def test_manager_dispatch_coder_dies_retry_preserves_worktree(system):
                                                 'execution': s.execution})
     successor = retried['dispatch']
     assert successor['id'] != first['id']
-    queue = ExecutionQueue(s.app, deliver=lambda payload, signed: collaboration.execute(s.service, payload, signed))
+    queue = ExecutionQueue(s.app, deliver=lambda payload, signed: collaboration.execute(s.service, {'binding': {key: payload['binding'][key] for key in ('channel_id','dispatch_id')}}))
     asyncio.run(queue.tick())
     assert s.finished.wait(5), 'successor was not scheduled promptly'
     s.model.close()
@@ -120,15 +121,47 @@ def test_manager_dispatch_coder_dies_retry_preserves_worktree(system):
     assert all('LEASE_OWNER_MISMATCH' not in str(event) for event in state['events'])
 
 
-def test_service_admission_rejects_payload_tampering(system):
+def test_service_admission_rejects_caller_supplied_recipe(system):
     s = system
-    payload = {'binding': {'channel_id': s.channel, 'dispatch_id': 'd', 'instance_id': 'ai_coder:i',
-                          'workflow_id': 'w', 'agent_id': 'ai_coder'}, 'execution': s.execution}
-    signed = grant({**payload['binding'], 'owner_id': 'owner',
-        'payload_sha256': hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}, 'devagents-dispatch')
-    payload['execution']['prompt'] = 'different assignment'
-    with pytest.raises(ModelError, match='differs'):
-        collaboration.execute(s.service, payload, signed)
+    payload = {'binding': {'channel_id': s.channel, 'dispatch_id': 'd'}, 'execution': s.execution}
+    with pytest.raises(ModelError, match='references only'):
+        collaboration.execute(s.service, payload)
+
+
+def test_assignment_lookup_uses_existing_identity_and_fixed_origin(monkeypatch):
+    import httpx
+    hint = {'binding': {'channel_id': 'channel_fixture', 'dispatch_id': 'dispatch_fixture'}}
+    monkeypatch.setenv('COORDINATION_CALLBACK_URL', 'https://configured-chat.example')
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', 'existing-service-fixture')
+    seen = []
+    def reply(request):
+        seen.append(request)
+        assert str(request.url) == 'https://configured-chat.example/internal/collaboration/channel_fixture/dispatch/dispatch_fixture'
+        assert request.headers['X-Workflow-Service-Token'] == 'existing-service-fixture'
+        assert 'Authorization' not in request.headers
+        return httpx.Response(200, json={'ok': True, 'data': {'binding': hint['binding'], 'owner_id': 'approved-owner', 'execution': {'prompt': 'approved'}}})
+    client = httpx.Client
+    def factory(**kwargs):
+        assert kwargs['follow_redirects'] is False and kwargs['trust_env'] is False
+        return client(transport=httpx.MockTransport(reply), **kwargs)
+    monkeypatch.setattr(httpx, 'Client', factory)
+    assert collaboration.fetch_assignment(hint)['owner_id'] == 'approved-owner'
+    assert len(seen) == 1
+
+
+def test_assignment_lookup_never_follows_redirects(monkeypatch):
+    import httpx
+    monkeypatch.setenv('COORDINATION_CALLBACK_URL', 'https://configured-chat.example')
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', 'existing-service-fixture')
+    client = httpx.Client
+    seen = []
+    def redirect(request):
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={'location': 'https://untrusted.example/collect'}, json={})
+    monkeypatch.setattr(httpx, 'Client', lambda **kwargs: client(transport=httpx.MockTransport(redirect), **kwargs))
+    with pytest.raises(ModelError):
+        collaboration.fetch_assignment({'binding': {'channel_id': 'channel', 'dispatch_id': 'dispatch'}})
+    assert len(seen) == 1 and 'untrusted' not in seen[0]
 
 
 def test_read_only_runtime_does_not_recover_writer_leases(system):
@@ -159,7 +192,7 @@ def test_never_started_dispatch_automatically_runs_one_replacement(system):
                                                'execution': s.execution})['dispatch']
     s.clock[0] += 121
     replacement = s.journal.mutate(s.channel, 'watchdog', {'op': 'reconcile'})['successors'][0]
-    asyncio.run(ExecutionQueue(s.app, deliver=lambda payload, signed: collaboration.execute(s.service, payload, signed)).tick())
+    asyncio.run(ExecutionQueue(s.app, deliver=lambda payload, signed: collaboration.execute(s.service, {'binding': {key: payload['binding'][key] for key in ('channel_id','dispatch_id')}})).tick())
     assert completed.wait(5)
     s.model.close()
     assert count == [replacement['dispatch_id']]
@@ -182,7 +215,7 @@ def test_failed_result_callback_is_durable_and_replayed(system, monkeypatch):
             raise ModelError('coordination_unavailable', 'temporary outage')
         return local_call(self, op, **data)
     monkeypatch.setattr(ChannelSession, 'call', temporary_failure)
-    asyncio.run(ExecutionQueue(s.app, deliver=lambda payload, signed: collaboration.execute(s.service, payload, signed)).tick())
+    asyncio.run(ExecutionQueue(s.app, deliver=lambda payload, signed: collaboration.execute(s.service, {'binding': {key: payload['binding'][key] for key in ('channel_id','dispatch_id')}})).tick())
     s.model.close()
     with s.model.store.connection() as db:
         assert db.execute('SELECT count(*) FROM coordination_completions').fetchone()[0] == 1

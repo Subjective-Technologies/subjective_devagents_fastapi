@@ -89,14 +89,19 @@ def test_busy_refused_before_dispatch_start_and_role_header_expected(client, mon
     assert not any(op=='gate' and data['kind']=='WORKFLOW_VERSION_DIAGNOSTIC' for op,data in calls)
 
 
-def test_server_dispatch_endpoint_rejects_unsigned_requests(client, monkeypatch):
+def test_server_dispatch_endpoint_rejects_caller_recipe(client, monkeypatch):
     from subjective_devagents_fastapi.app import core
-    monkeypatch.setenv('COORDINATION_SERVICE_SECRET', 'api-fixture-signing-secret-over-32-characters')
     before = dict(core().llm_service.backend.model._futures)
     response = client.post('/api/collaboration/execute', json={'binding': {}, 'execution': {}})
     assert response.status_code == 409
-    assert response.json()['error'] == 'invalid_runtime_grant'
+    assert response.json()['error'] == 'runtime_scope_mismatch'
     assert core().llm_service.backend.model._futures == before
+
+
+def test_runtime_wake_rejects_large_body_even_with_forged_length(client):
+    response = client.post('/api/collaboration/execute', content=b'x' * 2049,
+        headers={'Content-Length': '2', 'Content-Type': 'application/json'})
+    assert response.status_code == 413
 
 
 def test_durable_attachment_endpoint_keeps_authenticated_owner(client, monkeypatch):

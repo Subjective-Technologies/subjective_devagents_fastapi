@@ -364,7 +364,16 @@ async def require_api_token(request: Request, call_next):
     turn. Static UI files stay public: they are an empty shell without the API.
     """
     if request.url.path == '/api/collaboration/execute' and request.method == 'POST':
-        # This one endpoint verifies a dispatch-scoped service grant in its handler.
+        length = request.headers.get('Content-Length', '')
+        if not length.isdigit() or int(length) > 2048:
+            return JSONResponse(status_code=413, content={'ok': False, 'error': 'invalid_runtime_wake'})
+        content = bytearray()
+        async for chunk in request.stream():
+            content.extend(chunk)
+            if len(content) > 2048:
+                return JSONResponse(status_code=413, content={'ok': False, 'error': 'invalid_runtime_wake'})
+        request._body = bytes(content)
+        # This endpoint accepts bounded wake references; its handler retrieves the approved task through existing service authentication.
         return await call_next(request)
     if auth.is_workflow_read_path(request.url.path):
         # Read-only prompt access for agents: its own token, GET only.
@@ -2060,7 +2069,7 @@ async def api_collaboration_execute(request: Request, body: dict = Body(...)):
     from .collaboration import execute
     from .language_models.contracts import ModelError
     try:
-        return await asyncio.to_thread(execute, core().llm_service, body, request.headers.get('X-Collaboration-Grant', ''))
+        return await asyncio.to_thread(execute, core().llm_service, body)
     except ModelError as error:
         return JSONResponse(status_code=409, content={'ok': False, 'error': error.code})
 

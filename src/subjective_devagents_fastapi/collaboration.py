@@ -1,6 +1,5 @@
-"""Signed, idempotent server dispatch admission; no browser or instance addressing."""
+"""Authoritative, idempotent server dispatch admission; no browser or instance addressing."""
 from __future__ import annotations
-import hashlib
 from dataclasses import replace
 import json
 import os
@@ -8,7 +7,6 @@ import threading
 from pathlib import Path
 import time
 
-import jwt
 
 from .channel_coordination import ChannelSession
 from .language_models.contracts import ModelError
@@ -16,21 +14,51 @@ from .language_models.contracts import ModelError
 _admission = threading.RLock()
 
 
-def execute(service, payload, signed):
-    secret = os.environ.get('COORDINATION_SERVICE_SECRET', '')
-    if len(secret) < 32:
-        raise ModelError('invalid_runtime_grant', 'Collaboration transport is not configured')
+def validate_hint(hint):
+    import re
+    if not isinstance(hint, dict) or set(hint) != {'binding'} or not isinstance(hint['binding'], dict) or set(hint['binding']) != {'channel_id', 'dispatch_id'}:
+        raise ModelError('runtime_scope_mismatch', 'Wake requests contain dispatch references only')
+    if any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_:-]{1,256}', value) for value in hint['binding'].values()):
+        raise ModelError('runtime_scope_mismatch', 'Invalid wake dispatch reference')
+
+
+def fetch_assignment(hint):
+    import httpx
+    validate_hint(hint)
+    base = os.environ.get('COORDINATION_CALLBACK_URL', '').rstrip('/')
+    token = os.environ.get('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', '')
+    if not base or not token:
+        raise ModelError('coordination_unavailable', 'Existing workflow service authentication is unavailable')
+    route = '/internal/collaboration/' + hint['binding']['channel_id'] + '/dispatch/' + hint['binding']['dispatch_id']
     try:
-        claims = jwt.decode(signed, secret, algorithms=['HS256'], audience='devagents-dispatch',
-                            options={'require': ['exp', 'aud', 'owner_id', 'payload_sha256']})
-    except jwt.PyJWTError:
-        raise ModelError('invalid_runtime_grant', 'Invalid runtime delegation') from None
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-    if claims['payload_sha256'] != digest:
-        raise ModelError('runtime_scope_mismatch', 'Runtime payload differs from its signed delegation')
-    binding, execution = payload['binding'], payload['execution']
-    if any(claims.get(k) != binding.get(k) for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id')):
-        raise ModelError('runtime_scope_mismatch', 'Runtime identity differs from its signed delegation')
+        with httpx.Client(timeout=12, follow_redirects=False, trust_env=False) as client:
+            response = client.post(base + route, headers={'X-Workflow-Service-Token': token})
+        payload = response.json()
+        if response.status_code != 200 or not payload.get('ok'):
+            raise ModelError('runtime_assignment_unavailable', 'Approved runtime assignment is unavailable')
+        job = payload['data']
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        raise ModelError('coordination_unavailable', 'Cannot retrieve approved runtime assignment') from None
+    if any(job.get('binding', {}).get(key) != value for key, value in hint['binding'].items()):
+        raise ModelError('runtime_scope_mismatch', 'Authoritative assignment differs from wake reference')
+    return job
+
+
+def execute(service, payload, _unused=None):
+    # Bound unauthenticated wakeups; only the authoritative approved job supplies executable data.
+    validate_hint(payload)
+    if not _admission.acquire(blocking=False):
+        raise ModelError('runtime_busy', 'Runtime admission is already processing a dispatch')
+    try:
+        job = fetch_assignment(payload)
+        return _execute_approved(service, job)
+    finally:
+        _admission.release()
+
+
+def _execute_approved(service, job):
+    binding, execution = job['binding'], job['execution']
+    claims = {**binding, 'owner_id': job['owner_id']}
     profile = execution['agents'][binding['agent_id']]
     if profile.get('company_id') != os.environ.get('COORDINATION_COMPANY_ID'):
         raise ModelError('runtime_scope_mismatch', 'Runtime company differs from installation')
@@ -68,7 +96,7 @@ def execute(service, payload, signed):
             with model.store.connection() as db:
                 db.execute('INSERT INTO collaboration_dispatches VALUES(?,?)', (binding['dispatch_id'], conversation_id))
         channel = ChannelSession(binding, binding['agent_id'], '')
-        # A short-lived grant is minted afresh for each callback; no login token is retained.
+        # Callback identity is resolved from the approved job; the existing service token stays in process env.
         channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
         channel.fence_root = str(Path(model.store.path).parent / 'mutation-fences')
         channel.defer_start(identity, export['version']['version'], agent_workflow.agent_id_for(profile['role_file']))
@@ -88,7 +116,7 @@ def replay_completions(store):
         try:
             channel.call('finish', **payload['data'])
         except ModelError as error:
-            if error.code not in {'INSTANCE_NOT_RUNNING', 'DISPATCH_NOT_RUNNING', 'STALE_ASSIGNMENT'}:
+            if error.code not in {'INSTANCE_NOT_RUNNING', 'DISPATCH_NOT_RUNNING', 'STALE_ASSIGNMENT', 'DISPATCH_NOT_FOUND', 'not_a_member'}:
                 continue
         with store.connection() as db:
             db.execute('DELETE FROM coordination_completions WHERE dispatch_id=?', (row['dispatch_id'],))
