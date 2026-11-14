@@ -150,3 +150,20 @@ def test_flattened_import_updates_provider_consistently():
     assert db.execute("SELECT current_provider_id FROM conversations").fetchone()[0] == "codex"
     assert db.execute("SELECT provider_id, provider_session_id FROM conversation_sessions").fetchone()[:] == ("codex", "different")
     assert not db.execute("PRAGMA foreign_key_check").fetchall()
+
+
+def test_duplicate_native_session_keeps_both_transcripts():
+    import json
+    db = _db()
+    executor = SqliteExecutor(db)
+    stats = sync_conversations(executor, [_chat(), _chat(target="llm:claude:alias", sourceFile="/alias.jsonl")])
+    assert stats["failed"] == 0
+    assert stats["upserted"] == 2
+    assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 4
+    sessions = db.execute("SELECT id, provider_session_id, metadata_json FROM conversation_sessions").fetchall()
+    owner = next(row for row in sessions if row["provider_session_id"])
+    alias = next(row for row in sessions if not row["provider_session_id"])
+    metadata = json.loads(alias["metadata_json"])
+    assert metadata["canonicalSessionId"] == owner["id"]
+    assert metadata["providerSessionId"] == owner["provider_session_id"]
+    assert not db.execute("PRAGMA foreign_key_check").fetchall()

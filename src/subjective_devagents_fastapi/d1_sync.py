@@ -203,6 +203,15 @@ def _sync_one(executor: SqlExecutor, conversation: dict, *, host: str, stamp: st
     session_id = stored_session["id"] if stored_session else stable_id("sess", conversation_id, provider, session_key or "none")
     stored_turn = _one(executor, "SELECT id FROM turns WHERE conversation_id = ? AND seq = 1", (conversation_id,))
     turn_id = stored_turn["id"] if stored_turn else stable_id("turn", session_id, "1")
+    # Different local/history targets may refer to the same native session.
+    # Keep both transcripts, but only one owns the globally unique native ID.
+    session_metadata = {"origin": conversation.get("origin")}
+    native_session_id = session_key or None
+    if session_key:
+        owner = _one(executor, "SELECT id FROM conversation_sessions WHERE provider_id = ? AND provider_session_id = ?", (provider, session_key))
+        if owner and owner["id"] != session_id:
+            native_session_id = None
+            session_metadata.update({"providerSessionId": session_key, "canonicalSessionId": owner["id"]})
     origin = "imported" if conversation.get("origin") == "history" else (
         conversation.get("origin") if conversation.get("origin") in {"local", "imported", "api", "web"} else "local"
     )
@@ -261,6 +270,7 @@ def _sync_one(executor: SqlExecutor, conversation: dict, *, host: str, stamp: st
         ON CONFLICT(id) DO UPDATE SET
           provider_id = excluded.provider_id,
           provider_session_id = excluded.provider_session_id,
+          metadata_json = excluded.metadata_json,
           os_user = excluded.os_user,
           workspace = excluded.workspace,
           source_file = excluded.source_file,
@@ -270,12 +280,12 @@ def _sync_one(executor: SqlExecutor, conversation: dict, *, host: str, stamp: st
             session_id,
             conversation_id,
             provider,
-            session_key or None,
+            native_session_id,
             os_user,
             conversation.get("workspace"),
             conversation.get("sourceFile"),
             created_at,
-            json.dumps({"origin": conversation.get("origin")}, default=str),
+            json.dumps(session_metadata, default=str),
             created_at,
             stamp,
         ),
