@@ -21,8 +21,13 @@ log = logging.getLogger(__name__)
 _READ_COMMANDS = {
     'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'whoami', 'date', 'true', 'false', 'echo', 'printf',
     'which', 'type', 'file', 'stat', 'test', 'rg', 'grep', 'find', 'du', 'df', 'uname', 'id',
-    'printenv', 'env', 'nl',
+    'nl',
 }
+_ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# env/npm flags that consume the next argv. Leaving them in the positional list
+# would classify the directory (or the variable name) as the command.
+_ENV_VALUED = {'-u', '--unset', '-C', '--chdir', '-S', '--split-string'}
+_NPM_VALUED = {'--prefix', '--userconfig', '--cache', '--registry', '-C', '--package', '-p', '--call', '-c'}
 _WRITE_COMMANDS = {
     'rm', 'mv', 'cp', 'mkdir', 'rmdir', 'touch', 'chmod', 'chown', 'tee', 'truncate', 'dd', 'install',
     'ln', 'unlink',
@@ -41,16 +46,153 @@ def _segments(command):
     return [piece for piece in parts if piece] or ['']
 
 
+def _positional(tokens):
+    args = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--':
+            args.extend(tokens[index + 1:])
+            break
+        if token in _NPM_VALUED:
+            index += 2
+            continue
+        if token.startswith('--') and '=' in token:
+            index += 1
+            continue
+        if token.startswith('-'):
+            index += 1
+            continue
+        args.append(token)
+        index += 1
+    return args
+
+
+def _env_command(tokens):
+    """argv after env options and NAME=VALUE. Empty when env only prints the environment."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _ASSIGNMENT.match(token):
+            index += 1
+            continue
+        if token == '--':
+            return tokens[index + 1:]
+        if token in _ENV_VALUED:
+            index += 2
+            continue
+        if token.startswith('--') and '=' in token:
+            index += 1
+            continue
+        if token.startswith('-'):
+            index += 1
+            continue
+        return tokens[index:]
+    return []
+
+
+def _literal_directory(value):
+    """A directory token the guard can resolve. Shell expansions are not literal."""
+    if not value or value.startswith('-'):
+        return None
+    if any(ch in value for ch in '$`*?[]<>|&;(){}'):
+        return None
+    if value.startswith('~'):
+        value = os.path.expanduser(value)
+        if value.startswith('~'):
+            return None
+    return value
+
+
+def _cd_destination(tokens):
+    args = tokens[1:]
+    if args[:1] == ['--']:
+        args = args[1:]
+    if len(args) != 1:
+        return None
+    return _literal_directory(args[0])
+
+
+def _prefix_directory(tokens):
+    """Return the --prefix directory, None when absent, or False when it is not literal."""
+    for index, token in enumerate(tokens):
+        if token == '--':
+            return None
+        if token == '--prefix' and index + 1 < len(tokens):
+            return _literal_directory(tokens[index + 1]) or False
+        if token.startswith('--prefix='):
+            return _literal_directory(token.split('=', 1)[1]) or False
+    return None
+
+
+def bash_workdir(command, workspace):
+    """Directory a Bash command runs in.
+
+    A leading ``cd <dir>`` (including ``cd a && cd b``) or ``--prefix <dir>`` selects
+    it. Otherwise the command runs at the workspace root. A non-literal cd or prefix
+    fails closed: ``cd $HOME && rm`` must not inherit a workspace lease.
+    """
+    root = Path(workspace).resolve()
+    current = root
+    bits = re.split(r'\s*(&&|\|\||;|\|)\s*', command or '')
+    index = 0
+    while index < len(bits):
+        part = bits[index].strip()
+        separator = bits[index + 1] if index + 1 < len(bits) else None
+        index += 2
+        if not part:
+            continue
+        try:
+            tokens = shlex.split(part, posix=True)
+        except ValueError:
+            raise ModelError('LEASE_SCOPE_MISMATCH', 'Shell working directory is not a literal path') from None
+        while tokens and _ASSIGNMENT.match(tokens[0]):
+            del tokens[0]
+        if not tokens:
+            continue
+        if tokens[0] == 'cd':
+            # `|` and `||` do not leave the following command in that directory.
+            if separator not in {'&&', ';', None}:
+                raise ModelError('LEASE_SCOPE_MISMATCH', 'Shell working directory is not a literal path')
+            dest = _cd_destination(tokens)
+            if not dest:
+                raise ModelError('LEASE_SCOPE_MISMATCH', 'Shell working directory is not a literal path')
+            path = Path(dest)
+            current = (path if path.is_absolute() else current / path).resolve()
+            continue
+        prefix = _prefix_directory(tokens)
+        if prefix is False:
+            raise ModelError('LEASE_SCOPE_MISMATCH', 'Shell working directory is not a literal path')
+        if prefix:
+            path = Path(prefix)
+            current = (path if path.is_absolute() else current / path).resolve()
+        return str(current)
+    return str(current)
+
+
 def _segment_effect(part):
     try:
         tokens = shlex.split(part, posix=True)
     except ValueError:
         return 'UNKNOWN'
+    # FOO=bar cmd runs cmd. The assignment itself writes nothing.
+    while tokens and _ASSIGNMENT.match(tokens[0]):
+        del tokens[0]
     if not tokens:
         return 'READ_ONLY'
     base = tokens[0].rsplit('/', 1)[-1]
     if base in {'sudo', 'command', 'time', 'nohup'} and len(tokens) > 1:
-        return _segment_effect(' '.join(tokens[1:]))
+        return _segment_effect(' '.join(shlex.quote(token) for token in tokens[1:]))
+    # `env rm` must be classified as rm. Bare env/printenv only print.
+    if base == 'env':
+        tail = _env_command(tokens[1:])
+        if not tail:
+            return 'READ_ONLY'
+        return _segment_effect(' '.join(shlex.quote(token) for token in tail))
+    if base == 'printenv':
+        return 'READ_ONLY'
+    if base == 'cd':
+        return 'READ_ONLY'
     if base == 'git':
         sub = next((token for token in tokens[1:] if not token.startswith('-')), '')
         if sub in _GIT_WRITE:
@@ -58,7 +200,21 @@ def _segment_effect(part):
         if sub in _GIT_READ:
             return 'READ_ONLY'
         return 'UNKNOWN'
-    if base in {'npm', 'pnpm', 'yarn'} and 'test' in tokens[1:3]:
+    if base in {'npm', 'pnpm', 'yarn'}:
+        args = _positional(tokens)
+        # `npm run build` writes dist/. `npm test` / `npm ls` do not.
+        if args[:2] == ['run', 'build']:
+            return 'WRITE'
+        if args[:1] == ['test'] or args[:2] == ['run', 'test'] or args[:1] in (['ls'], ['list']):
+            return 'READ_ONLY'
+        if 'test' in tokens[1:3]:
+            return 'READ_ONLY'
+        return 'UNKNOWN'
+    if base == 'npx':
+        if _positional(tokens)[:2] == ['vitest', 'run']:
+            return 'READ_ONLY'
+        return 'UNKNOWN'
+    if base == 'node' and tokens[1:] and set(tokens[1:]) <= {'--version', '-v'}:
         return 'READ_ONLY'
     if base == 'sed':
         return 'WRITE' if '-i' in tokens or any(token.startswith('--in-place') for token in tokens) else 'READ_ONLY'
@@ -105,9 +261,11 @@ CONTROL_TOOL = {'type': 'function', 'function': {
         'specialists_consulted); capability (capability,status,target,source); review '
         '(id,repository,sha,artifact_fact_id,test_revision,verdict); gate (id,kind,result,metadata); '
         'worktree (path,lease_id,base_sha,branch,state,dirty,pushed). '
-        'Before Write/Edit acquire a covering write lease. Read-only shell (pwd, ls, git status, cat, npm test) '
-        'needs no write lease. A mutating or unknown shell needs a write lease covering the paths it changes, '
-        'not the filesystem root. Release after reconciling worktrees. '
+        'Before Write/Edit acquire a covering write lease. Read-only shell (pwd, ls, git status, cat, npm test, '
+        'npm ls, node --version, npx vitest run) needs no write lease. A leading cd or VAR=value/env prefix '
+        'does not itself write. npm run build and other mutating or unknown shell need a write lease covering '
+        'the command directory (leading cd or --prefix), not the whole workspace and not the filesystem root. '
+        'Release after reconciling worktrees. '
         'Never submit credentials. Security decisions require explicit IDs; agents cannot resolve them.'),
     'parameters': {'type': 'object', 'properties': {'operation': {'type': 'string'},
         'data': {'type': 'object'}}, 'required': ['operation', 'data']}}}
@@ -259,8 +417,12 @@ class ChannelSession:
             raise ModelError('WRITE_LEASE_REQUIRED', 'Acquire a covering Coordination write lease before executing')
         if self.identity.ssh_host:
             raise ModelError('remote_scope_unverified', 'Remote execution scopes are not verified')
-        # Unknown or mutating shell is checked against the workspace, not the filesystem root.
-        target = str(Path(self.identity.workspace).resolve()) if name == 'Bash' else str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
+        # Bash runs in a leading `cd <dir>` or `--prefix <dir>`, otherwise the workspace root.
+        # A lease on that directory is enough. Do not demand a lease on the whole workspace.
+        if name == 'Bash':
+            target = bash_workdir(str(arguments.get('command', '')), self.identity.workspace)
+        else:
+            target = str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
         state = self.call('check', path=target)['state']
         for tree in state['worktrees'].values():
             foreign = tree['instance_id'] != self.binding['instance_id']

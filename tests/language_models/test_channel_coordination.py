@@ -67,6 +67,81 @@ def test_guard_bash_is_global_and_paths_canonicalized(bound):
     with pytest.raises(ModelError):session.tool('acquire',{'repository':'/unrelated','paths':['.']})
 
 
+def test_shell_effect_prefixes_package_scripts_and_env(bound):
+    from pathlib import Path
+    from subjective_devagents_fastapi.channel_coordination import shell_effect
+    session, journal, identity = bound
+    before = len(journal.calls)
+    read_only = (
+        'cd sub && pwd',
+        'cd sub && npm ls',
+        'cd "my dir" && node --version',
+        'node --version',
+        'npm ls',
+        'npx vitest run',
+        'npx --yes vitest run',
+        'env',
+        'printenv',
+        'printenv PATH',
+        'FOO=bar ls',
+        'FOO=1 env',
+        'cd sub && npx vitest run',
+    )
+    for command in read_only:
+        assert shell_effect(command) == 'READ_ONLY', command
+        session.guard('Bash', {'command': command})
+    assert len(journal.calls) == before
+    write = (
+        'npm run build',
+        'cd sub && npm run build',
+        'npm --prefix sub run build',
+        'env rm -rf x',
+        'env -u PATH rm -rf x',
+        'env FOO=1 rm -rf x',
+        'FOO=bar rm -rf x',
+        'FOO=bar env rm x',
+        'sudo env rm x',
+    )
+    for command in write:
+        assert shell_effect(command) == 'WRITE', command
+        with pytest.raises(ModelError, match='write lease') as error:
+            session.guard('Bash', {'command': command})
+        assert error.value.code == 'WRITE_LEASE_REQUIRED'
+    root = str(Path(identity.workspace).resolve())
+    sub = Path(root) / 'pkg'
+    sub.mkdir()
+    session.tool('acquire', {'repository': identity.workspace, 'paths': ['pkg']})
+    covered = [str(sub)]
+
+    def scoped(body):
+        result = journal(body)
+        if body['op'] == 'check':
+            target = body['path']
+            if not any(scope == target or target.startswith(scope.rstrip('/') + '/') for scope in covered):
+                raise ModelError('LEASE_SCOPE_MISMATCH', 'Tool target is outside lease')
+        return result
+
+    session._client = scoped
+    for command, expected in (
+        ('cd pkg && npm run build', sub),
+        ('npm --prefix pkg run build', sub),
+        ('npm --prefix=pkg run build', sub),
+        ('--prefix pkg npm run build', sub),
+        ('cd pkg && cd nested && rm out', sub / 'nested'),
+    ):
+        session.guard('Bash', {'command': command})
+        assert journal.calls[-1]['path'] == str(expected), command
+    with pytest.raises(ModelError, match='outside lease'):
+        session.guard('Bash', {'command': 'npm run build'})
+    with pytest.raises(ModelError, match='literal path'):
+        session.guard('Bash', {'command': 'cd $HOME && rm secret'})
+    with pytest.raises(ModelError, match='literal path'):
+        session.guard('Bash', {'command': 'cd pkg | rm secret'})
+    covered[:] = [root]
+    session.guard('Bash', {'command': 'npm run build'})
+    assert journal.calls[-1]['path'] == root
+
+
 def test_read_only_shell_does_not_require_a_write_lease(bound):
     from subjective_devagents_fastapi.channel_coordination import shell_effect
     session, journal, _identity = bound
