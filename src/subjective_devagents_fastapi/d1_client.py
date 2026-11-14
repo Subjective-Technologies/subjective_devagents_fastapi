@@ -92,11 +92,38 @@ class D1Client:
         self._headers = {"Content-Type": "application/json", **d1_auth_headers(self.env)}
         if "Authorization" not in self._headers and "X-Auth-Key" not in self._headers:
             raise D1Error("No Cloudflare token/key available for D1.")
-        if not self.account_id or not self.database_id:
-            raise D1Error("CLOUDFLARE_ACCOUNT_ID and SUBJECTIVE_DEVAGENTS_D1_DATABASE_ID are required.")
+        if not self.account_id:
+            raise D1Error("CLOUDFLARE_ACCOUNT_ID is required for D1.")
 
     def _url(self) -> str:
-        return f"{CF_API}/accounts/{self.account_id}/d1/database/{self.database_id}/query"
+        return f"{CF_API}/accounts/{self.account_id}/d1/database/{self._database_id()}/query"
+
+    def _database_id(self) -> str:
+        """Use the configured id, or resolve the named database once.
+
+        Conversation sync pins the replica id. The user/company authorization
+        check uses the shared ``subjective`` database, whose id need not be
+        copied into this service's environment.
+        """
+        if self.database_id:
+            return self.database_id
+        request = urllib.request.Request(
+            f"{CF_API}/accounts/{self.account_id}/d1/database",
+            headers=self._headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise D1Error(f"D1 HTTP {error.code}: {detail}") from error
+        if not payload.get("success"):
+            raise D1Error(f"D1 error: {payload.get('errors')}")
+        for database in payload.get("result") or []:
+            if database.get("name") == self.database_name and database.get("uuid"):
+                self.database_id = str(database["uuid"])
+                return self.database_id
+        raise D1Error("The configured D1 database was not found.")
 
     def _post(self, sql: str, params: Iterable[Any] | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"sql": sql}
