@@ -233,8 +233,8 @@ class AppState:
                 conversations = conversations_for_sync(self.core.llm_service)
             default_log("info", "D1 conversation sync start", {"reason": reason, "conversations": len(conversations)})
             stats = sync_conversations(D1Client(), conversations)
-            stats.update({"ok": True, "reason": reason, "ms": int((time.time() - started) * 1000)})
-            default_log("info", "D1 conversation sync done", stats)
+            stats.update({"ok": stats.get("failed", 0) == 0, "reason": reason, "ms": int((time.time() - started) * 1000)})
+            default_log("error" if stats.get("failed") else "info", "D1 conversation sync done", stats)
             self.d1_last_sync = stats
             return stats
         except D1Error as error:

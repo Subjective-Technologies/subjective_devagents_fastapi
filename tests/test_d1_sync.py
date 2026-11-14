@@ -120,3 +120,33 @@ def test_unknown_provider_is_skipped_not_inserted():
     stats = sync_conversations(SqliteExecutor(db), [_chat(provider="mystery")], host="h1")
     assert stats["upserted"] == 0
     assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("provider", ["kimi", "antigravity", "ssh"])
+def test_sync_seeds_missing_provider(provider):
+    db = _db()
+    stats = sync_conversations(SqliteExecutor(db), [_chat(provider=provider)])
+    assert stats["failed"] == 0
+    assert stats["upserted"] == 1
+
+
+def test_sync_keeps_existing_parent_id(monkeypatch):
+    db = _db()
+    executor = SqliteExecutor(db)
+    assert sync_conversations(executor, [_chat()])["failed"] == 0
+    previous = db.execute("SELECT id FROM conversations").fetchone()[0]
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_D1_NAMESPACE", "00000000-0000-4000-8000-000000000002")
+    stats = sync_conversations(executor, [_chat(updatedAt=1_760_000_200_000)])
+    assert stats["failed"] == 0
+    assert db.execute("SELECT id FROM conversations").fetchone()[0] == previous
+
+
+def test_flattened_import_updates_provider_consistently():
+    db = _db()
+    executor = SqliteExecutor(db)
+    assert sync_conversations(executor, [_chat()])["failed"] == 0
+    stats = sync_conversations(executor, [_chat(provider="codex", sessionId="different", updatedAt=1_760_000_200_000)])
+    assert stats["failed"] == 0
+    assert db.execute("SELECT current_provider_id FROM conversations").fetchone()[0] == "codex"
+    assert db.execute("SELECT provider_id, provider_session_id FROM conversation_sessions").fetchone()[:] == ("codex", "different")
+    assert not db.execute("PRAGMA foreign_key_check").fetchall()

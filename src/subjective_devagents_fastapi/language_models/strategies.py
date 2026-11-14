@@ -19,6 +19,8 @@ from .contracts import Cancelled, Emit, ModelError, ModelRequest, ModelResult, M
 from .transports import Command, LocalProcess, ProcessTransport, SshTunnel
 
 MAX_CONTEXT_BYTES = 512 * 1024
+# Bound upstream inference independently of the entire tool loop.
+API_AGENT_CALL_TIMEOUT = 120.0
 
 
 def provider_error_code(event: dict) -> str:
@@ -455,6 +457,8 @@ class Api(ModelStrategy):
                     return ModelResult("timed_out", error_code="timed_out")
                 await asyncio.wait({task}, timeout=0.1)
             return await task
+        except httpx.TimeoutException:
+            return ModelResult("timed_out", error_code="timed_out")
         except httpx.HTTPError:
             return ModelResult("failed", error_code="provider_unreachable")
         finally:
@@ -561,6 +565,8 @@ def http_error_code(status: int, body: str = "") -> str:
     text = (body or "").lower()
     if any(word in text for word in _QUOTA_WORDS):
         return "quota_exhausted"
+    if status in {408, 504}:
+        return "timed_out"
     if status == 429:
         return "rate_limited"
     if status in {401, 403}:
@@ -1088,6 +1094,7 @@ class ApiAgent(ModelStrategy):
         return result
 
     async def _call(self, identity, token: str, messages: list, tools: dict, timeout: float, cancelled: Cancelled):
+        timeout = min(timeout, API_AGENT_CALL_TIMEOUT)
         payload = {"model": identity.model, "messages": messages, "stream": False}
         if tools:
             payload["tools"] = list(tools.values())
@@ -1097,7 +1104,8 @@ class ApiAgent(ModelStrategy):
                 response = await client.post(identity.api_base_url.rstrip("/") + "/chat/completions",
                                              headers={"Authorization": f"Bearer {token}"}, json=payload)
                 if response.status_code != 200:
-                    return ModelResult("failed", error_code=http_error_code(response.status_code, response.text[:2000]))
+                    code = http_error_code(response.status_code, response.text[:2000])
+                    return ModelResult("timed_out" if code == "timed_out" else "failed", error_code=code)
                 try:
                     data = response.json()
                     choice = data["choices"][0]
@@ -1118,6 +1126,8 @@ class ApiAgent(ModelStrategy):
                     return ModelResult("timed_out", error_code="timed_out")
                 await asyncio.wait({task}, timeout=0.1)
             return await task
+        except httpx.TimeoutException:
+            return ModelResult("timed_out", error_code="timed_out")
         except httpx.HTTPError:
             return ModelResult("failed", error_code="provider_unreachable")
         finally:

@@ -158,6 +158,14 @@ def sync_conversations(
 ) -> dict[str, int]:
     host = host or os.environ.get("SUBJECTIVE_DEVAGENTS_HOST") or socket.gethostname()
     stamp = now_iso()
+    # Histories may contain providers introduced after the initial seed.
+    # Preserve existing operator-managed provider settings.
+    for provider in sorted({map_provider(c.get("provider")) for c in conversations} - {None}):
+        executor.execute(
+            """INSERT INTO providers (id, display_name, vendor, kind, created_at, updated_at)
+               VALUES (?, ?, ?, 'cli', ?, ?) ON CONFLICT(id) DO NOTHING""",
+            (provider, provider, provider, stamp, stamp),
+        )
     stats = {"seen": 0, "upserted": 0, "skipped": 0, "failed": 0, "messages": 0}
     for conversation in conversations:
         stats["seen"] += 1
@@ -188,10 +196,13 @@ def _sync_one(executor: SqlExecutor, conversation: dict, *, host: str, stamp: st
         return False
 
     messages = conversation.get("messages") if isinstance(conversation.get("messages"), list) else []
-    conversation_id = stable_id("conv", target)
+    stored = _one(executor, "SELECT id FROM conversations WHERE target = ?", (target,))
+    conversation_id = stored["id"] if stored else stable_id("conv", target)
     session_key = str(conversation.get("sessionId") or "")
-    session_id = stable_id("sess", conversation_id, provider, session_key or "none")
-    turn_id = stable_id("turn", session_id, "1")
+    stored_session = _one(executor, "SELECT id FROM conversation_sessions WHERE conversation_id = ? AND seq = 1", (conversation_id,))
+    session_id = stored_session["id"] if stored_session else stable_id("sess", conversation_id, provider, session_key or "none")
+    stored_turn = _one(executor, "SELECT id FROM turns WHERE conversation_id = ? AND seq = 1", (conversation_id,))
+    turn_id = stored_turn["id"] if stored_turn else stable_id("turn", session_id, "1")
     origin = "imported" if conversation.get("origin") == "history" else (
         conversation.get("origin") if conversation.get("origin") in {"local", "imported", "api", "web"} else "local"
     )
@@ -248,6 +259,7 @@ def _sync_one(executor: SqlExecutor, conversation: dict, *, host: str, stamp: st
           os_user, workspace, source_file, status, started_at, metadata_json, created_at, updated_at
         ) VALUES (?, ?, 1, ?, ?, 'import', ?, ?, ?, 'open', ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+          provider_id = excluded.provider_id,
           provider_session_id = excluded.provider_session_id,
           os_user = excluded.os_user,
           workspace = excluded.workspace,
@@ -276,6 +288,7 @@ def _sync_one(executor: SqlExecutor, conversation: dict, *, host: str, stamp: st
           started_at, ended_at, metadata_json, created_at, updated_at
         ) VALUES (?, ?, ?, 1, 'user', 'completed', ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+          session_id = excluded.session_id,
           ended_at = excluded.ended_at,
           updated_at = excluded.updated_at
         """,

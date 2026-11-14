@@ -610,3 +610,26 @@ def test_selected_proxy_model_reaches_inference(monkeypatch, tmp_path):
             assert proxy.requests[0][2]["model"] == "gpt-selected"
         finally:
             backend.close()
+
+
+@pytest.mark.parametrize("status", [408, 504])
+def test_upstream_timeout_is_reported_as_timeout(request_data, monkeypatch, status):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    with ScriptedProxy([(status, 0, {"error": "request timeout"})]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+    assert result.status == "timed_out"
+    assert result.error_code == "timed_out"
+
+
+def test_inference_wait_has_separate_bound(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    monkeypatch.setattr("subjective_devagents_fastapi.language_models.strategies.API_AGENT_CALL_TIMEOUT", 0.1)
+    with ScriptedProxy([(200, 0.4, completion(content="too late")[2])]) as proxy:
+        request = replace(request_data, timeout=30, identity=replace(request_data.identity, api_base_url=proxy.url))
+        started = time.monotonic()
+        result = ApiAgent().run(request, lambda *_: None, lambda: False)
+        elapsed = time.monotonic() - started
+    assert result.status == "timed_out"
+    assert result.error_code == "timed_out"
+    assert elapsed < 1
