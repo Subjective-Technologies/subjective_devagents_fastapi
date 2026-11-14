@@ -181,6 +181,8 @@ def _segment_effect(part):
     if not tokens:
         return 'READ_ONLY'
     base = tokens[0].rsplit('/', 1)[-1]
+    if base in {'pytest', 'py.test'} or (re.fullmatch(r'python(?:[0-9]+(?:\.[0-9]+)*)?', base) and tokens[1:3] == ['-m', 'pytest']):
+        return 'READ_ONLY'
     if base in {'sudo', 'command', 'time', 'nohup'} and len(tokens) > 1:
         return _segment_effect(' '.join(shlex.quote(token) for token in tokens[1:]))
     # `env rm` must be classified as rm. Bare env/printenv only print.
@@ -250,7 +252,7 @@ def concrete_user_decision(text):
     return bool(question)
 
 UNREACHABLE_GRACE = 30.0
-TOOL_OPERATIONS = {'task', 'recover', 'reissue', 'adopt_worktree', 'blocker', 'snapshot', 'acquire', 'release', 'fact', 'decision', 'discovery',
+TOOL_OPERATIONS = {'task', 'recover_task_lease', 'recover', 'reissue', 'adopt_worktree', 'blocker', 'snapshot', 'acquire', 'release', 'fact', 'decision', 'discovery',
                    'capability', 'route', 'privilege', 'review', 'gate', 'worktree'}
 CONTROL_TOOL = {'type': 'function', 'function': {
     'name': 'Coordination',
@@ -290,6 +292,12 @@ class ChannelSession:
         self.privilege = None
         self._state = None
         self.tool_capabilities = set()
+        self.delegation = None
+        self.completion_store = None
+        self.fence_root = None
+        self.pending_start = None
+        self.heartbeat_interval = max(1.0, float(os.environ.get('COORDINATION_HEARTBEAT_INTERVAL', '15')))
+        self._last_touch = 0.0
 
     def __repr__(self):
         return f'ChannelSession(channel={self.binding["channel_id"]!r}, instance={self.binding["instance_id"]!r})'
@@ -305,9 +313,15 @@ class ChannelSession:
             base = os.environ.get('SUBJECTIVE_CHAT_COORDINATION_URL',
                 'https://dashboard.subjectivetechnologies.com/api/chat-proxy').rstrip('/')
             try:
+                route = '/chat/conversations/' + self.binding['channel_id'] + '/coordination'
+                if self.delegation:
+                    base = os.environ.get('COORDINATION_CALLBACK_URL', '').rstrip('/')
+                    if not base:
+                        raise ModelError('coordination_unavailable', 'Runtime callback URL is not configured')
+                    route = '/internal/collaboration/' + self.binding['channel_id'] + '/coordination'
                 with httpx.Client(timeout=12, follow_redirects=False, trust_env=False) as client:
-                    response = client.post(base + '/chat/conversations/' + self.binding['channel_id'] + '/coordination',
-                        headers={'Authorization': self._authorization}, json=body)
+                    response = client.post(base + route,
+                        headers=self._headers(), json=body)
                 payload = response.json()
                 if response.status_code != 200 or not payload.get('ok'):
                     error = payload.get('error')
@@ -321,6 +335,28 @@ class ChannelSession:
             raise ModelError(result['code'], json.dumps({k: v for k, v in result.items() if k != 'state'}))
         return result
 
+    def _headers(self):
+        if self.delegation:
+            import jwt
+            signed = jwt.encode({**self.delegation, 'aud': 'chat-coordination', 'exp': int(time.time()) + 60},
+                                os.environ['COORDINATION_SERVICE_SECRET'], algorithm='HS256')
+            return {'X-Collaboration-Grant': signed}
+        return {'Authorization': self._authorization}
+
+    def defer_start(self, identity, version, agent_role=None):
+        self.pending_start = (identity, version, agent_role)
+
+    def worker_started(self):
+        if self.pending_start:
+            args, self.pending_start = self.pending_start, None
+            self.start(*args)
+
+    def activity(self, tool=None):
+        now = time.monotonic()
+        if tool or now - self._last_touch >= self.heartbeat_interval:
+            self.call('touch', **({'tool': tool} if tool else {}))
+            self._last_touch = now
+
     def start(self, identity, version, agent_role=None):
         self.identity = identity
         self.runtime = identity.id
@@ -330,7 +366,18 @@ class ChannelSession:
             raise ModelError('coordination_disabled', 'Channel coordination is disabled')
         if snapshot['workflow_id'] != self.binding['workflow_id']:
             raise ModelError('workflow_identity_conflict', 'Channel workflow identity changed')
-        self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor)
+        started = self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor,
+                            heartbeat_interval=self.heartbeat_interval)
+        if started.get('dispatch'):
+            # A late delivery can atomically adopt an unclaimed successor; bind all later calls to it.
+            self.binding.update(dispatch_id=started['dispatch']['id'], instance_id=started['dispatch']['instance_id'])
+            if self.delegation:
+                self.delegation.update(dispatch_id=self.binding['dispatch_id'], instance_id=self.binding['instance_id'])
+        self.activity()
+        if identity.sandbox == 'workspace-write' and self.recoverable_leases(same_agent=True):
+            recovered = json.loads(self.tool('recover_task_lease', {}))
+            if recovered.get('leases'):
+                self.lease_id = recovered['leases'][0]['id']
         legacy = Path(identity.workspace) / 'workflow/WORKFLOW_VERSION'
         if not identity.ssh_host and legacy.is_file():
             observed = legacy.read_text()[:80].strip()
@@ -342,7 +389,7 @@ class ChannelSession:
 
     def context(self):
         state = self.call('snapshot')['state']
-        state['leases'] = {key: lease for key, lease in state['leases'].items() if lease['status'] in {'active', 'revoking', 'recovery_required', 'expired'}}
+        state['leases'] = {key: lease for key, lease in state['leases'].items() if lease['status'] in {'active', 'revoking', 'recovery_required', 'expired', 'recoverable'}}
         # The state is supplied separately on every turn; never rely on transcript replay.
         return '\nCHANNEL RUNTIME CONTEXT (authoritative journal; reported facts retain provenance):\n' + json.dumps({
             'workflow_id': state['workflow_id'], 'workflow_version': state['workflow_version'],
@@ -351,10 +398,43 @@ class ChannelSession:
             **{key: state.get(key, [] if key == 'completed_gates' else {}) for key in ('facts', 'leases', 'decisions', 'capabilities', 'reviews', 'gates', 'worktrees', 'discoveries', 'blockers', 'completed_gates')}
         }, sort_keys=True)
 
+    def recoverable_leases(self, same_agent=False):
+        state = self._state or {}
+        dispatch = state.get('dispatches', {}).get(self.binding['dispatch_id'], {})
+        return [lease for lease in state.get('leases', {}).values()
+                if lease.get('status') in {'recoverable', 'expired'}
+                and (not same_agent or lease.get('agent_id') == self.actor)
+                and (lease.get('task_id'), lease.get('task_revision')) == (dispatch.get('task_id'), dispatch.get('task_revision'))]
+
+    def inspect_workspace(self, repository):
+        """Observe on the execution host; preserve every byte of existing work in place."""
+        if self.identity.ssh_host:
+            raise ModelError('remote_scope_unverified', 'Recovery needs an execution-host observer')
+        location = Path(repository).resolve()
+        root = Path(self.identity.workspace).resolve()
+        registered = (self._state or {}).get('worktrees', {}).get(str(location))
+        if not location.is_relative_to(root) and not registered:
+            raise ModelError('lease_outside_workspace', 'Cannot inspect an unrelated worktree')
+        def git(*args):
+            result = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(location), *args],
+                capture_output=True, text=True, timeout=10, env={'PATH': '/usr/local/bin:/usr/bin:/bin',
+                'HOME': self.identity.home or self.identity.workspace, 'GIT_OPTIONAL_LOCKS': '0'})
+            if result.returncode:
+                raise ModelError('worktree_observation_failed', 'Cannot inspect repository before lease recovery')
+            return result.stdout.strip()
+        git_dir = Path(git('rev-parse', '--absolute-git-dir'))
+        operations = [name for name in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD')
+                      if (git_dir / name).exists()]
+        return {'repository': str(location), 'head': git('rev-parse', 'HEAD'),
+                'dirty': bool(git('status', '--porcelain')), 'operation_in_progress': operations,
+                'preserved': True, 'observed_at': time.time(), 'source': 'runtime_git_status'}
+
     def tool(self, operation, data):
         if operation not in TOOL_OPERATIONS or not isinstance(data, dict):
             raise ModelError('coordination_operation_forbidden', 'Unknown or privileged coordination operation')
         data = dict(data)
+        if operation == 'recover_task_lease' and self.identity.sandbox != 'workspace-write':
+            raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Read-only runtime cannot recover write leases')
         if operation == 'acquire':
             if data.get('mode', 'write') == 'write' and (self.identity.sandbox != 'workspace-write' or (self.identity.allowed_tools and not {'Bash', 'Write', 'Edit'}.intersection(self.identity.allowed_tools))):
                 raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Runtime has no mutating tools')
@@ -393,7 +473,20 @@ class ChannelSession:
             # Agents may declare capabilities, but only observed tool execution proves them.
             if data.get('status') == 'proven':
                 raise ModelError('capability_proof_required', 'Runtime tool observations, not declarations, prove capabilities')
-        result = self.call(operation, **data)
+        if operation in {'acquire', 'recover_task_lease'}:
+            self.call('snapshot')
+            from .workspace_fence import mutation_fence
+            recoverable = self.recoverable_leases()
+            if recoverable:
+                with mutation_fence(self):
+                    repositories = sorted({lease.get('physical_repository', lease['repository']) for lease in recoverable})
+                    observations = [self.inspect_workspace(repository) for repository in repositories]
+                    data['workspace_observation'] = {'repositories': observations, 'preserved': True}
+                    result = self.call(operation, **data)
+            else:
+                result = self.call(operation, **data)
+        else:
+            result = self.call(operation, **data)
         if operation == 'acquire':
             self.lease_id = result['lease']['id']
         if operation == 'release' and data.get('lease_id', self.lease_id) == self.lease_id:
@@ -409,6 +502,11 @@ class ChannelSession:
     def guard(self, name, arguments):
         if name not in {'Bash', 'Write', 'Edit'}:
             return
+        if self.identity.sandbox != 'workspace-write':
+            command = str(arguments.get('command', ''))
+            if name != 'Bash' or shell_effect(command) != 'READ_ONLY' or re.search(r'[<>$`()\n]', command):
+                raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Read-only runtime permits observation and test commands only')
+            return
         if name == 'Bash' and shell_effect(str(arguments.get('command', ''))) == 'READ_ONLY':
             return
         if self.privilege and self.privilege['privilege_level'] != 'scoped':
@@ -423,7 +521,9 @@ class ChannelSession:
             target = bash_workdir(str(arguments.get('command', '')), self.identity.workspace)
         else:
             target = str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
-        state = self.call('check', path=target)['state']
+        checked = self.call('check', path=target)
+        self.lease_id = checked.get('lease', {}).get('id', self.lease_id)
+        state = checked['state']
         for tree in state['worktrees'].values():
             foreign = tree['instance_id'] != self.binding['instance_id']
             affected = name == 'Bash' and (tree['state'] == 'abandoned' or tree.get('dirty'))
@@ -433,11 +533,11 @@ class ChannelSession:
         self.last_check = time.monotonic()
 
     def revoked(self):
-        if not self.lease_id or time.monotonic() - self.last_check < 2:
+        if self.closed or time.monotonic() - self.last_check < 2:
             return False
         self.last_check = time.monotonic()
         try:
-            self.call('heartbeat')
+            self.call('heartbeat') if self.lease_id else self.call('touch')
             self._unreachable_since = None
             return False
         except ModelError as error:
@@ -495,9 +595,26 @@ class ChannelSession:
             self.blocked = True
         return ensure_header(reply, self.version, self.agent_role)
 
-    def finish(self, status, error_code=None):
+    def completion_payload(self, status, error_code=None, result=None):
+        outcome = ('blocked' if self.blocked or status == 'blocked' else
+                   'completed' if status == 'completed' else 'failed')
+        data = {'status': outcome, 'error_code': error_code,
+                'executor_stopped': status not in {'interrupted', 'timed_out'} and 'uncertain' not in str(error_code)}
+        if result is not None:
+            data['result'] = result
+        return {'binding': self.binding, 'actor': self.actor, 'delegation': self.delegation, 'data': data}
+
+    def finish(self, status, error_code=None, result=None):
         if self.closed:
             return
+        payload = self.completion_payload(status, error_code, result)
+        if self.delegation and self.completion_store:
+            with self.completion_store.connection() as db:
+                db.execute('INSERT OR REPLACE INTO coordination_completions VALUES(?,?)',
+                           (self.binding['dispatch_id'], json.dumps(payload)))
+        self.call('finish', **payload['data'])
+        if self.delegation and self.completion_store:
+            with self.completion_store.connection() as db:
+                db.execute('DELETE FROM coordination_completions WHERE dispatch_id=?', (self.binding['dispatch_id'],))
         self.closed = True
-        self.call('finish', status='blocked' if self.blocked else 'completed' if status == 'completed' else 'blocked' if status == 'blocked' else 'failed', executor_stopped=status not in {'interrupted', 'timed_out'} and 'uncertain' not in str(error_code))
         self._authorization = ''

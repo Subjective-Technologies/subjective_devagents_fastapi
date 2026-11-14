@@ -92,6 +92,9 @@ class LanguageModel:
         turn = self.store.turn(identifier)
         log.info("LanguageModel turn started turn_id=%s identity=%s", identifier, turn["identity"]["id"])
         try:
+            if coordination:
+                coordination.completion_store = self.store
+                coordination.worker_started()
             identity = Identity(**turn["identity"])
             history = tuple(Message(**item) for item in self.store.conversation(turn["conversation_id"])["messages"])
             request = ModelRequest(identifier, identity, turn["prompt"], history, turn["session_id"], turn["timeout"],
@@ -99,7 +102,11 @@ class LanguageModel:
             strategy = self.strategies.get(f"{identity.strategy}:{identity.provider}") or self.strategies.get(identity.strategy)
             if strategy is None:
                 raise ModelError("unsupported_provider", "No execution strategy is registered.")
-            result = strategy.run(request, lambda kind, data: self.store.event(identifier, kind, data),
+            def emit(kind, data):
+                if coordination and kind in {'tool_call', 'tool_result', 'message', 'activity'}:
+                    coordination.activity(data.get('name') if kind == 'tool_call' else None)
+                self.store.event(identifier, kind, data)
+            result = strategy.run(request, emit,
                                   lambda: self._stopping.is_set() or bool(self.store.turn(identifier)["cancel_requested"]))
         except ModelError as error:
             result = ModelResult("failed", error_code=error.code)
@@ -118,14 +125,16 @@ class LanguageModel:
             except ModelError as error:
                 result = ModelResult("interrupted", error_code=error.code)
         try:
-            self.store.finish(identifier, result)
+            completion = (coordination.completion_payload(result.status, result.error_code,
+                          {'text': result.text, 'error_code': result.error_code}) if coordination and coordination.delegation else None)
+            self.store.finish(identifier, result, completion=completion)
         except Exception:
             log.exception("LanguageModel could not record the turn turn_id=%s", identifier)
             result = ModelResult("interrupted", error_code="worker_exception")
             self.store.finish(identifier, result)
         if coordination:
             try:
-                coordination.finish(result.status, result.error_code)
+                coordination.finish(result.status, result.error_code, result={'text': result.text, 'error_code': result.error_code})
             except ModelError as error:
                 self.store.event(identifier, "coordination_reconciliation_required", {"code": error.code})
         log.info("LanguageModel turn finished turn_id=%s status=%s error_code=%s",

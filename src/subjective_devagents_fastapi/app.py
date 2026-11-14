@@ -323,10 +323,20 @@ async def lifespan(application: FastAPI):
 
     # Both API surfaces share one durable execution engine.
     application.state.language_model = core.llm_service.backend.model
+    async def completion_loop():
+        from .collaboration import replay_completions
+        while True:
+            try:
+                await asyncio.to_thread(replay_completions, core.llm_service.backend.model.store)
+            except Exception:
+                default_log('error', 'Collaboration result replay failed', {})
+            await asyncio.sleep(1)
+    completion_task = asyncio.create_task(completion_loop())
     refresh_task = asyncio.create_task(refresh_loop())
     try:
         yield
     finally:
+        completion_task.cancel()
         refresh_task.cancel()
         default_log("info", "Shutting down")
         await asyncio.to_thread(core.shutdown)
@@ -353,6 +363,9 @@ async def require_api_token(request: Request, call_next):
     unauthenticated request must not reach a handler that reads conversations or starts a
     turn. Static UI files stay public: they are an empty shell without the API.
     """
+    if request.url.path == '/api/collaboration/execute' and request.method == 'POST':
+        # This one endpoint verifies a dispatch-scoped service grant in its handler.
+        return await call_next(request)
     if auth.is_workflow_read_path(request.url.path):
         # Read-only prompt access for agents: its own token, GET only.
         if request.method != "GET" or not auth.workflow_token_is_valid(request.headers):
@@ -983,7 +996,12 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
             # The role name the definition told the model to sign with (header[1]), not the AI
             # user id: otherwise every correct reply was logged as WORKFLOW_VERSION_CONFLICT.
             role = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or (None, None))[1]
-            await asyncio.to_thread(channel.start, identity, version, role)
+            with journal.connection() as db:
+                claimed = db.execute('INSERT OR IGNORE INTO channel_admissions VALUES(?,?)', (binding['dispatch_id'], target)).rowcount
+            if not claimed:
+                raise ModelError('DISPATCH_SUPPRESSED', 'Dispatch already admitted')
+            channel.fence_root = str(Path(journal.path).parent / 'mutation-fences')
+            channel.defer_start(identity, version, role)
             with journal.connection() as db:
                 db.execute("INSERT OR IGNORE INTO channel_bindings VALUES(?,?,?)", (target, binding["channel_id"], actor))
             exported_identity = (instance.llm_service.agent_turns.get(target) or {}).get("workflow_identity", {})
@@ -2035,3 +2053,28 @@ async def unhandled_error(request: Request, error: Exception) -> JSONResponse:
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.post('/api/collaboration/execute')
+async def api_collaboration_execute(request: Request, body: dict = Body(...)):
+    from .collaboration import execute
+    from .language_models.contracts import ModelError
+    try:
+        return await asyncio.to_thread(execute, core().llm_service, body, request.headers.get('X-Collaboration-Grant', ''))
+    except ModelError as error:
+        return JSONResponse(status_code=409, content={'ok': False, 'error': error.code})
+
+
+@app.post('/api/collaboration/attachments')
+async def api_collaboration_attachments(request: Request, body: dict = Body(...)):
+    from .collaboration import save_attachments
+    from .language_models.contracts import ModelError
+    claims = getattr(request.state, 'devagents_claims', {})
+    owner = claims.get('sub')
+    if not owner:
+        return JSONResponse(status_code=401, content={'ok': False, 'error': 'firebase_identity_required'})
+    try:
+        reference = await asyncio.to_thread(save_attachments, core().llm_service, body.get('files', []), owner)
+        return {'ok': True, 'reference': reference}
+    except ModelError as error:
+        return JSONResponse(status_code=422, content={'ok': False, 'error': error.code})

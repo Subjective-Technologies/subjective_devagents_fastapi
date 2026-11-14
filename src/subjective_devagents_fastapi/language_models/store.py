@@ -35,6 +35,9 @@ class TurnStore:
         with self.connection() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS collaboration_dispatches (dispatch_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS coordination_completions (dispatch_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS channel_admissions (dispatch_id TEXT PRIMARY KEY, target TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS channel_bindings (target TEXT PRIMARY KEY, channel_id TEXT NOT NULL, actor_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY, identity TEXT NOT NULL,
@@ -196,7 +199,7 @@ class TurnStore:
                 self._event(db, identifier, "state", {"status": "running"})
             return claimed
 
-    def finish(self, identifier: str, result: ModelResult):
+    def finish(self, identifier: str, result: ModelResult, *, completion=None):
         if result.status not in TERMINAL:
             raise ValueError("Invalid terminal state")
         with self.connection() as db:
@@ -211,6 +214,9 @@ class TurnStore:
                        (result.session_id if result.status == "completed" else None,
                         int(result.status == "interrupted"), row["conversation_id"]))
             self._event(db, identifier, "state", {"status": result.status, "error_code": result.error_code})
+            if completion:
+                db.execute('INSERT OR REPLACE INTO coordination_completions VALUES(?,?)',
+                           (completion['binding']['dispatch_id'], json.dumps(completion)))
 
     def cancel(self, identifier: str) -> dict:
         with self.connection() as db:

@@ -952,6 +952,9 @@ class ApiAgent(ModelStrategy):
         if coordination:
             from ..channel_coordination import CONTROL_TOOL
             tools["Coordination"] = CONTROL_TOOL
+            if identity.sandbox == 'read-only' and (not identity.allowed_tools or 'Bash' in identity.allowed_tools):
+                # ChannelSession.guard classifies these commands; Write/Edit stay absent.
+                tools['Bash'] = AGENT_TOOLS['Bash']
             original_cancelled = cancelled
             cancelled = lambda: original_cancelled() or coordination.revoked()
         emit("runtime", {
@@ -1040,7 +1043,7 @@ class ApiAgent(ModelStrategy):
         return ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod
-    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None, coordination=None):
+    def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None, coordination=None, fenced=False):
         name = (call.get("function") or {}).get("name") or ""
         call_id = str(call.get("id") or "")
         try:
@@ -1051,7 +1054,19 @@ class ApiAgent(ModelStrategy):
             return "Error: tool arguments were not valid JSON."
         if name not in tools:
             return f"Error: tool {name!r} is not permitted in this session."
+        from ..channel_coordination import shell_effect
+        if coordination and identity.sandbox == 'workspace-write' and not fenced and (name in {"Write", "Edit"} or
+                (name == "Bash" and shell_effect(str(arguments.get("command", ""))) != "READ_ONLY")):
+            from ..workspace_fence import mutation_fence
+            try:
+                with mutation_fence(coordination):
+                    return ApiAgent._dispatch(call, tools, identity, transport, cancelled, timeout, emit, edited, coordination, True)
+            except ModelError as error:
+                return f"Error: {error.code}: {error}"
         if coordination:
+            activity = getattr(coordination, 'activity', None)
+            if activity:
+                activity(name)
             try:
                 if name == "Coordination":
                     return coordination.tool(arguments.get("operation"), arguments.get("data", {}))

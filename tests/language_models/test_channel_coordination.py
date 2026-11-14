@@ -276,3 +276,39 @@ def test_lease_lost_turn_reports_failure_not_operator_stop(bound, monkeypatch):
     result=ApiAgent().run(request,lambda *a:None,lambda:False)
     assert result.status=='failed' and result.error_code=='coordination_lease_lost:LEASE_RECOVERY_REQUIRED'
     assert ApiAgent().run(request,lambda *a:None,lambda:True).status=='cancelled'
+
+
+def test_read_only_verifier_can_execute_test_shell_but_cannot_write(bound, monkeypatch):
+    session, journal, identity = bound
+    session.identity = replace(identity, sandbox='read-only')
+    monkeypatch.setenv('TEST_KEY', 'fixture')
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call('1', 'Bash', command='pwd')]),
+        completion(content='PASS: observed workspace'),
+    ]) as proxy:
+        result = ApiAgent().run(ModelRequest('verify', replace(session.identity, api_base_url=proxy.url),
+            'verify', timeout=5, coordination=session), lambda *_: None, lambda: False)
+    assert result.status == 'completed'
+    session.guard('Bash', {'command': 'npx vitest run'})
+    for command in ('rm file', 'npm run build', 'echo overwrite > file', 'ls $(touch file)'):
+        with pytest.raises(ModelError):
+            session.guard('Bash', {'command': command})
+
+
+def test_read_only_pytest_stage_runs_real_test(bound, monkeypatch):
+    import sys
+    from pathlib import Path
+    session, journal, identity = bound
+    session.identity = replace(identity, sandbox='read-only')
+    monkeypatch.setenv('TEST_KEY', 'fixture')
+    probe = Path(identity.workspace) / 'test_probe.py'
+    probe.write_text('def test_probe():\n    assert 2 + 2 == 4\n')
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call('pytest', 'Bash', command=f'{sys.executable} -m pytest -q {probe}')]),
+        completion(content='PASS: pytest executed'),
+    ]) as proxy:
+        result = ApiAgent().run(ModelRequest('verify-pytest', replace(session.identity, api_base_url=proxy.url),
+            'verify', timeout=10, coordination=session), lambda *_: None, lambda: False)
+    assert result.status == 'completed'
+    outputs = [message['content'] for message in proxy.requests[1][2]['messages'] if message['role'] == 'tool']
+    assert any('1 passed' in output for output in outputs)

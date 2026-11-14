@@ -82,6 +82,8 @@ def test_busy_refused_before_dispatch_start_and_role_header_expected(client, mon
         answers=[m for m in client.get('/api/llm/conversation',params={'target':target}).json()['conversation']['messages'] if m['role']=='assistant']
         if answers:break
         time.sleep(.01)
-    assert answers[0]['text']=='[WF:7][agent:coder_agent]\nDone.'
+    assert answers[0]['text'].startswith('[WF:7][agent:coder_agent]\n')
+    assert answers[0]['text'].endswith('\nDone.')
+    assert '[RT:turn=' in answers[0]['text']
     assert [data['agent_role'] for op,data in calls if op=='start']==['coder_agent']
     assert not any(op=='gate' and data['kind']=='WORKFLOW_VERSION_DIAGNOSTIC' for op,data in calls)

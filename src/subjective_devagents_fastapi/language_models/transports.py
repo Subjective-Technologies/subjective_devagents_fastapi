@@ -74,10 +74,11 @@ class LocalProcess(ProcessTransport):
             return ProcessResult(-1, "", "", "cancelled")
         deadline = time.monotonic() + timeout
         try:
+            from ..workspace_fence import inherited_fds, child_command
             process = subprocess.Popen(
-                command.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                child_command(command.argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, cwd=command.cwd, env=dict(command.env),
-                start_new_session=True, bufsize=0,
+                start_new_session=True, bufsize=0, pass_fds=inherited_fds(),
             )
         except (OSError, ValueError):
             # Exception messages can contain credential-bearing paths or args.
