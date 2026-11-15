@@ -296,6 +296,7 @@ class ChannelSession:
         self.completion_store = None
         self.fence_root = None
         self.pending_start = None
+        self.start_acknowledged = False
         self.heartbeat_interval = max(1.0, float(os.environ.get('COORDINATION_HEARTBEAT_INTERVAL', '15')))
         self._last_touch = 0.0
 
@@ -375,7 +376,19 @@ class ChannelSession:
     def worker_started(self):
         if self.pending_start:
             args, self.pending_start = self.pending_start, None
-            self.start(*args)
+            try:
+                self.start(*args)
+            except ModelError as error:
+                if not self.start_acknowledged and error.code in {
+                    'DISPATCH_SUPPRESSED', 'EXECUTION_ACTIVE', 'INSTANCE_MISMATCH', 'INSTANCE_NOT_RUNNING',
+                    'DISPATCH_NOT_RUNNING', 'STALE_ASSIGNMENT', 'workflow_identity_conflict', 'coordination_unavailable',
+                }:
+                    # A losing/uncertain admission owns no execution to finish. In
+                    # particular it must never terminate another worker's live row.
+                    self.closed = True
+                    self.delegation = None
+                    self._authorization = ''
+                raise
 
     def activity(self, tool=None):
         now = time.monotonic()
@@ -404,6 +417,7 @@ class ChannelSession:
             raise ModelError('workflow_identity_conflict', 'Channel workflow identity changed')
         started = self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor,
                             heartbeat_interval=self.heartbeat_interval)
+        self.start_acknowledged = True
         if started.get('dispatch'):
             # A late delivery can atomically adopt an unclaimed successor; bind all later calls to it.
             self.binding.update(dispatch_id=started['dispatch']['id'], instance_id=started['dispatch']['instance_id'])
@@ -644,7 +658,8 @@ class ChannelSession:
         outcome = ('blocked' if self.blocked or status == 'blocked' else
                    'completed' if status == 'completed' else 'failed')
         data = {'status': outcome, 'error_code': error_code,
-                'executor_stopped': status not in {'interrupted', 'timed_out'} and 'uncertain' not in str(error_code)}
+                'executor_stopped': status not in {'interrupted', 'timed_out'} and 'uncertain' not in str(error_code),
+                'failed_before_start': not self.start_acknowledged}
         if result is not None:
             data['result'] = result
         return {'binding': self.binding, 'actor': self.actor, 'delegation': self.delegation, 'data': data}
@@ -660,6 +675,7 @@ class ChannelSession:
         self.call('finish', **payload['data'])
         if self.delegation and self.completion_store:
             with self.completion_store.connection() as db:
-                db.execute('DELETE FROM coordination_completions WHERE dispatch_id=?', (self.binding['dispatch_id'],))
+                db.execute('DELETE FROM coordination_completions WHERE dispatch_id=? AND payload=?',
+                           (self.binding['dispatch_id'], json.dumps(payload)))
         self.closed = True
         self._authorization = ''

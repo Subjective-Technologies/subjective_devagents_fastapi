@@ -57,7 +57,7 @@ def _serve(monkeypatch, export, seen=None):
         return _Response(json.dumps(export).encode())
 
     monkeypatch.setattr(aw.urllib.request, "urlopen", opener)
-    monkeypatch.setattr(aw, "fetch_export", lambda company, auth, opener=opener: _real_fetch(company, auth, opener=opener))
+    monkeypatch.setattr(aw, "fetch_export", lambda company, auth, opener=opener, **kwargs: _real_fetch(company, auth, opener=opener, **kwargs))
 
 
 _real_fetch = aw.fetch_export
@@ -139,3 +139,29 @@ def test_the_service_fetch_uses_the_service_token_header(monkeypatch):
     monkeypatch.delenv("SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN")
     with pytest.raises(aw.WorkflowUnavailable):
         aw.fetch_export_as_service(COMPANY, opener=opener)
+
+
+@pytest.mark.parametrize('as_service', [False, True])
+def test_assigned_version_is_fetched_and_cached_separately_from_latest(monkeypatch, as_service):
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', 'existing-service-fixture')
+    latest, assigned = '20261115000000', '20261114000000'
+    seen = []
+    def opener(request, timeout):
+        seen.append(request.full_url)
+        return _Response(json.dumps(_export(assigned if '?version=' in request.full_url else latest)).encode())
+    def fetch(version=''):
+        return (aw.fetch_export_as_service(COMPANY, opener=opener, version=version) if as_service
+                else aw.fetch_export(COMPANY, 'Bearer fixture', opener=opener, version=version))
+    assert fetch()['version']['version'] == latest
+    assert fetch(assigned)['version']['version'] == assigned
+    assert fetch()['version']['version'] == latest
+    assert fetch(assigned)['version']['version'] == assigned
+    assert len(seen) == 2 and seen[1].endswith('?version='+assigned)
+
+
+def test_assigned_version_response_cannot_silently_change_and_invalid_stamp_is_refused():
+    def opener(request, timeout): return _Response(json.dumps(_export('20261115000000')).encode())
+    with pytest.raises(aw.WorkflowUnavailable, match='differs from the channel'):
+        aw.fetch_export(COMPANY, 'Bearer fixture', opener=opener, version='20261114000000')
+    with pytest.raises(aw.WorkflowUnavailable, match='valid published workflow'):
+        aw.fetch_export(COMPANY, 'Bearer fixture', opener=opener, version='invalid?version=other')

@@ -23,6 +23,7 @@ def image_support(identity: Identity) -> bool:
 class IdentityRegistry:
     def __init__(self, identities: list[Identity]):
         self._identities: dict[str, Identity] = {}
+        self._runtime_ids: set[str] = set()
         homes: set[tuple[str, str]] = set()
         configs: set[tuple[str, str]] = set()
         for identity in identities:
@@ -102,6 +103,19 @@ class IdentityRegistry:
             raise ModelError("identity_changed", "Existing identity cannot be retargeted.")
         self._identities[identity.id] = identity
 
+    def register_runtime(self, identity: Identity) -> None:
+        """Register a derived execution identity without adding a selectable account."""
+        if identity.id in self._identities and identity.id not in self._runtime_ids:
+            raise ModelError('identity_changed', 'Derived execution identity collides with an existing account.')
+        already_runtime = identity.id in self._runtime_ids
+        self._runtime_ids.add(identity.id)
+        try:
+            self.register_legacy(identity)
+        except Exception:
+            if not already_runtime:
+                self._runtime_ids.discard(identity.id)
+            raise
+
     @classmethod
     def load(cls, path: str) -> "IdentityRegistry":
         data = json.loads(Path(path).read_text())
@@ -118,4 +132,4 @@ class IdentityRegistry:
                  "strategy": item.strategy, "remote": bool(item.ssh_host),
                  "capabilities": {"text": True, "attachments": image_support(item),
                                   "interactive_approvals": False, "native_resume": item.strategy == "cli"}}
-                for item in self._identities.values()]
+                for item in list(self._identities.values()) if item.id not in self._runtime_ids]

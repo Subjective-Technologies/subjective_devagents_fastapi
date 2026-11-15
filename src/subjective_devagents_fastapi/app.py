@@ -959,6 +959,20 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
         from . import agent_workflow
 
         try:
+            options = {}
+            if isinstance(body.get('coordination'), dict):
+                from .channel_coordination import ChannelSession
+                from .language_models.contracts import ModelError
+                binding = body['coordination']
+                actor = str(agent.get('user_id') or binding.get('agent_id') or '')
+                try:
+                    lookup = ChannelSession(binding, actor, request.headers.get('authorization', ''))
+                    assigned = (await asyncio.to_thread(lookup.call, 'snapshot'))['state'].get('workflow_version')
+                except ModelError as error:
+                    instance.llm_service.settle_send(target)
+                    return JSONResponse(status_code=409, content={'ok': False, 'error': error.code})
+                if isinstance(assigned, str) and agent_workflow._VERSION.fullmatch(assigned):
+                    options['version'] = assigned
             text = await asyncio.to_thread(
                 agent_workflow.prepare_turn,
                 instance.llm_service.agent_turns,
@@ -967,6 +981,7 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
                 request.headers.get("authorization", ""),
                 text,
                 instance.llm_service.app_home,
+                **options,
             )
         except agent_workflow.WorkflowUnavailable as error:
             instance.llm_service.settle_send(target)
@@ -1048,7 +1063,9 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
         except Exception as error:  # noqa: BLE001
             default_log("error", "LLM send background crash", {"target": target, "message": str(error)})
         finally:
-            if channel and not channel.closed:
+            if channel and not channel.closed and not (channel.delegation and channel.completion_store):
+                # Once the worker owns a durable receipt, cleanup must not replace
+                # its result/error with a generic second failed completion.
                 try:
                     await asyncio.to_thread(channel.finish, "failed")
                 except Exception:

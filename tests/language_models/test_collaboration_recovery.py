@@ -51,10 +51,16 @@ def system(tmp_path, monkeypatch):
     journal.mutate(channel, 'owner', {'op': 'enable', 'enabled': True}, manager=True, human=True)
     original_call = ChannelSession.call
     def local_call(self, op, **data):
-        result = journal.mutate(channel, self.actor, {**data, 'op': op, '_runtime': True,
-            'dispatch_id': self.binding['dispatch_id'], 'instance_id': self.binding['instance_id'],
-            **({'lease_id': self.lease_id} if self.lease_id and 'lease_id' not in data else {})})
+        from subjective_chat_api.errors import ApiError
+        try:
+            result = journal.mutate(channel, self.actor, {**data, 'op': op, '_runtime': True,
+                'dispatch_id': self.binding['dispatch_id'], 'instance_id': self.binding['instance_id'],
+                **({'lease_id': self.lease_id} if self.lease_id and 'lease_id' not in data else {})})
+        except ApiError as error:
+            raise ModelError(error.code, error.message) from None
         self._state = result['state']
+        if result.get('code') in {'LEASE_CONFLICT', 'WORKFLOW_VERSION_CONFLICT'}:
+            raise ModelError(result['code'], 'Channel coordination rejected operation')
         return result
     monkeypatch.setattr(ChannelSession, 'call', local_call)
     identity = Identity('runtime', 'codex', model='fixture', strategy='api_agent', workspace=str(repo), home=str(tmp_path),
@@ -76,7 +82,7 @@ def system(tmp_path, monkeypatch):
     export = {'version': {'version': '20261114000000'}, 'files': [
         {'path': 'AGENTS.md', 'content': 'Complete assigned work.'},
         {'path': 'agents/roles/coder_agent.md', 'content': 'Implement and test.'}]}
-    monkeypatch.setattr(agent_workflow, 'fetch_export_as_service', lambda company: export)
+    monkeypatch.setattr(agent_workflow, 'fetch_export_as_service', lambda company, **_kwargs: export)
     execution = {'prompt': 'Implement TASK-1', 'agents': {'ai_coder': {'user_id': 'ai_coder', 'company_id': 'company_test',
         'provider': 'codex', 'role_file': 'agents/roles/coder_agent.md', 'display_name': 'Coder'}}}
     class Hub:
@@ -309,8 +315,167 @@ def test_legacy_admission_http_payload_and_finish_after_login_expires(tmp_path, 
         session.authorize_service_callbacks('company_test')
         assert seen[0][2]['agent_id'] == 'ai_integration'
         assert session._authorization == '' and session.delegation['owner_id'] == 'owner'
-        session.call('start', runtime='runtime', workflow_version='v', heartbeat_interval=15)
+        session.start(Identity('runtime', 'codex', model='fixture', strategy='api_agent', workspace=str(tmp_path),
+            api_base_url='http://fixture.invalid', api_key_env='FIXTURE_KEY'), 'v', 'coder_agent')
         session.call('touch')
         session.finish('completed')
         state = chat.get(route, headers=user).json()['data']
         assert state['dispatches'][binding['dispatch_id']]['status'] == 'COMPLETED'
+
+
+@pytest.mark.parametrize('base_id', ['runtime', 'x' * 80])
+def test_server_dispatch_runs_read_only_role_with_valid_stable_identity(system, base_id):
+    import re
+    s = system
+    base_identity = replace(s.identity, id=base_id)
+    s.model.identities.register_legacy(base_identity)
+    s.service.backend.identity = lambda *_args, **_kwargs: base_identity
+    s.execution['agents']['ai_coder']['mode'] = 'read'
+    seen = []
+    class Observer(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            seen.append(request.identity)
+            assert request.identity.sandbox == 'read-only'
+            assert request.coordination.lease_id is None
+            with pytest.raises(ModelError): request.coordination.guard('Write', {'file_path': 'blocked.txt'})
+            return ModelResult('completed', 'TASK COMPLETE: read-only verification')
+    s.model.strategies['api_agent:codex'] = Observer()
+    item = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'Verify', 'execution':s.execution})['dispatch']
+    asyncio.run(ExecutionQueue(s.app, deliver=lambda payload, _unused: collaboration.execute(s.service,
+        {'binding':{key:payload['binding'][key] for key in ('channel_id','dispatch_id')}})).tick())
+    s.model.close()
+    assert len(seen) == 1 and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', seen[0].id)
+    assert s.model.identities.get(base_id).sandbox == 'workspace-write'
+    assert s.journal.snapshot(s.channel)['dispatches'][item['id']]['status'] == 'COMPLETED'
+    assert (s.repo/'a.py').read_text() == 'original\n'
+
+
+def test_server_dispatch_reads_assigned_published_workflow_instead_of_new_latest(system, monkeypatch):
+    s = system
+    original = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'prior stage'})['dispatch']
+    actor = ChannelSession(ChannelCoordination.binding(s.journal.snapshot(s.channel), original), 'ai_coder', '')
+    actor.start(s.identity, s.export['version']['version'], 'coder_agent')
+    actor.finish('completed')
+    requested = []
+    def published(company, **options):
+        requested.append(options.get('version'))
+        return s.export if options.get('version') == s.export['version']['version'] else {
+            **s.export, 'version': {'version':'20261115000000'}}
+    monkeypatch.setattr(agent_workflow, 'fetch_export_as_service', published)
+    class Observer(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            assert '[WF:20261114000000]' in request.prompt
+            return ModelResult('completed', 'TASK COMPLETE: assigned workflow honored')
+    s.model.strategies['api_agent:codex'] = Observer()
+    item = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'next stage','execution':s.execution})['dispatch']
+    asyncio.run(ExecutionQueue(s.app, deliver=lambda payload, _unused: collaboration.execute(s.service,
+        {'binding':{key:payload['binding'][key] for key in ('channel_id','dispatch_id')}})).tick())
+    s.model.close()
+    assert requested == ['20261114000000']
+    assert s.journal.snapshot(s.channel)['dispatches'][item['id']]['status'] == 'COMPLETED'
+
+
+def test_worker_start_failure_has_durable_visible_result(system):
+    s = system
+    s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'old'})
+    # An incompatible channel assignment must still report a failure; never fake start.
+    with s.database.lock:
+        state = s.journal._load(s.channel)
+        state['workflow_version'] = 'incompatible-version'
+        s.database.execute('UPDATE channel_coordination SET payload=? WHERE channel_id=?', (json.dumps(state), s.channel))
+    item = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'different', 'execution':s.execution})['dispatch']
+    # Cancel the unrelated earlier reservation so this dispatch becomes ready.
+    previous = item.get('queued_behind')
+    if previous: s.journal.mutate(s.channel, 'owner', {'op':'cancel_pending','dispatch_id':previous}, human=True, manager=True)
+    queue = ExecutionQueue(s.app, deliver=lambda payload, _unused: collaboration.execute(s.service,
+        {'binding':{key:payload['binding'][key] for key in ('channel_id','dispatch_id')}}))
+    asyncio.run(queue.tick())
+    s.model.close()
+    row = s.database.query_one('SELECT result FROM coordination_jobs WHERE dispatch_id=?', (item['id'],))
+    assert json.loads(row['result'])['error_code'] == 'WORKFLOW_VERSION_CONFLICT'
+    with s.model.store.connection() as db: assert db.execute('SELECT count(*) FROM coordination_completions').fetchone()[0] == 0
+    queue.deliver = lambda *_args: None
+    asyncio.run(queue.tick())
+    messages = s.database.query_all('SELECT body FROM messages WHERE conversation_id=?', (s.channel,))
+    assert any('WORKFLOW_VERSION_CONFLICT' in message['body'] for message in messages)
+
+
+def test_readonly_dispatch_does_not_ambiguate_real_configured_identity(system, monkeypatch, tmp_path):
+    from subjective_devagents_fastapi.language_models.legacy import LegacyLanguageModel
+    s = system
+    config = tmp_path/'configured-identities.json'
+    config.write_text(json.dumps({'identities':[s.identity.snapshot()]}))
+    monkeypatch.setenv('SUBJECTIVE_LANGUAGE_MODELS_CONFIG', str(config))
+    monkeypatch.setenv('SUBJECTIVE_LANGUAGE_MODELS_DB', str(tmp_path/'configured-runtime.sqlite3'))
+    backend = LegacyLanguageModel(str(tmp_path))
+    s.service.backend = backend
+    observed = []
+    class Recorder(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            observed.append(request.identity.sandbox)
+            return ModelResult('completed', 'TASK COMPLETE: configured execution')
+    backend.model.strategies = {'api_agent:codex':Recorder()}
+    try:
+        for mode in ('read', 'write', 'read'):
+            s.execution['agents']['ai_coder']['mode'] = mode
+            item = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'check '+mode,'execution':s.execution})['dispatch']
+            result = collaboration.execute(s.service, {'binding':{'channel_id':s.channel,'dispatch_id':item['id']}})
+            future = backend.model._futures.get(result['turn_id'])
+            if future: future.result(timeout=5)
+            assert backend.model.store.turn(result['turn_id'])['status'] == 'completed'
+            chosen = backend.identity({'provider':'codex','workspace':str(s.repo)}, execution_required=True)
+            assert chosen == s.identity
+            assert [row['id'] for row in backend.model.identities.public()] == ['runtime']
+        assert observed == ['read-only', 'workspace-write', 'read-only']
+    finally:
+        backend.close()
+
+
+def test_losing_start_claim_never_finishes_healthy_winner(system):
+    s = system
+    item = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'work','execution':s.execution})['dispatch']
+    binding = ChannelCoordination.binding(s.journal.snapshot(s.channel), item)
+    winner = ChannelSession(binding, 'ai_coder', '')
+    winner.start(s.identity, s.export['version']['version'], 'coder_agent')
+    winner.tool('acquire', {'repository':str(s.repo),'paths':['.']})
+    loser = ChannelSession(binding, 'ai_coder', 'Bearer caller-fixture')
+    loser.delegation = {**binding, 'owner_id':'owner'}
+    loser.defer_start(s.identity, s.export['version']['version'], 'coder_agent')
+    conversation = s.model.create(s.identity.id)['id']
+    turn = s.model.submit(conversation, 'Duplicate delivery', 'loser', coordination=loser)
+    future = s.model._futures.get(turn['id'])
+    if future: future.result(timeout=5)
+    assert s.model.store.turn(turn['id'])['error_code'] == 'DISPATCH_SUPPRESSED'
+    assert loser.closed and loser.delegation is None
+    state = s.journal.snapshot(s.channel)
+    assert state['dispatches'][item['id']]['status'] in {'STARTED','RUNNING'}
+    assert state['leases'][winner.lease_id]['status'] == 'active'
+    with s.model.store.connection() as db:
+        assert db.execute('SELECT count(*) FROM coordination_completions').fetchone()[0] == 0
+
+
+def test_conflicting_prestart_failure_cannot_finish_later_healthy_winner(system):
+    s = system
+    item = s.journal.mutate(s.channel, 'owner', {'op':'dispatch','agent_id':'ai_coder','assignment':'work','execution':s.execution})['dispatch']
+    binding = ChannelCoordination.binding(s.journal.snapshot(s.channel), item)
+    with s.database.lock:
+        state = s.journal._load(s.channel)
+        state['workflow_version'] = '20261114000000'
+        s.database.execute('UPDATE channel_coordination SET payload=? WHERE channel_id=?', (json.dumps(state), s.channel))
+    loser = ChannelSession(binding, 'ai_coder', '')
+    loser.delegation = {**binding,'owner_id':'owner'}
+    loser.completion_store = s.model.store
+    loser.defer_start(s.identity, '20261115000000', 'coder_agent')
+    with pytest.raises(ModelError) as conflict: loser.worker_started()
+    assert conflict.value.code == 'WORKFLOW_VERSION_CONFLICT' and not loser.start_acknowledged
+    winner = ChannelSession(binding, 'ai_coder', '')
+    winner.start(s.identity, '20261114000000', 'coder_agent')
+    winner.tool('acquire', {'repository':str(s.repo),'paths':['.']})
+    with pytest.raises(ModelError) as rejected: loser.finish('failed', 'WORKFLOW_VERSION_CONFLICT')
+    assert rejected.value.code == 'DISPATCH_ALREADY_STARTED'
+    collaboration.replay_completions(s.model.store)
+    state = s.journal.snapshot(s.channel)
+    assert state['dispatches'][item['id']]['status'] in {'STARTED','RUNNING'}
+    assert state['leases'][winner.lease_id]['status'] == 'active'
+    with s.model.store.connection() as db:
+        assert db.execute('SELECT count(*) FROM coordination_completions').fetchone()[0] == 0

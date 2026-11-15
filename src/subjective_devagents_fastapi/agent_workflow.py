@@ -67,29 +67,31 @@ def workflow_root(app_home: str) -> Path:
     return Path(configured) if configured else Path(app_home) / "workflows"
 
 
-def fetch_export_as_service(company_id: str, *, opener=urllib.request.urlopen) -> dict:
+def fetch_export_as_service(company_id: str, *, opener=urllib.request.urlopen, version: str = '') -> dict:
     """The published workflow read with DevAgents' own service token (agents' wf command)."""
     token = (os.environ.get("SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN") or "").strip()
     if not token:
         raise WorkflowUnavailable("DevAgents has no workflow service token configured.")
-    return fetch_export(company_id, "", opener=opener, service_token=token)
+    return fetch_export(company_id, "", opener=opener, service_token=token, version=version)
 
 
-def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "") -> dict:
+def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "", version: str = '') -> dict:
     """The company's current published workflow, as the caller (or the service) sees it."""
     if not _COMPANY.match(company_id or ""):
         raise WorkflowUnavailable("This agent names no valid workflow company.")
+    if version and not _VERSION.fullmatch(version):
+        raise WorkflowUnavailable('Channel names no valid published workflow version.')
     if not service_token and not authorization.lower().startswith("bearer "):
         raise WorkflowUnavailable("Sign in again to load this agent's workflow.")
     credential = f"service:{service_token}" if service_token else authorization
-    key = (company_id, hashlib.sha256(credential.encode()).hexdigest())
+    key = (company_id, hashlib.sha256((credential + '\0' + version).encode()).hexdigest())
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
         if hit and now - hit[0] < EXPORT_CACHE_SECONDS:
             return hit[1]
     request = urllib.request.Request(
-        f"{workflow_api()}/companies/{company_id}/workflow/export",
+        f"{workflow_api()}/companies/{company_id}/workflow/export" + (f'?version={version}' if version else ''),
         headers={
             **({"X-Workflow-Service-Token": service_token} if service_token else {"Authorization": authorization}),
             "Accept": "application/json",
@@ -108,9 +110,11 @@ def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.u
         raise WorkflowUnavailable(f"The workflow service answered {error.code}.") from error
     except (urllib.error.URLError, TimeoutError, ValueError) as error:
         raise WorkflowUnavailable("The workflow service could not be reached.") from error
-    version = str((export.get("version") or {}).get("version") or "")
-    if not _VERSION.match(version) or not isinstance(export.get("files"), list):
+    observed_version = str((export.get("version") or {}).get("version") or "")
+    if not _VERSION.match(observed_version) or not isinstance(export.get("files"), list):
         raise WorkflowUnavailable("The workflow service returned an unexpected answer.")
+    if version and observed_version != version:
+        raise WorkflowUnavailable('Published workflow response differs from the channel assignment.')
     with _cache_lock:
         _cache[key] = (now, export)
     return export
@@ -266,7 +270,7 @@ def execution_claim_has_runtime_evidence(agent_id: str, reply: str, evidence: di
     return int((evidence or {}).get("successfulToolCalls") or 0) > 0
 
 
-def prepare_turn(state: dict, target: str, agent: dict, authorization: str, text: str, app_home: str) -> str:
+def prepare_turn(state: dict, target: str, agent: dict, authorization: str, text: str, app_home: str, *, version: str = '') -> str:
     """The prompt to send for this turn, and the header the reply must carry.
 
     `state` is the service's per-conversation memory: the definition hash this
@@ -274,7 +278,7 @@ def prepare_turn(state: dict, target: str, agent: dict, authorization: str, text
     it is empty, so the definition is simply sent once more.
     """
     company_id = str(agent.get("company_id") or "")
-    export = fetch_export(company_id, authorization)
+    export = fetch_export(company_id, authorization, **({'version': version} if version else {}))
     workflow_dir = materialize(export, company_id, workflow_root(app_home))
     definition = compose_definition(export, agent, workflow_dir)
     digest = definition_hash(definition)

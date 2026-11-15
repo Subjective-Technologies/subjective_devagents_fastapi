@@ -1,6 +1,7 @@
 """Authoritative, idempotent server dispatch admission; no browser or instance addressing."""
 from __future__ import annotations
 from dataclasses import replace
+import hashlib
 import json
 import os
 import threading
@@ -84,10 +85,18 @@ def _execute_approved(service, job):
         if identity.strategy != 'api_agent' or identity.ssh_host:
             raise ModelError('coordinated_runtime_required', 'Collaboration requires a local runtime with per-tool fencing')
         if profile.get('mode') == 'read':
-            identity = replace(identity, id=identity.id + ':readonly', sandbox='read-only')
-            model.identities.register_legacy(identity)
+            identifier = 'readonly-' + hashlib.sha256(identity.id.encode()).hexdigest()
+            identity = replace(identity, id=identifier, sandbox='read-only')
+            try:
+                model.identities.register_runtime(identity)
+            except ValueError:
+                raise ModelError('invalid_runtime_identity', 'Read-only execution identity is invalid') from None
         from . import agent_workflow
-        export = agent_workflow.fetch_export_as_service(profile['company_id'])
+        channel = ChannelSession(binding, binding['agent_id'], '')
+        channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
+        assigned = channel.call('snapshot')['state'].get('workflow_version')
+        options = {'version': assigned} if isinstance(assigned, str) and agent_workflow._VERSION.fullmatch(assigned) else {}
+        export = agent_workflow.fetch_export_as_service(profile['company_id'], **options)
         folder = agent_workflow.materialize(export, profile['company_id'], agent_workflow.workflow_root(service.app_home))
         definition = agent_workflow.compose_definition(export, profile, folder)
         prompt = agent_workflow.wrap_turn(definition, execution['prompt'])
@@ -95,9 +104,7 @@ def _execute_approved(service, job):
             conversation_id = model.create(identity.id)['id']
             with model.store.connection() as db:
                 db.execute('INSERT INTO collaboration_dispatches VALUES(?,?)', (binding['dispatch_id'], conversation_id))
-        channel = ChannelSession(binding, binding['agent_id'], '')
         # Callback identity is resolved from the approved job; the existing service token stays in process env.
-        channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
         channel.fence_root = str(Path(model.store.path).parent / 'mutation-fences')
         channel.defer_start(identity, export['version']['version'], agent_workflow.agent_id_for(profile['role_file']))
         attachments = load_attachments(service, execution['attachment_ref'], claims['owner_id']) if execution.get('attachment_ref') else ()
@@ -116,10 +123,10 @@ def replay_completions(store):
         try:
             channel.call('finish', **payload['data'])
         except ModelError as error:
-            if error.code not in {'INSTANCE_NOT_RUNNING', 'DISPATCH_NOT_RUNNING', 'STALE_ASSIGNMENT', 'DISPATCH_NOT_FOUND', 'not_a_member'}:
+            if error.code not in {'INSTANCE_NOT_RUNNING', 'DISPATCH_NOT_RUNNING', 'DISPATCH_ALREADY_STARTED', 'STALE_ASSIGNMENT', 'DISPATCH_NOT_FOUND', 'not_a_member'}:
                 continue
         with store.connection() as db:
-            db.execute('DELETE FROM coordination_completions WHERE dispatch_id=?', (row['dispatch_id'],))
+            db.execute('DELETE FROM coordination_completions WHERE dispatch_id=? AND payload=?', (row['dispatch_id'], row['payload']))
 
 
 def save_attachments(service, files, owner_id):
