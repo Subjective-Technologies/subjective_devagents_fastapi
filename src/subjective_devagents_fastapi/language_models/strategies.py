@@ -1092,12 +1092,12 @@ class ApiAgent(ModelStrategy):
             detail = arguments.get('file_path')
         elif name in {'Glob', 'Grep'}:
             detail = arguments.get('path') or '.'
-        emit("tool_call", {"tool_call_id": call_id, "name": name, "detail": safe_tool_detail(detail, command=name == "Bash")})
-        step = ClaudeCli.tool_step(name, arguments)
-        if step:
-            preview = ("Running: " + (safe_tool_detail(arguments.get("command")) or "Bash")
-                       if name == "Bash" else safe_tool_detail(step, command=False))
-            emit("activity", {"text": preview})
+        preview = safe_tool_detail(detail, command=name == "Bash")
+        emit("tool_call", {"tool_call_id": call_id, "name": name, "detail": preview})
+        # Use exactly the same safe metadata for legacy progress listeners.
+        # Raw search patterns, URLs, queries and tool bodies never enter status.
+        label = "Running" if name == "Bash" else name
+        emit("activity", {"text": label + (": " + preview if preview else "")})
         if name in {"Write", "Edit"} and edited is not None and arguments.get("file_path"):
             # Already shown by the tool's own diff; the end-of-turn Bash diff skips it.
             edited.add(os.path.normpath(os.path.join(identity.workspace or "/", str(arguments["file_path"]))))

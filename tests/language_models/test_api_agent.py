@@ -634,3 +634,18 @@ def test_inference_wait_has_separate_bound(request_data, monkeypatch):
     assert result.status == "timed_out"
     assert result.error_code == "timed_out"
     assert elapsed < 1
+
+
+def test_search_status_never_publishes_raw_pattern(request_data, monkeypatch):
+    monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
+    with ScriptedProxy([
+        completion(tool_calls=[tool_call("search", "Grep", pattern="fixture7", path=".")]),
+        completion(content="Search finished."),
+    ]) as proxy:
+        request = replace(request_data, identity=replace(request_data.identity, api_base_url=proxy.url))
+        events = []
+        result = ApiAgent().run(request, lambda *event: events.append(event), lambda: False)
+    assert result.status == "completed"
+    progress = [data for kind, data in events if kind in {"activity", "tool_call"}]
+    assert "fixture7" not in str(progress)
+    assert any(data.get("detail") == "." for data in progress)
