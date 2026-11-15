@@ -270,3 +270,47 @@ def test_durable_images_are_owner_checked_and_survive_reload(system):
         collaboration.load_attachments(s.service, reference, 'another')
     with pytest.raises(ModelError):
         collaboration.load_attachments(s.service, '../runtime.db', 'owner')
+
+
+def test_legacy_admission_http_payload_and_finish_after_login_expires(tmp_path, monkeypatch):
+    import httpx
+    from fastapi.testclient import TestClient
+    from subjective_chat_api.main import create_app
+    from subjective_chat_api import service_auth
+    monkeypatch.setenv('COORDINATION_COMPANY_ID', 'company_test')
+    monkeypatch.setenv('COORDINATION_CALLBACK_URL', 'https://chat.fixture')
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', 'existing-service-token-fixture')
+    monkeypatch.setenv('SUBJECTIVE_CHAT_ENVIRONMENT', 'development')
+    monkeypatch.setenv('SUBJECTIVE_CHAT_ALLOW_DEV_AUTH', '1')
+    monkeypatch.setenv('SUBJECTIVE_CHAT_DB_PATH', str(tmp_path/'admission.sqlite3'))
+    monkeypatch.setattr(service_auth, 'verify_service_identity', lambda token: None if token == 'existing-service-token-fixture' else pytest.fail('wrong service identity'))
+    with TestClient(create_app()) as chat:
+        user = {'x-dev-user-id': 'owner'}
+        channel = chat.post('/chat/conversations', headers=user, json={'type':'group','name':'Integration recovery','member_ids':['ai_integration']}).json()['data']['conversation']['id']
+        route = f'/chat/conversations/{channel}/coordination'
+        response = chat.post(route, headers=user, json={'op':'dispatch','agent_id':'ai_integration','assignment':'Integration check'}).json()['data']
+        binding = ChannelCoordination.binding(response['state'], response['dispatch'])
+        session = ChannelSession(binding, 'ai_integration', 'Bearer initial-browser-fixture')
+        seen = []
+        class Bridge:
+            def __init__(self, **kwargs):
+                assert kwargs['follow_redirects'] is False and kwargs['trust_env'] is False
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def post(self, url, *, headers, json):
+                seen.append((url, dict(headers), dict(json)))
+                if url.endswith('/admit'):
+                    assert headers['Authorization'] == 'Bearer initial-browser-fixture'
+                    headers = {**headers, **user}
+                else:
+                    assert 'Authorization' not in headers
+                return chat.post(url.removeprefix('https://chat.fixture'), headers=headers, json=json)
+        monkeypatch.setattr(httpx, 'Client', Bridge)
+        session.authorize_service_callbacks('company_test')
+        assert seen[0][2]['agent_id'] == 'ai_integration'
+        assert session._authorization == '' and session.delegation['owner_id'] == 'owner'
+        session.call('start', runtime='runtime', workflow_version='v', heartbeat_interval=15)
+        session.call('touch')
+        session.finish('completed')
+        state = chat.get(route, headers=user).json()['data']
+        assert state['dispatches'][binding['dispatch_id']]['status'] == 'COMPLETED'

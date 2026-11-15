@@ -1002,6 +1002,8 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
             version = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or ("inline",))[0]
             if bound_channel and (bound_channel["channel_id"], bound_channel["actor_id"]) != (binding.get("channel_id"), actor):
                 raise ModelError("channel_binding_conflict", "Conversation belongs to another channel/agent")
+            company = agent.get('company_id') if isinstance(agent, dict) else None
+            await asyncio.to_thread(channel.authorize_service_callbacks, company or os.environ.get('COORDINATION_COMPANY_ID'))
             # The role name the definition told the model to sign with (header[1]), not the AI
             # user id: otherwise every correct reply was logged as WORKFLOW_VERSION_CONFLICT.
             role = ((instance.llm_service.agent_turns.get(target) or {}).get("header") or (None, None))[1]

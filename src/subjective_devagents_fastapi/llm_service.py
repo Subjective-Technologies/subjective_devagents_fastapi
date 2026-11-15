@@ -1747,7 +1747,9 @@ class LlmService:
 
     def send_message(self, target: str, text: str, files: list | None = None) -> dict:
         lock = self._conversation_lock(target)
-        if not lock.acquire(blocking=False):
+        # UI polling briefly takes this same lock to project/reload history.
+        # Give that reader time to finish instead of failing an accepted send.
+        if not lock.acquire(timeout=0.25):
             return {"ok": False, "status": "busy", "error": "Conversation is already processing a request."}
         try:
             return self._send_message(target, text, files)

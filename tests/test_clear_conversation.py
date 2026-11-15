@@ -108,3 +108,21 @@ def test_cleared_chat_replaces_d1_replica_messages(service):
     assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
     assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
     db.close()
+
+
+def test_short_history_reload_does_not_reject_accepted_send(service, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    def reload_reader():
+        with service._conversation_lock('reload-race'):
+            entered.set()
+            release.wait(2)
+    reader = threading.Thread(target=reload_reader)
+    reader.start()
+    assert entered.wait(1)
+    timer = threading.Timer(0.03, release.set)
+    monkeypatch.setattr(service, '_send_message', lambda target, text, files: {'ok':True, 'target':target})
+    timer.start()
+    try:
+        assert service.send_message('reload-race', 'Continue accepted work')['ok']
+    finally:
+        release.set(); timer.cancel(); reader.join(2)

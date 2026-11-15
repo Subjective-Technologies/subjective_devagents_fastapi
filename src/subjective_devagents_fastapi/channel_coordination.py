@@ -343,6 +343,32 @@ class ChannelSession:
             return {'X-Workflow-Service-Token': token}
         return {'Authorization': self._authorization}
 
+    def authorize_service_callbacks(self, company):
+        """Bind this caller-approved dispatch to the installed runtime before its login expires."""
+        if not company or company != os.environ.get('COORDINATION_COMPANY_ID'):
+            return
+        base = os.environ.get('COORDINATION_CALLBACK_URL', '').rstrip('/')
+        token = os.environ.get('SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN', '')
+        if not base or not token:
+            raise ModelError('coordination_unavailable', 'Existing runtime service authentication is unavailable')
+        try:
+            with httpx.Client(timeout=15, follow_redirects=False, trust_env=False) as client:
+                response = client.post(base + '/internal/collaboration/' + self.binding['channel_id'] + '/admit',
+                    headers={'Authorization': self._authorization, 'X-Workflow-Service-Token': token}, json={**self.binding, 'agent_id': self.actor})
+            payload = response.json()
+            if response.status_code != 200 or not payload.get('ok'):
+                error = payload.get('error', {})
+                raise ModelError(error.get('code', 'runtime_admission_denied') if isinstance(error, dict) else 'runtime_admission_denied',
+                                 'Runtime callback admission was rejected')
+            approved = payload['data']
+            if (any(approved['binding'].get(key) != value for key, value in self.binding.items())
+                    or approved['binding'].get('agent_id') != self.actor or not approved.get('owner_id')):
+                raise ModelError('runtime_scope_mismatch', 'Runtime admission differs from requested dispatch')
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            raise ModelError('coordination_unavailable', 'Runtime callback admission is unavailable') from None
+        self.delegation = {**self.binding, 'owner_id': approved['owner_id']}
+        self._authorization = ''
+
     def defer_start(self, identity, version, agent_role=None):
         self.pending_start = (identity, version, agent_role)
 
