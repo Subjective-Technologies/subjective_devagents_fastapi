@@ -6,7 +6,7 @@ import re
 def report(data, trace, model):
     reported_model = data.get('model')
     result = {'model': reported_model if isinstance(reported_model, str) and re.fullmatch(r'[A-Za-z0-9_./:-]{1,128}', reported_model) else model}
-    match = re.fullmatch(r'\d{14}-([A-Za-z0-9_-]{1,128})-[A-Za-z0-9]{8}', trace or '')
+    match = re.fullmatch(r'\d{14}-([A-Za-z0-9_-]{1,128})-(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}|[A-Za-z0-9]{8})', trace or '')
     if match:
         result['account'] = hashlib.sha256(match[1].encode()).hexdigest()[:24]
     raw = data.get('usage')
