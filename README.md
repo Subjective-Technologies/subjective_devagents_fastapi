@@ -397,3 +397,28 @@ The legacy production checkout and canonical `clients/desktop/subjective_devagen
 checkout must contain the same frontend changes. Source fingerprints are captured at
 backend startup; restart is required after deployment. The browser regression uses a
 temporary chat home, exercises two panes, clears one, drags it back, and reloads the page.
+
+
+### Collaboration activity usage and timeouts
+
+API-agent model calls report CLIProxy's canonical token usage to the channel journal.
+The runtime sends only numeric counts, model names, and a hashed reference derived
+from `X-CPA-TRACE-ID`; no API keys, OAuth tokens, prompts, or model reasoning are
+included. Cached input is a subset of prompt tokens, not additional tokens.
+Missing provider usage stays unknown. Unacknowledged receipts ride heartbeats and
+are included in the existing durable completion outbox for idempotent replay.
+
+Coordinated inference has a 300-second per-request cap and at most three attempts.
+Retries reuse the transcript containing completed tool results; they do not restart
+the tool loop. For coordinated tasks, the configured turn timeout is a no-progress
+window renewed after successful model responses and finished tool calls. The
+200-round cap, cancellation, and tool execution fences remain in effect. An
+exhausted inference-only timeout reports `model_request_timed_out` and releases
+its finished executor; uncertain tool execution retains its fencing requirements.
+
+The dashboard activity table can show configured API-equivalent USD estimates and
+provisional subscription allocations. Pricing is channel-scoped and owner/manager
+editable. Subscription fees and optional full-account token totals are scoped to a
+UTC calendar month. Without a full-account total, allocation uses observed usage
+within that channel only; other CLIProxy clients and unreported usage are excluded.
+These estimates are not provider invoices. No default prices are invented.

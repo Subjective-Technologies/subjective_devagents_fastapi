@@ -649,3 +649,53 @@ def test_search_status_never_publishes_raw_pattern(request_data, monkeypatch):
     progress = [data for kind, data in events if kind in {"activity", "tool_call"}]
     assert "fixture7" not in str(progress)
     assert any(data.get("detail") == "." for data in progress)
+
+
+def test_collaboration_inference_retry_does_not_repeat_tools(request_data, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv('TEST_AGENT_KEY','fixture-key')
+    executed=[]
+    monkeypatch.setattr('subjective_devagents_fastapi.language_models.strategies.execute_agent_tool',lambda *args: executed.append(args[0]) or 'done')
+    control=SimpleNamespace(context=lambda:'test',revoked=lambda:False,guard=lambda *_:None,observed=lambda *_:None)
+    with ScriptedProxy([completion(tool_calls=[tool_call('one','Bash',command='pwd')]),
+        (504,0,{'error':'timeout'}),completion(content='Done')]) as proxy:
+        request=replace(request_data,coordination=control,identity=replace(request_data.identity,sandbox='read-only',api_base_url=proxy.url))
+        events=[]
+        result=ApiAgent().run(request,lambda *event:events.append(event),lambda:False)
+    assert result.status=='completed' and executed==['Bash']
+    assert proxy.requests[2][2]['messages'][-1]['role']=='tool'
+    assert len([data for kind,data in events if kind=='model_usage' and data['status']=='completed'])==2
+
+
+def test_coordinated_progress_renews_window_without_hiding_stalled_requests(request_data, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv('TEST_AGENT_KEY','fixture-key')
+    monkeypatch.setattr('subjective_devagents_fastapi.language_models.strategies.execute_agent_tool',lambda *_:'done')
+    control=SimpleNamespace(context=lambda:'test',revoked=lambda:False,guard=lambda *_:None,observed=lambda *_:None)
+    replies=[completion(tool_calls=[tool_call('one','Bash',command='pwd')]),completion(tool_calls=[tool_call('two','Bash',command='pwd')]),completion(content='Done')]
+    with ScriptedProxy([(status,.2,body) for status,_,body in replies]) as proxy:
+        request=replace(request_data,timeout=.5,coordination=control,identity=replace(request_data.identity,sandbox='read-only',api_base_url=proxy.url))
+        started=time.monotonic()
+        result=ApiAgent().run(request,lambda *_:None,lambda:False)
+    assert result.status=='completed' and time.monotonic()-started>.5
+
+
+def test_coordinated_model_timeout_exhaustion_has_explicit_reason(request_data, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv('TEST_AGENT_KEY','fixture-key')
+    control=SimpleNamespace(context=lambda:'test',revoked=lambda:False)
+    with ScriptedProxy([(504,0,{'error':'timeout'})]*3) as proxy:
+        request=replace(request_data,coordination=control,identity=replace(request_data.identity,api_base_url=proxy.url))
+        result=ApiAgent().run(request,lambda *_:None,lambda:False)
+    assert result.error_code=='model_request_timed_out' and len(proxy.requests)==3
+
+
+def test_provider_usage_reaches_activity_receipt_without_estimation(request_data, monkeypatch):
+    monkeypatch.setenv('TEST_AGENT_KEY','fixture-key')
+    status,delay,body=completion(content='Done')
+    body['usage']={'prompt_tokens':100,'completion_tokens':50,'total_tokens':150,'prompt_tokens_details':{'cached_tokens':20,'cached_creation_tokens':10}}
+    with ScriptedProxy([(status,delay,body)]) as proxy:
+        events=[]
+        result=ApiAgent().run(replace(request_data,identity=replace(request_data.identity,api_base_url=proxy.url)),lambda *event:events.append(event),lambda:False)
+    receipt=[data for kind,data in events if kind=='model_usage' and data['status']=='completed'][0]
+    assert result.status=='completed' and receipt['input_tokens']==100 and receipt['total_tokens']==150 and receipt['cache_read_tokens']==20

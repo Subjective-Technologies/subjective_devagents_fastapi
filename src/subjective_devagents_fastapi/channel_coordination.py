@@ -299,6 +299,7 @@ class ChannelSession:
         self.start_acknowledged = False
         self.heartbeat_interval = max(1.0, float(os.environ.get('COORDINATION_HEARTBEAT_INTERVAL', '15')))
         self._last_touch = 0.0
+        self._usage_pending = {}
 
     def __repr__(self):
         return f'ChannelSession(channel={self.binding["channel_id"]!r}, instance={self.binding["instance_id"]!r})'
@@ -390,10 +391,12 @@ class ChannelSession:
                     self._authorization = ''
                 raise
 
-    def activity(self, tool=None, *, phase=None, detail=None, call_id=None):
+    def activity(self, tool=None, *, phase=None, detail=None, call_id=None, usage=None):
+        if isinstance(usage, dict) and isinstance(usage.get('id'), str):
+            self._usage_pending[usage['id']] = usage
         phase = phase or ('working' if tool else None)
         now = time.monotonic()
-        if tool or phase or now - self._last_touch >= self.heartbeat_interval:
+        if tool or phase or usage or now - self._last_touch >= self.heartbeat_interval:
             try:
                 from .activity_preview import safe_tool_detail
                 payload = {'tool': tool} if tool else {}
@@ -403,7 +406,12 @@ class ChannelSession:
                     payload['tool_detail'] = safe_tool_detail(detail, command=tool == 'Bash')
                 if isinstance(call_id, str):
                     payload['tool_call_id'] = call_id[:128]
+                pending = next(iter(self._usage_pending.values()), None)
+                if pending:
+                    payload['model_usage'] = pending
                 self.call('touch', **payload)
+                if pending and self._usage_pending.get(pending['id']) == pending:
+                    self._usage_pending.pop(pending['id'], None)
             except ModelError as error:
                 if error.code != 'coordination_unavailable':
                     raise
@@ -596,7 +604,10 @@ class ChannelSession:
             return False
         self.last_check = time.monotonic()
         try:
-            self.call('heartbeat') if self.lease_id else self.call('touch')
+            pending = next(iter(self._usage_pending.values()), None)
+            self.call('heartbeat' if self.lease_id else 'touch', **({'model_usage': pending} if pending else {}))
+            if pending and self._usage_pending.get(pending['id']) == pending:
+                self._usage_pending.pop(pending['id'], None)
             self._unreachable_since = None
             return False
         except ModelError as error:
@@ -667,8 +678,10 @@ class ChannelSession:
         outcome = ('blocked' if self.blocked or status == 'blocked' else
                    'completed' if status == 'completed' else 'failed')
         data = {'status': outcome, 'error_code': error_code,
-                'executor_stopped': status not in {'interrupted', 'timed_out'} and 'uncertain' not in str(error_code),
+                'executor_stopped': (status not in {'interrupted', 'timed_out'} or error_code == 'model_request_timed_out') and 'uncertain' not in str(error_code),
                 'failed_before_start': not self.start_acknowledged}
+        if self._usage_pending:
+            data['usage_receipts'] = list(self._usage_pending.values())[-600:]
         if result is not None:
             data['result'] = result
         return {'binding': self.binding, 'actor': self.actor, 'delegation': self.delegation, 'data': data}

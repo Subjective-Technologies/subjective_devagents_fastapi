@@ -104,7 +104,9 @@ class LanguageModel:
                 raise ModelError("unsupported_provider", "No execution strategy is registered.")
             def emit(kind, data):
                 if coordination:
-                    if kind == 'tool_call':
+                    if kind == 'model_usage':
+                        coordination.activity(usage=data)
+                    elif kind == 'tool_call':
                         coordination.activity(data.get('name'), phase='tool', detail=data.get('detail'), call_id=data.get('tool_call_id'))
                     elif kind == 'tool_result':
                         coordination.activity(phase='working')

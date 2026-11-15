@@ -10,6 +10,7 @@ import pwd
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path, PurePosixPath
 from abc import ABC, abstractmethod
 
@@ -20,7 +21,7 @@ from .transports import Command, LocalProcess, ProcessTransport, SshTunnel
 
 MAX_CONTEXT_BYTES = 512 * 1024
 # Bound upstream inference independently of the entire tool loop.
-API_AGENT_CALL_TIMEOUT = 120.0
+API_AGENT_CALL_TIMEOUT = 300.0
 
 
 def provider_error_code(event: dict) -> str:
@@ -1002,10 +1003,26 @@ class ApiAgent(ModelStrategy):
                 if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                     return ModelResult("failed", error_code="context_too_large")
             emit("runtime_status", {"phase": "model"})
-            outcome = await self._call(identity, token, messages, tools, remaining, cancelled)
-            if isinstance(outcome, ModelResult):
-                return outcome
-            message, finish_reason = outcome
+            # Retry inference only. Already executed tool calls stay in messages
+            # and are never repeated because a later model request timed out.
+            for attempt in range(3 if coordination else 1):
+                usage_id = str(uuid.uuid4())
+                emit("model_usage", {"id": usage_id, "model": identity.model, "status": "running"})
+                outcome = await self._call(identity, token, messages, tools, max(0.01, deadline - time.monotonic()), cancelled)
+                if not isinstance(outcome, ModelResult):
+                    break
+                emit("model_usage", {"id": usage_id, "model": identity.model, "status": outcome.error_code or outcome.status})
+                if not coordination or outcome.status != 'timed_out' or attempt == 2 or deadline <= time.monotonic():
+                    if coordination and outcome.status == 'timed_out':
+                        return ModelResult('timed_out', 'Model request timed out after retries. Earlier tool calls were not repeated.', error_code='model_request_timed_out')
+                    return outcome
+                emit("runtime_status", {"phase": "model"})
+            message, finish_reason, usage = outcome
+            emit("model_usage", {"id": usage_id, "status": "completed", **usage})
+            if coordination:
+                # For durable collaboration, timeout is a no-progress window.
+                # Healthy tool loops can exceed a single 30-minute wall clock.
+                deadline = time.monotonic() + request.timeout
             text = message.get("content") or ""
             from ..channel_coordination import concrete_user_decision
             user_decision = bool(coordination and isinstance(text, str) and "NEEDS INPUT:" in text and concrete_user_decision(text))
@@ -1042,6 +1059,8 @@ class ApiAgent(ModelStrategy):
                 if isinstance(result_text, ModelResult):
                     return result_text
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
+                if coordination:
+                    deadline = time.monotonic() + request.timeout
         return ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod
@@ -1141,7 +1160,8 @@ class ApiAgent(ModelStrategy):
                         raise TypeError("message must be an object")
                 except (ValueError, KeyError, IndexError, TypeError):
                     return ModelResult("failed", error_code="invalid_provider_output")
-                return message, choice.get("finish_reason")
+                from .usage import report
+                return message, choice.get("finish_reason"), report(data, response.headers.get('x-cpa-trace-id'), identity.model)
 
         task = asyncio.create_task(post())
         call_deadline = asyncio.get_running_loop().time() + timeout

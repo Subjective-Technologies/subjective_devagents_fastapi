@@ -364,3 +364,27 @@ def test_activity_forwards_sanitized_command_and_phase(bound):
     session.activity(phase='model')
     assert journal.calls[-1]['progress_phase'] == 'model'
     assert 'tool_detail' not in journal.calls[-1]
+
+
+def test_usage_receipts_retry_and_survive_in_durable_completion_payload(bound):
+    session,journal,_=bound
+    from subjective_devagents_fastapi.language_models.contracts import ModelError
+    original=session._client
+    unavailable=[True]
+    def flaky(body):
+        if unavailable[0]: raise ModelError('coordination_unavailable','fixture outage')
+        return original(body)
+    session._client=flaky
+    usage={'id':'request1','model':'test-model','status':'completed','input_tokens':10,'output_tokens':5,'total_tokens':15}
+    session.activity(usage=usage)
+    assert session._usage_pending and session.completion_payload('completed')['data']['usage_receipts']==[usage]
+    unavailable[0]=False
+    session.last_check=0
+    session.revoked()
+    assert journal.calls[-1]['model_usage']==usage and not session._usage_pending
+
+
+def test_inference_only_timeout_releases_executor_but_uncertain_tool_timeout_does_not(bound):
+    session,_,_=bound
+    assert session.completion_payload('timed_out','model_request_timed_out')['data']['executor_stopped'] is True
+    assert session.completion_payload('timed_out','timed_out')['data']['executor_stopped'] is False
