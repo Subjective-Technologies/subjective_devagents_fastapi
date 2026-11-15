@@ -390,11 +390,20 @@ class ChannelSession:
                     self._authorization = ''
                 raise
 
-    def activity(self, tool=None):
+    def activity(self, tool=None, *, phase=None, detail=None, call_id=None):
+        phase = phase or ('working' if tool else None)
         now = time.monotonic()
-        if tool or now - self._last_touch >= self.heartbeat_interval:
+        if tool or phase or now - self._last_touch >= self.heartbeat_interval:
             try:
-                self.call('touch', **({'tool': tool} if tool else {}))
+                from .activity_preview import safe_tool_detail
+                payload = {'tool': tool} if tool else {}
+                if phase in {'model', 'tool', 'working'}:
+                    payload['progress_phase'] = phase
+                if detail is not None:
+                    payload['tool_detail'] = safe_tool_detail(detail, command=tool == 'Bash')
+                if isinstance(call_id, str):
+                    payload['tool_call_id'] = call_id[:128]
+                self.call('touch', **payload)
             except ModelError as error:
                 if error.code != 'coordination_unavailable':
                     raise

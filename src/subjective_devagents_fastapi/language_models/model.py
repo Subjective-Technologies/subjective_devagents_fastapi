@@ -103,8 +103,15 @@ class LanguageModel:
             if strategy is None:
                 raise ModelError("unsupported_provider", "No execution strategy is registered.")
             def emit(kind, data):
-                if coordination and kind in {'tool_call', 'tool_result', 'message', 'activity'}:
-                    coordination.activity(data.get('name') if kind == 'tool_call' else None)
+                if coordination:
+                    if kind == 'tool_call':
+                        coordination.activity(data.get('name'), phase='tool', detail=data.get('detail'), call_id=data.get('tool_call_id'))
+                    elif kind == 'tool_result':
+                        coordination.activity(phase='working')
+                    elif kind == 'runtime_status':
+                        coordination.activity(phase=data.get('phase'))
+                    elif kind in {'message', 'activity'}:
+                        coordination.activity()
                 self.store.event(identifier, kind, data)
             result = strategy.run(request, emit,
                                   lambda: self._stopping.is_set() or bool(self.store.turn(identifier)["cancel_requested"]))

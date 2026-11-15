@@ -352,3 +352,15 @@ def test_transient_capability_report_is_retried_without_inventing_proof(bound, m
     session.observed('Read', True)
     assert ('fs_read', True) in session.tool_capabilities
     assert journal.calls[-1]['op'] == 'capability'
+
+
+def test_activity_forwards_sanitized_command_and_phase(bound):
+    session, journal, _ = bound
+    session.activity('Bash', phase='tool', detail='npm test -- --run', call_id='call-1')
+    assert journal.calls[-1]['tool_detail'] == 'npm test -- --run'
+    assert journal.calls[-1]['progress_phase'] == 'tool'
+    session.activity('Bash', phase='tool', detail='cat /subjective/.env', call_id='call-2')
+    assert journal.calls[-1]['tool_detail'] == '[details hidden: sensitive data]'
+    session.activity(phase='model')
+    assert journal.calls[-1]['progress_phase'] == 'model'
+    assert 'tool_detail' not in journal.calls[-1]

@@ -1001,6 +1001,7 @@ class ApiAgent(ModelStrategy):
                         first_of_turn = len(fitted)
                 if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                     return ModelResult("failed", error_code="context_too_large")
+            emit("runtime_status", {"phase": "model"})
             outcome = await self._call(identity, token, messages, tools, remaining, cancelled)
             if isinstance(outcome, ModelResult):
                 return outcome
@@ -1026,6 +1027,7 @@ class ApiAgent(ModelStrategy):
                         emit("file_diff", diff)
                 return ModelResult("completed", text)
             for call in calls:
+                emit("runtime_status", {"phase": "working"})
                 if cancelled():
                     # Between tool calls nothing is running: the stop is clean.
                     return ModelResult("cancelled", error_code="cancelled_mid_tool")
@@ -1082,10 +1084,18 @@ class ApiAgent(ModelStrategy):
             emit("activity", {"text": f"Asking: {short(question)}"})
             emit("message", {"text": question})
             return ModelResult("completed", question)
-        emit("tool_call", {"tool_call_id": call_id, "name": name})
+        from ..activity_preview import safe_tool_detail
+        detail = None
+        if name == 'Bash':
+            detail = arguments.get('command')
+        elif name in {'Read', 'Write', 'Edit'}:
+            detail = arguments.get('file_path')
+        elif name in {'Glob', 'Grep'}:
+            detail = arguments.get('path') or '.'
+        emit("tool_call", {"tool_call_id": call_id, "name": name, "detail": safe_tool_detail(detail, command=name == "Bash")})
         step = ClaudeCli.tool_step(name, arguments)
         if step:
-            emit("activity", {"text": step})
+            emit("activity", {"text": "Running: " + safe_tool_detail(arguments.get("command")) if name == "Bash" else safe_tool_detail(step, command=False)})
         if name in {"Write", "Edit"} and edited is not None and arguments.get("file_path"):
             # Already shown by the tool's own diff; the end-of-turn Bash diff skips it.
             edited.add(os.path.normpath(os.path.join(identity.workspace or "/", str(arguments["file_path"]))))

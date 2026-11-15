@@ -88,13 +88,14 @@ def test_tool_loop_runs_bash_then_answers(request_data, monkeypatch):
         result = ApiAgent().run(request, lambda *event: events.append(event), lambda: False)
     assert result.status == "completed"
     assert result.text == "The command printed hi."
-    assert ("activity", {"text": "Running: echo hi"}) in events
+    assert ("activity", {"text": "Running: echo [arguments hidden]"}) in events
     [runtime] = [data for kind, data in events if kind == "runtime"]
     assert runtime["strategy"] == "api_agent"
     assert runtime["workspace"] == request_data.identity.workspace
     assert "Bash" in runtime["effective_tools"]
     [call] = [data for kind, data in events if kind == "tool_call"]
-    assert call == {"tool_call_id": "1", "name": "Bash"}
+    assert call == {"tool_call_id": "1", "name": "Bash", "detail": "echo [arguments hidden]"}
+    assert [data for kind, data in events if kind == "runtime_status"] == [{"phase": "model"}, {"phase": "working"}, {"phase": "model"}]
     [tool_result] = [data for kind, data in events if kind == "tool_result"]
     assert tool_result["tool_call_id"] == "1"
     assert tool_result["name"] == "Bash"
