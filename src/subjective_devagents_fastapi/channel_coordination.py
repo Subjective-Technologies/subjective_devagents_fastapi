@@ -380,7 +380,17 @@ class ChannelSession:
     def activity(self, tool=None):
         now = time.monotonic()
         if tool or now - self._last_touch >= self.heartbeat_interval:
-            self.call('touch', **({'tool': tool} if tool else {}))
+            try:
+                self.call('touch', **({'tool': tool} if tool else {}))
+            except ModelError as error:
+                if error.code != 'coordination_unavailable':
+                    raise
+                self._unreachable_since = self._unreachable_since or now
+                if now - self._unreachable_since >= UNREACHABLE_GRACE:
+                    raise
+                # Observation can continue briefly; guard() still fences every write.
+                return
+            self._unreachable_since = None
             self._last_touch = now
 
     def start(self, identity, version, agent_role=None):
@@ -582,10 +592,19 @@ class ChannelSession:
         capability = {'Read': 'fs_read', 'Grep': 'fs_read', 'Glob': 'fs_read',
                       'Write': 'fs_write', 'Edit': 'fs_write', 'Bash': 'shell_exec'}.get(name)
         if ok and capability and (capability, ok) not in self.tool_capabilities:
-            self.call('capability', agent_id=self.actor, runtime=self.runtime,
-                target=self.identity.workspace, capability=capability,
-                status='proven' if ok else 'failed', source='devagents_tool_result:' + name,
-                credential_ref='runtime:' + self.identity.id, privilege_level='scoped')
+            try:
+                self.call('capability', agent_id=self.actor, runtime=self.runtime,
+                    target=self.identity.workspace, capability=capability,
+                    status='proven' if ok else 'failed', source='devagents_tool_result:' + name,
+                    credential_ref='runtime:' + self.identity.id, privilege_level='scoped')
+            except ModelError as error:
+                now = time.monotonic()
+                if error.code != 'coordination_unavailable':
+                    raise
+                self._unreachable_since = self._unreachable_since or now
+                if now - self._unreachable_since >= UNREACHABLE_GRACE:
+                    raise
+                return  # Leave proof uncached so the next successful observation retries.
             self.tool_capabilities.add((capability, ok))
 
     def ask(self, arguments):

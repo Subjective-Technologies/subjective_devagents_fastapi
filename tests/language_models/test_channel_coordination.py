@@ -312,3 +312,43 @@ def test_read_only_pytest_stage_runs_real_test(bound, monkeypatch):
     assert result.status == 'completed'
     outputs = [message['content'] for message in proxy.requests[1][2]['messages'] if message['role'] == 'tool']
     assert any('1 passed' in output for output in outputs)
+
+
+def test_activity_keeps_running_through_brief_issuer_outage_but_not_revocation(bound, monkeypatch):
+    session, journal, identity = bound
+    now = [100.0]
+    monkeypatch.setattr('subjective_devagents_fastapi.channel_coordination.time.monotonic', lambda: now[0])
+    session._last_touch = 0
+    def unavailable(*_args, **_kwargs): raise ModelError('coordination_unavailable', 'temporary issuer outage')
+    monkeypatch.setattr(session, 'call', unavailable)
+    session.activity('Read')
+    assert session._unreachable_since == 100
+    from subjective_devagents_fastapi.channel_coordination import UNREACHABLE_GRACE
+    now[0] += UNREACHABLE_GRACE + 1
+    with pytest.raises(ModelError, match='temporary issuer outage'): session.activity('Read')
+    def revoked(*_args, **_kwargs): raise ModelError('invalid_service_identity', 'revoked')
+    monkeypatch.setattr(session, 'call', revoked)
+    with pytest.raises(ModelError, match='revoked'): session.activity('Read')
+
+
+def test_activity_outage_never_permits_unverified_write(bound, monkeypatch):
+    session, journal, identity = bound
+    session.tool('acquire', {'repository': identity.workspace, 'paths': ['.']})
+    def unavailable(*_args, **_kwargs): raise ModelError('coordination_unavailable', 'temporary issuer outage')
+    monkeypatch.setattr(session, 'call', unavailable)
+    session.activity('Write')
+    with pytest.raises(ModelError, match='temporary issuer outage'):
+        session.guard('Write', {'file_path': 'blocked.txt'})
+
+
+def test_transient_capability_report_is_retried_without_inventing_proof(bound, monkeypatch):
+    session, journal, identity = bound
+    original = session.call
+    def unavailable(*_args, **_kwargs): raise ModelError('coordination_unavailable', 'temporary issuer outage')
+    monkeypatch.setattr(session, 'call', unavailable)
+    session.observed('Read', True)
+    assert ('fs_read', True) not in session.tool_capabilities
+    monkeypatch.setattr(session, 'call', original)
+    session.observed('Read', True)
+    assert ('fs_read', True) in session.tool_capabilities
+    assert journal.calls[-1]['op'] == 'capability'
