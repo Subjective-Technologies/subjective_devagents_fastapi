@@ -1095,7 +1095,9 @@ class ApiAgent(ModelStrategy):
         emit("tool_call", {"tool_call_id": call_id, "name": name, "detail": safe_tool_detail(detail, command=name == "Bash")})
         step = ClaudeCli.tool_step(name, arguments)
         if step:
-            emit("activity", {"text": "Running: " + safe_tool_detail(arguments.get("command")) if name == "Bash" else safe_tool_detail(step, command=False)})
+            preview = ("Running: " + (safe_tool_detail(arguments.get("command")) or "Bash")
+                       if name == "Bash" else safe_tool_detail(step, command=False))
+            emit("activity", {"text": preview})
         if name in {"Write", "Edit"} and edited is not None and arguments.get("file_path"):
             # Already shown by the tool's own diff; the end-of-turn Bash diff skips it.
             edited.add(os.path.normpath(os.path.join(identity.workspace or "/", str(arguments["file_path"]))))
