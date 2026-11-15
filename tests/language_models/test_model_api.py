@@ -268,3 +268,25 @@ def test_existing_app_starts_configured_engine_and_closes_it(engine, tmp_path, m
         result = await_turn(app.state.language_model.store, response.json()["id"])
         assert result["status"] == "completed"
     assert app.state.language_model is None
+
+
+def test_provider_tool_ids_are_scoped_per_inference_without_changing_wire_history(engine):
+    from types import SimpleNamespace
+    captured=[]
+    class ReusedIds(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            for identifier in ('request-a','request-b'):
+                emit('model_usage',{'id':identifier,'model':'test','status':'running'})
+                emit('tool_call',{'name':'Bash','tool_call_id':'functions.Bash:0','detail':'pwd'})
+                emit('tool_result',{'name':'Bash','tool_call_id':'functions.Bash:0','ok':True})
+            return ModelResult('completed','Done')
+    engine.strategies['cli:claude']=ReusedIds()
+    control=SimpleNamespace(worker_started=lambda:None,activity=lambda *args,**data:captured.append((args,data)),
+        delegation=None,canonical_reply=lambda text:text,finish=lambda *args,**kwargs:None)
+    conversation=engine.create('claude-a')
+    turn=engine.submit(conversation['id'],'fixture','reuse-ids',coordination=control)
+    assert await_turn(engine.store,turn['id'])['status']=='completed'
+    scoped=[data['call_id'] for _,data in captured if data.get('phase')=='tool']
+    assert scoped==['request-a-0','request-b-0']
+    raw=[event['data']['tool_call_id'] for event in engine.store.events(turn['id']) if event['kind']=='tool_call']
+    assert raw==['functions.Bash:0','functions.Bash:0']

@@ -102,12 +102,15 @@ class LanguageModel:
             strategy = self.strategies.get(f"{identity.strategy}:{identity.provider}") or self.strategies.get(identity.strategy)
             if strategy is None:
                 raise ModelError("unsupported_provider", "No execution strategy is registered.")
+            from .usage import ActivityScope
+            activity_scope = ActivityScope()
             def emit(kind, data):
                 if coordination:
                     if kind == 'model_usage':
+                        activity_scope.observe(data)
                         coordination.activity(usage=data)
                     elif kind == 'tool_call':
-                        coordination.activity(data.get('name'), phase='tool', detail=data.get('detail'), call_id=data.get('tool_call_id'))
+                        coordination.activity(data.get('name'), phase='tool', detail=data.get('detail'), call_id=activity_scope.tool_id(data.get('tool_call_id')))
                     elif kind == 'tool_result':
                         coordination.activity(phase='working')
                     elif kind == 'runtime_status':

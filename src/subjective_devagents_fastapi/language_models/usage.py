@@ -26,3 +26,22 @@ def report(data, trace, model):
     total = count(raw.get('total_tokens'))
     result['total_tokens'] = total if total is not None and total >= incoming + outgoing else incoming + outgoing
     return result
+
+
+class ActivityScope:
+    """Provider tool IDs are message-local; channel activity IDs are request-scoped."""
+    def __init__(self):
+        self.request_id = None
+        self.position = 0
+
+    def observe(self, usage):
+        if usage.get('status') == 'running' and isinstance(usage.get('id'), str):
+            self.request_id = usage['id']
+            self.position = 0
+
+    def tool_id(self, provider_id):
+        if not self.request_id:
+            return provider_id
+        identifier = self.request_id + '-' + str(self.position)
+        self.position += 1
+        return identifier
