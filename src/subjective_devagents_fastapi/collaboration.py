@@ -84,7 +84,8 @@ def _execute_approved(service, job):
         if capacity['available'] <= 0:
             # Refuse instead of accepting into a hidden in-process queue: the journal then
             # shows the dispatch waiting for capacity rather than failing to start.
-            raise ModelError('runtime_capacity', f"All {capacity.get('workers')} runtime workers are busy")
+            raise ModelError('runtime_capacity', 'The runtime is draining for a restart; this dispatch waits until it is back'
+                             if capacity.get('draining') else f"All {capacity.get('workers')} runtime workers are busy")
         # Profiles can select a configured provider/model, never arbitrary workspaces/accounts/URLs.
         identity = service.backend.identity({'provider': profile['provider'], 'model': profile.get('model', ''),
             'workspace': service._default_workspace(profile['provider'])}, execution_required=True)
@@ -112,7 +113,9 @@ def _execute_approved(service, job):
         export = agent_workflow.fetch_export_as_service(profile['company_id'], **options)
         folder = agent_workflow.materialize(export, profile['company_id'], agent_workflow.workflow_root(service.app_home))
         definition = agent_workflow.compose_definition(export, profile, folder)
-        prompt = agent_workflow.wrap_turn(definition, execution['prompt'])
+        from .deploy_methods import facts_block
+        prompt = agent_workflow.wrap_turn(definition, execution['prompt'] + (
+            facts_block(execution['prompt']) if not identity.ssh_host else ''))
         if conversation_id is None:
             conversation_id = model.create(identity.id)['id']
             with model.store.connection() as db:

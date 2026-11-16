@@ -666,6 +666,11 @@ class ChannelSession:
             return
         if name == 'Bash':
             self.check_publication(str(arguments.get('command', '')))
+            if self.identity:
+                from .deploy_methods import refuse_local_deploy
+                folder = self._command_dir(str(arguments.get('command', '')))
+                if folder:
+                    refuse_local_deploy(str(arguments.get('command', '')), folder)
         if self.identity.sandbox != 'workspace-write':
             command = str(arguments.get('command', ''))
             if name == 'Bash' and self.verification:

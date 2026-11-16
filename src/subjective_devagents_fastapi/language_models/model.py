@@ -7,6 +7,7 @@ import re
 import math
 import os
 import threading
+from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from .contracts import MAX_ATTACHMENTS, Attachment, Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
@@ -42,6 +43,14 @@ class LanguageModel:
                  strategies: dict[str, ModelStrategy] | None = None, max_workers: int | None = None):
         self.store = store
         self.identities = identities
+        # Present while an operator drains this runtime for a restart (scripts/drain_restart.sh):
+        # new coordinated work stays queued in the chat journal instead of being cut off later.
+        # A freshly started service is never draining.
+        self.drain_flag = Path(store.path).parent / "DRAINING"
+        try:
+            self.drain_flag.unlink(missing_ok=True)
+        except OSError:
+            pass
         self.strategies = strategies if strategies is not None else {
             "cli:codex": Cli(CodexCli()), "cli:claude": Cli(ClaudeCli()),
             "cli:cursor": Cli(CursorCli()), "cli:grok": Cli(GrokCli()), "api": Api(),
@@ -108,7 +117,9 @@ class LanguageModel:
         """Running/queued turns versus workers. Admission refuses rather than hiding a queue."""
         with self._lock:
             busy = sum(1 for future in self._futures.values() if not future.done())
-        return {"busy": busy, "workers": self.max_workers, "available": max(0, self.max_workers - busy)}
+        draining = self.drain_flag.exists()
+        return {"busy": busy, "workers": self.max_workers, "draining": draining,
+                "available": 0 if draining else max(0, self.max_workers - busy)}
 
     def _forget(self, identifier: str):
         with self._lock:
