@@ -268,6 +268,8 @@ UNREACHABLE_GRACE = _seconds('COORDINATION_UNREACHABLE_GRACE', 240)
 CALL_BACKOFF = tuple(float(x) for x in os.environ.get('COORDINATION_CALL_BACKOFF', '1,2,4,8').split(',') if x.strip())
 # Liveness pings tolerate outages through UNREACHABLE_GRACE instead of blocking a tool loop.
 _NO_RETRY = {'touch', 'heartbeat'}
+# Bytes of journal state a worker sees (system prompt and snapshot tool), whatever the channel's age.
+CONTEXT_STATE_LIMIT = int(os.environ.get('COORDINATION_CONTEXT_STATE_LIMIT', '8000'))
 TOOL_OPERATIONS = {'task', 'recover_task_lease', 'recover', 'reissue', 'adopt_worktree', 'blocker', 'snapshot', 'acquire', 'release', 'fact', 'decision', 'discovery',
                    'capability', 'route', 'privilege', 'review', 'gate', 'worktree'}
 CONTROL_TOOL = {'type': 'function', 'function': {
@@ -492,16 +494,69 @@ class ChannelSession:
                         'source': str(legacy), 'observed': observed, 'authoritative': version})
         return self.context()
 
+    def compact_state(self, state, limit=CONTEXT_STATE_LIMIT):
+        """The journal as one worker needs it: its task revision, live leases, open questions.
+
+        The full journal (every dispatch, 300 events, 200 metrics, capability history, old
+        reviews) used to be sent as the system prompt and as every snapshot tool result;
+        it grew with the channel's age and was most of a worker's starting context.
+        """
+        now = time.time()
+        revision = state.get('task_revision')
+        instance = self.binding['instance_id']
+        leases = {key: {k: lease.get(k) for k in ('id', 'agent_id', 'instance_id', 'repository', 'absolute_paths',
+                                                    'mode', 'status', 'expires_at', 'task_revision')}
+                  for key, lease in (state.get('leases') or {}).items()
+                  if lease.get('status') in {'active', 'revoking', 'recovery_required', 'expired', 'recoverable'}}
+        facts = {key: {k: fact.get(k) for k in ('kind', 'repository', 'value', 'source', 'status')}
+                 for key, fact in (state.get('facts') or {}).items()
+                 if fact.get('task_revision') == revision and fact.get('expires_at', now + 1) > now}
+        task = state.get('task') or {}
+        view = {
+            'workflow_id': state.get('workflow_id'), 'workflow_version': state.get('workflow_version'),
+            'agent_instance_id': instance, 'task_family': state.get('task_family'), 'task_revision': revision,
+            'state_revision': state.get('revision'),
+            'task': {k: task.get(k) for k in ('status', 'phase', 'facts') if task.get(k) is not None},
+            'leases': dict(list(leases.items())[-12:]),
+            'facts': dict(list(facts.items())[-20:]),
+            'decisions': {k: v for k, v in (state.get('decisions') or {}).items() if v.get('status') == 'PENDING'},
+            'blockers': {k: v for k, v in (state.get('blockers') or {}).items() if v.get('status') == 'open'},
+            'worktrees': {k: v for k, v in (state.get('worktrees') or {}).items()
+                          if v.get('instance_id') == instance or v.get('state') in {'active', 'abandoned'}},
+            'completed_gates': (state.get('completed_gates') or [])[-20:],
+            'active_dispatches': [{k: d.get(k) for k in ('id', 'agent_id', 'status')}
+                                  for d in (state.get('dispatches') or {}).values()
+                                  if d.get('status') in {'CREATED', 'DISPATCHED', 'STARTED', 'RUNNING'}][-10:],
+        }
+        text = json.dumps(view, sort_keys=True, default=str)
+        for key in ('facts', 'worktrees', 'leases', 'completed_gates', 'active_dispatches'):
+            if len(text) <= limit:
+                break
+            view[key] = {} if isinstance(view[key], dict) else []
+            view['omitted'] = view.get('omitted', []) + [key]
+            text = json.dumps(view, sort_keys=True, default=str)
+        return text[:limit]
+
+    @property
+    def previous_checkpoint(self):
+        """The latest checkpoint this logical agent left for the current task revision, if any."""
+        task = (self._state or {}).get('task') or {}
+        checkpoint = (task.get('checkpoints') or {}).get(self.actor)
+        return checkpoint if isinstance(checkpoint, dict) else None
+
+    def checkpoint(self, checkpoint):
+        """Persist a structured checkpoint in the journal (best effort, never blocks the work)."""
+        try:
+            self.call('checkpoint', checkpoint=checkpoint)
+        except ModelError as error:
+            log.warning('Checkpoint not recorded channel=%s dispatch=%s code=%s',
+                        self.binding['channel_id'], self.binding['dispatch_id'], error.code)
+
     def context(self):
         state = self.call('snapshot')['state']
-        state['leases'] = {key: lease for key, lease in state['leases'].items() if lease['status'] in {'active', 'revoking', 'recovery_required', 'expired', 'recoverable'}}
         # The state is supplied separately on every turn; never rely on transcript replay.
-        return '\nCHANNEL RUNTIME CONTEXT (authoritative journal; reported facts retain provenance):\n' + json.dumps({
-            'workflow_id': state['workflow_id'], 'workflow_version': state['workflow_version'],
-            'agent_instance_id': self.binding['instance_id'], 'task_family': state['task_family'],
-            'task_revision': state['task_revision'], 'state_revision': state['revision'],
-            **{key: state.get(key, [] if key == 'completed_gates' else {}) for key in ('facts', 'leases', 'decisions', 'capabilities', 'reviews', 'gates', 'worktrees', 'discoveries', 'blockers', 'completed_gates')}
-        }, sort_keys=True)
+        return ('\nCHANNEL RUNTIME CONTEXT (authoritative journal for this task; reported facts retain provenance):\n'
+                + self.compact_state(state))
 
     def recoverable_leases(self, same_agent=False):
         state = self._state or {}
@@ -602,6 +657,8 @@ class ChannelSession:
             self.privilege = {k: data[k] for k in ('privilege_level', 'scope', 'decision_id') if k in data}
         if operation != 'snapshot':
             result = {k: v for k, v in result.items() if k != 'state'} | {'state_revision': self._state['revision']}
+        else:
+            return self.compact_state(result['state'])
         return json.dumps(result, sort_keys=True)
 
     def guard(self, name, arguments):

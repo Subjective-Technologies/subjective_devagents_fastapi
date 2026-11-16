@@ -185,18 +185,19 @@ class LanguageModel:
             except ModelError as error:
                 result = ModelResult("interrupted", error_code=error.code)
         try:
-            answer = {'text': result.text, 'error_code': result.error_code, **work_trail(trail)}
+            answer = {'text': result.text, 'error_code': result.error_code, **work_trail(trail),
+                      **({'checkpoint': result.checkpoint} if result.checkpoint else {})}
             completion = (coordination.completion_payload(result.status, result.error_code, answer)
                           if coordination and coordination.delegation else None)
             self.store.finish(identifier, result, completion=completion)
         except Exception:
             log.exception("LanguageModel could not record the turn turn_id=%s", identifier)
             result = ModelResult("interrupted", error_code="worker_exception")
+            answer = {'text': '', 'error_code': result.error_code}
             self.store.finish(identifier, result)
         if coordination:
             try:
-                coordination.finish(result.status, result.error_code,
-                                    result={'text': result.text, 'error_code': result.error_code, **work_trail(trail)})
+                coordination.finish(result.status, result.error_code, result=answer)
             except ModelError as error:
                 self.store.event(identifier, "coordination_reconciliation_required", {"code": error.code})
         log.info("LanguageModel turn finished turn_id=%s status=%s error_code=%s",

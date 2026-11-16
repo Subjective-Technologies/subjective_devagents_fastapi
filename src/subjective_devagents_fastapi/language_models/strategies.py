@@ -5,6 +5,7 @@ import asyncio
 import base64
 import difflib
 import json
+import logging
 import os
 import pwd
 import re
@@ -19,6 +20,8 @@ import httpx
 
 from .contracts import Cancelled, Emit, ModelError, ModelRequest, ModelResult, ModelStrategy
 from .transports import Command, LocalProcess, ProcessTransport, SshTunnel
+
+log = logging.getLogger(__name__)
 
 MAX_CONTEXT_BYTES = 512 * 1024
 # Bound upstream inference independently of the entire tool loop.
@@ -573,6 +576,8 @@ def agent_image_block(attachment) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:{attachment.mime_type};base64,{encoded}"}}
 
 
+_CONTEXT_WORDS = ("prompt is too long", "context length", "context_length_exceeded", "maximum context",
+                  "too many tokens", "input is too long", "context window", "request too large", "too large for the model")
 _QUOTA_WORDS = ("usage limit", "quota", "insufficient_quota", "billing", "credit balance", "exceeded your")
 
 
@@ -585,6 +590,9 @@ def http_error_code(status: int, body: str = "") -> str:
     text = (body or "").lower()
     if any(word in text for word in _QUOTA_WORDS):
         return "quota_exhausted"
+    if status in {400, 413, 422} and any(word in text for word in _CONTEXT_WORDS):
+        # Never resend the same payload: the coordinated caller checkpoints and hands off.
+        return "context_too_large"
     if status in {408, 504}:
         return "timed_out"
     if status == 429:
@@ -940,81 +948,34 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
     return f"Error: unknown tool {name!r}."
 
 
+# A successful run of one of these is worth a checkpoint: a test/build pass, a commit or a push.
+_MILESTONE = re.compile(r"(?i)\b(?:pytest|vitest|jest|node\s+--test|npm (?:run )?(?:test|build)|npx (?:vitest|tsc)|tsc|"
+                        r"go test|cargo test|make (?:test|build))\b|\bgit\b[^;&|\n]*\b(?:commit|push)\b")
 _CHECK_COMMAND = re.compile(r"(?i)\b(?:pytest|vitest|jest|npm (?:run )?(?:test|build|lint|typecheck)|pnpm (?:test|build)|"
                             r"yarn (?:test|build)|tsc|go (?:test|build|vet)|cargo (?:test|build|check)|make (?:test|build|check))\b")
-CONTINUATION_SUMMARY_LIMIT = 8000
+CONTINUATION_SUMMARY_LIMIT = 12000
 
 
-def continuation_summary(progress: dict, reason: str, identity, transport) -> str:
+def coordinated_checkpoint(progress: dict, reason: str, identity, coordination=None) -> dict:
+    """The structured checkpoint of this worker (task_context.build_checkpoint), task-scoped."""
+    from .task_context import build_checkpoint
+    previous = getattr(coordination, "previous_checkpoint", None) if coordination else None
+    role = getattr(coordination, "agent_role", None) if coordination else None
+    return build_checkpoint(progress.get("messages") or [], progress.get("first_of_turn", 0), progress.get("edited"),
+                            identity.workspace, reason=reason, role=role, previous=previous,
+                            rounds=progress.get("rounds", 0), repositories=not identity.ssh_host)
+
+
+def continuation_summary(progress: dict, reason: str, identity, transport=None, coordination=None) -> str:
     """Compact, structured state for a successor instance of the same logical task.
 
-    Built from this turn's own tool rounds and the execution host's Git status, never
-    from tool output bodies (which can hold secrets or very large logs).
+    Built from this turn's tool rounds and the touched repositories' Git state, never from
+    raw tool output bodies or the monorepo-wide status.
     """
-    messages = progress.get("messages") or []
-    first = progress.get("first_of_turn", 0)
-    calls, results = [], {}
-    files = set(progress.get("edited") or ())
-    last_note = ""
-    for item in messages[first:]:
-        if item.get("role") == "assistant":
-            if isinstance(item.get("content"), str) and item["content"].strip():
-                last_note = item["content"].strip()
-            for call in item.get("tool_calls") or []:
-                function = call.get("function") or {}
-                try:
-                    arguments = json.loads(function.get("arguments") or "{}")
-                except ValueError:
-                    arguments = {}
-                if not isinstance(arguments, dict):
-                    arguments = {}
-                calls.append((call.get("id") or "", function.get("name") or "", arguments))
-                if function.get("name") in {"Write", "Edit"} and arguments.get("file_path"):
-                    files.add(str(arguments["file_path"]))
-        elif item.get("role") == "tool":
-            content = item.get("content") if isinstance(item.get("content"), str) else ""
-            results[item.get("tool_call_id") or ""] = not content.startswith("Error:") and "[exit code " not in content
-    if not calls:
+    from .task_context import render_checkpoint
+    if not progress.get("messages"):
         return ""
-    from ..activity_preview import safe_tool_detail
-    commands, checks = [], []
-    for call_id, name, arguments in calls:
-        if name != "Bash":
-            continue
-        preview = safe_tool_detail(arguments.get("command"), command=True) or ""
-        outcome = {True: "ok", False: "failed"}.get(results.get(call_id), "not finished")
-        commands.append(f"{preview} -> {outcome}")
-        if _CHECK_COMMAND.search(str(arguments.get("command") or "")):
-            checks.append(f"{preview} -> {outcome}")
-    workspace_state = ""
-    if transport is not None and identity.workspace and not identity.ssh_host:
-        try:
-            env = agent_environment(identity)
-            wrapped, cwd = _localize(("git", "-C", identity.workspace, "status", "--porcelain=v1", "-b"), env, identity)
-            status = transport.run(Command(argv=wrapped, cwd=cwd, env=env), timeout=10,
-                                   cancelled=lambda: False, on_stdout=lambda _chunk: None)
-            if status.status == "completed" and status.returncode == 0:
-                lines = status.stdout.splitlines()
-                workspace_state = "\n".join(lines[:40]) + (f"\n... {len(lines) - 40} more" if len(lines) > 40 else "")
-        except Exception:  # noqa: BLE001 - observation only
-            workspace_state = ""
-    failing = [item for item in checks if item.endswith("failed")]
-    next_action = ("Resume from the last completed step; re-run the failing checks first: " + "; ".join(failing[-3:])
-                   if failing else "Resume from the last completed step; do not repeat finished work.")
-    body = {
-        "reason": reason,
-        "tool_rounds": progress.get("rounds", 0),
-        "work_completed": last_note[-1500:],
-        "files_changed": sorted(files)[:60],
-        "tests_run": checks[-15:],
-        "current_failure": failing[-1] if failing else reason,
-        "recent_commands": commands[-15:],
-        "workspace_state": workspace_state,
-        "next_action": next_action,
-    }
-    text = ("CONTINUATION_SUMMARY (automatic recovery of the same logical task; the workspace was preserved, "
-            "continue from it and do not restart from scratch):\n" + json.dumps(body, indent=1))
-    return text[:CONTINUATION_SUMMARY_LIMIT]
+    return render_checkpoint(coordinated_checkpoint(progress, reason, identity, coordination), CONTINUATION_SUMMARY_LIMIT)
 
 
 class ApiAgent(ModelStrategy):
@@ -1039,16 +1000,34 @@ class ApiAgent(ModelStrategy):
             # of the operator-stop message the UI shows for a plain cancellation.
             result = ModelResult("failed", error_code="coordination_lease_lost:" + revocation)
         if request.coordination and result.status not in {"completed", "blocked"} and progress.get("messages"):
-            # The logical task outlives this instance. Its successor continues from here.
+            # The logical task outlives this instance. Its successor continues from this checkpoint.
+            from .task_context import render_checkpoint
             try:
-                summary = continuation_summary(progress, result.error_code or result.status,
-                                               request.identity, progress.get("transport"))
+                checkpoint = coordinated_checkpoint(progress, result.error_code or result.status,
+                                                    request.identity, request.coordination)
+                checkpoint["context"] = progress.get("context_stats") or {}
+                summary = render_checkpoint(checkpoint, CONTINUATION_SUMMARY_LIMIT)
             except Exception:  # noqa: BLE001 - a summary must never hide the failure itself
-                summary = ""
+                checkpoint, summary = None, ""
             if summary:
                 text = (result.text + "\n\n" if result.text else "") + summary
-                result = ModelResult(result.status, text, result.session_id, result.error_code)
+                result = ModelResult(result.status, text, result.session_id, result.error_code, checkpoint)
         return result
+
+    @staticmethod
+    def _checkpoint(progress: dict, request: ModelRequest, reason: str) -> None:
+        """Persist this worker's checkpoint in the journal now, so even a crash leaves one behind."""
+        coordination = request.coordination
+        record = getattr(coordination, "checkpoint", None)
+        if not record:
+            return
+        try:
+            checkpoint = coordinated_checkpoint(progress, reason, request.identity, coordination)
+            checkpoint["context"] = dict(progress.get("context_stats") or {})
+            progress["context_stats"]["checkpoints"] = progress["context_stats"].get("checkpoints", 0) + 1
+            record(checkpoint)
+        except Exception:  # noqa: BLE001 - checkpointing never stops the work
+            log.warning("Checkpoint not recorded reason=%s", reason, exc_info=True)
 
     async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled, progress: dict | None = None) -> ModelResult:
         progress = {} if progress is None else progress
@@ -1097,11 +1076,46 @@ class ApiAgent(ModelStrategy):
         snapshot: dict | None = None
         edited: set[str] = set()
         progress.update(messages=messages, first_of_turn=first_of_turn, edited=edited, transport=transport, rounds=0)
+        from .task_context import ContextBudget, breakdown, compact_tool_results, estimate_tokens
+        budget = ContextBudget()
+        stats = progress.setdefault("context_stats", {"compaction_count": 0, "tool_output_tokens_dropped": 0,
+                                                      "historical_messages_dropped": dropped, "checkpoints": 0,
+                                                      "start_tokens": estimate_tokens(messages)})
+        last_tokens, tools_since_checkpoint = None, 0
         for _ in range(MAX_TOOL_ROUNDS):
             progress["rounds"] += 1
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return ModelResult("timed_out", error_code="timed_out")
+            tokens = estimate_tokens(messages)
+            level = budget.level(tokens)
+            if level in {"compact", "handoff"} or (coordination and level == "checkpoint"):
+                # Interpreted tool output is not replayed: older results become digests.
+                compacted, saved = compact_tool_results(messages, first_of_turn,
+                                                        2 if level == "handoff" else budget.keep_recent_tools)
+                if compacted:
+                    stats["compaction_count"] += 1
+                    stats["tool_output_tokens_dropped"] += saved
+                    emit("activity", {"text": f"Summarized {compacted} earlier tool outputs to keep the context bounded"})
+                    emit("context_compaction", {"compacted": compacted, "tokens_dropped": saved, "level": level})
+                    tokens = estimate_tokens(messages)
+                    level = budget.level(tokens)
+            emit("context_budget", {"max_context_tokens": budget.max_tokens, "estimated_input_tokens": tokens,
+                                    "context_utilization_percent": round(100 * tokens / budget.max_tokens, 1),
+                                    "remaining_context_budget": budget.max_tokens - tokens,
+                                    "context_growth_per_round": None if last_tokens is None else tokens - last_tokens,
+                                    "round": progress["rounds"], **breakdown(messages, first_of_turn)})
+            last_tokens = tokens
+            stats.update(last_tokens=tokens, max_context_tokens=budget.max_tokens)
+            if coordination and level != "ok" and not progress.get(f"checkpointed_{level}"):
+                progress[f"checkpointed_{level}"] = True
+                self._checkpoint(progress, request, "context_" + level)
+                tools_since_checkpoint = 0
+            if coordination and level == "handoff":
+                # Hand off before the provider limit: the successor starts from the checkpoint,
+                # never from this transcript.
+                emit("context_compaction", {"handoff": True, "estimated_input_tokens": tokens})
+                return ModelResult("failed", error_code="context_handoff")
             if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                 # Long tool loops: shorten this turn's oldest tool output, then older history.
                 if shorten_tool_results(messages, first_of_turn):
@@ -1125,6 +1139,10 @@ class ApiAgent(ModelStrategy):
                 if not isinstance(outcome, ModelResult):
                     break
                 emit("model_usage", {"id": usage_id, "model": identity.model, "status": outcome.error_code or outcome.status})
+                if coordination and outcome.error_code == "context_too_large":
+                    # The provider refused this payload: never resend it. Checkpoint, hand off.
+                    emit("context_compaction", {"provider_rejected": True, "estimated_input_tokens": tokens})
+                    return outcome
                 if not coordination or outcome.status != 'timed_out' or attempt == 2 or deadline <= time.monotonic():
                     if coordination and outcome.status == 'timed_out':
                         return ModelResult('timed_out', 'Model request timed out after retries. Earlier tool calls were not repeated.', error_code='model_request_timed_out')
@@ -1174,6 +1192,16 @@ class ApiAgent(ModelStrategy):
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
                 if coordination:
                     deadline = time.monotonic() + request.timeout
+                    tools_since_checkpoint += 1
+                    try:
+                        arguments = json.loads((call.get("function") or {}).get("arguments") or "{}") if name == "Bash" else {}
+                    except ValueError:
+                        arguments = {}
+                    command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
+                    milestone = name == "Bash" and "[exit code" not in result_text[-200:] and bool(_MILESTONE.search(command))
+                    if milestone or tools_since_checkpoint >= budget.checkpoint_every:
+                        self._checkpoint(progress, request, "milestone" if milestone else "periodic")
+                        tools_since_checkpoint = 0
         return ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod

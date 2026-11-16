@@ -225,9 +225,11 @@ def test_tool_loop_limit_returns_a_structured_continuation_summary(bound, monkey
     assert result.status == 'failed' and result.error_code == 'tool_loop_limit_exceeded'
     assert result.text.startswith('CONTINUATION_SUMMARY')
     body = json.loads(result.text.split('\n', 1)[1])
-    assert body['tool_rounds'] == 2 and body['work_completed'] == 'Edited the parser; now testing.'
-    assert body['tests_run'] and body['tests_run'][0].startswith('pytest -q')
-    assert {'files_changed', 'current_failure', 'next_action', 'workspace_state'} <= set(body)
+    assert body['tool_rounds'] == 2 and body['work_completed'] == ['Edited the parser; now testing.']
+    assert any(entry.startswith('pytest -q') for entry in body['tests_passed'] + body['tests_failed'])
+    assert {'goal', 'phase', 'files_changed', 'tests_passed', 'tests_failed', 'current_failure', 'verified_facts',
+            'decisions', 'repositories', 'next_action', 'workspace_state'} <= set(body)
+    assert result.checkpoint and result.checkpoint['tool_rounds'] == 2   # structured, not only prose
 
 
 def test_acceptance_done_latch_real_bug_end_to_end(system):
@@ -321,3 +323,39 @@ def test_server_answer_carries_changed_files_and_steps(system):
     assert meta['diffs'][0]['diff'] == diff and meta['diffs'][0]['status'] == 'modified'
     assert 'Bearer' not in meta['diffs'][1]['diff'] and 'withheld' in meta['diffs'][1]['diff']
     assert meta['steps'] == ['Running: git status', 'Edit: a.py']
+
+
+def test_context_handoff_successor_runs_from_the_checkpoint_not_the_transcript(system):
+    """Real runtime + journal: a worker hands off at its budget; the successor gets a bounded brief."""
+    s = system
+    transcript = 'PRIOR CONTEXT (oldest first, each message verbatim):\n' + ('old channel chatter ' * 4000)
+    s.execution['prompt'] = (transcript + '\nLATEST MESSAGE, from You — VERBATIM:\nAdd .xmi import to the dashboard'
+                             '\n\nCONTEXT METADATA:\nhistory_complete: true\n')
+    prompts, done = [], threading.Event()
+
+    class Budgeted(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            prompts.append(request.prompt)
+            if len(prompts) == 1:
+                return ModelResult('failed', 'CONTINUATION_SUMMARY (...)', error_code='context_handoff', checkpoint={
+                    'schema': 2, 'reason': 'context_handoff', 'phase': 'TESTING', 'work_completed': ['added .xmi'],
+                    'files_changed': ['src/files.ts'], 'tests_passed': ['npx vitest run (920 passed, 0 failed)'],
+                    'tests_failed': [], 'repositories': [str(s.repo)], 'next_action': 'run the build'})
+            done.set()
+            return ModelResult('completed', 'IMPLEMENTATION_COMPLETE: built')
+    s.model.strategies['api_agent:codex'] = Budgeted()
+    s.journal.mutate(s.channel, 'owner', {'op': 'dispatch', 'agent_id': 'ai_coder', 'assignment': 'Add .xmi import',
+                                          'execution': s.execution}, human=True)
+    tick(s)
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(x['status'] == 'DISPATCHED' and x['successor_of'] for x in dispatches(s)):
+        time.sleep(0.05)
+    tick(s)
+    assert done.wait(5)
+    s.model.close()
+    first, second = prompts
+    assert 'old channel chatter' in first and 'old channel chatter' not in second
+    assert 'run the build' in second and 'TESTING' in second and 'Add .xmi import' in second
+    assert len(second) < len(first) / 5
+    kinds = [e['kind'] for e in s.journal.snapshot(s.channel)['events']]
+    assert 'SUCCESSOR_AFTER_CONTEXT_LIMIT' in kinds and 'TASK_CHECKPOINT' in kinds

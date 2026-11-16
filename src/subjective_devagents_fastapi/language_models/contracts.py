@@ -91,6 +91,8 @@ class ModelResult:
     text: str = ""
     session_id: str | None = None
     error_code: str | None = None
+    # Coordinated work: the structured checkpoint a successor instance continues from.
+    checkpoint: dict | None = None
 
 
 Emit = Callable[[str, dict], None]
