@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import logging
+import re
 import math
 import os
 import threading
@@ -22,6 +23,18 @@ def _workers() -> int:
     except ValueError:
         value = 16
     return min(max(value, 1), 128)
+
+
+
+def work_trail(trail):
+    """Changed files and steps for the chat message, within the chat service's size bounds."""
+    diffs, total = [], 0
+    for diff in trail['diffs']:
+        if total + len(diff['diff']) > 300_000:
+            break
+        total += len(diff['diff'])
+        diffs.append(diff)
+    return {**({'diffs': diffs} if diffs else {}), **({'steps': trail['steps']} if trail['steps'] else {})}
 
 
 class LanguageModel:
@@ -109,6 +122,19 @@ class LanguageModel:
             return
         turn = self.store.turn(identifier)
         log.info("LanguageModel turn started turn_id=%s identity=%s", identifier, turn["identity"]["id"])
+        # What the turn did, posted with a coordinated answer: changed files and steps.
+        trail = {'diffs': [], 'steps': []}
+
+        def remember(kind, data):
+            if not isinstance(data, dict):
+                return
+            if kind == 'file_diff' and isinstance(data.get('path'), str) and isinstance(data.get('diff'), str):
+                trail['diffs'] = (trail['diffs'] + [{'path': data['path'], 'status': data.get('status') or 'modified',
+                                                     'diff': data['diff'][:100_000]}])[-50:]
+            elif kind == 'activity' and isinstance(data.get('text'), str):
+                step = data['text'].strip()[:500]
+                if step and not re.search(r' is still working… \d+s$', step) and (not trail['steps'] or trail['steps'][-1] != step):
+                    trail['steps'] = (trail['steps'] + [step])[-200:]
         try:
             if coordination:
                 coordination.completion_store = self.store
@@ -123,6 +149,7 @@ class LanguageModel:
             from .usage import ActivityScope
             activity_scope = ActivityScope()
             def emit(kind, data):
+                remember(kind, data)
                 if coordination:
                     if kind == 'model_usage':
                         activity_scope.observe(data)
@@ -158,8 +185,9 @@ class LanguageModel:
             except ModelError as error:
                 result = ModelResult("interrupted", error_code=error.code)
         try:
-            completion = (coordination.completion_payload(result.status, result.error_code,
-                          {'text': result.text, 'error_code': result.error_code}) if coordination and coordination.delegation else None)
+            answer = {'text': result.text, 'error_code': result.error_code, **work_trail(trail)}
+            completion = (coordination.completion_payload(result.status, result.error_code, answer)
+                          if coordination and coordination.delegation else None)
             self.store.finish(identifier, result, completion=completion)
         except Exception:
             log.exception("LanguageModel could not record the turn turn_id=%s", identifier)
@@ -167,7 +195,8 @@ class LanguageModel:
             self.store.finish(identifier, result)
         if coordination:
             try:
-                coordination.finish(result.status, result.error_code, result={'text': result.text, 'error_code': result.error_code})
+                coordination.finish(result.status, result.error_code,
+                                    result={'text': result.text, 'error_code': result.error_code, **work_trail(trail)})
             except ModelError as error:
                 self.store.event(identifier, "coordination_reconciliation_required", {"code": error.code})
         log.info("LanguageModel turn finished turn_id=%s status=%s error_code=%s",

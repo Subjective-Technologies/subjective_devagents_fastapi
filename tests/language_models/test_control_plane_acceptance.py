@@ -290,3 +290,34 @@ def test_acceptance_done_latch_real_bug_end_to_end(system):
     assert len(turns) == 9 and 'UNEXPECTED TURN' not in str(turns)
     bodies = [m['body'] for m in s.database.query_all('SELECT body FROM messages WHERE conversation_id=?', (s.channel,))]
     assert not any('NEEDS INPUT' in body for body in bodies)
+
+
+def test_server_answer_carries_changed_files_and_steps(system):
+    """Server-runtime answers show the files the agent changed (with diffs) and its steps, like browser rounds."""
+    s = system
+    diff = '--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-original\n+changed\n'
+
+    class Editing(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            emit('activity', {'text': 'Running: git status'})
+            emit('activity', {'text': 'Codex is still working… 30s'})
+            emit('file_diff', {'path': str(s.repo / 'a.py'), 'status': 'modified', 'diff': diff})
+            emit('activity', {'text': 'Edit: a.py'})
+            emit('file_diff', {'path': str(s.repo / 'secret.env'), 'status': 'created',
+                               'diff': '+TOKEN=Bearer abcdefghijklmnop'})
+            return ModelResult('completed', 'Changed a.py.\nIMPLEMENTATION_COMPLETE: done')
+    s.model.strategies['api_agent:codex'] = Editing()
+    s.journal.mutate(s.channel, 'owner', {'op': 'dispatch', 'agent_id': 'ai_coder', 'assignment': 'Change a.py',
+                                          'execution': s.execution}, human=True)
+    tick(s)
+    deadline = time.time() + 5
+    while time.time() < deadline and any(x['status'] in ACTIVE_DISPATCH for x in dispatches(s)):
+        time.sleep(0.05)
+    tick(s)
+    import json
+    row = s.database.query_one("SELECT metadata_json FROM messages WHERE conversation_id=? AND sender_id='ai_coder'", (s.channel,))
+    meta = json.loads(row['metadata_json'])
+    assert [d['path'].rsplit('/', 1)[-1] for d in meta['diffs']] == ['a.py', 'secret.env']
+    assert meta['diffs'][0]['diff'] == diff and meta['diffs'][0]['status'] == 'modified'
+    assert 'Bearer' not in meta['diffs'][1]['diff'] and 'withheld' in meta['diffs'][1]['diff']
+    assert meta['steps'] == ['Running: git status', 'Edit: a.py']
