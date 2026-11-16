@@ -924,6 +924,19 @@ async def api_workflow_file(path: str = Query(default=""), company: str = Query(
     )
 
 
+@app.get("/api/architecture/xmi")
+async def api_architecture_xmi():
+    """This company's UML model, /<company>/<company>/architecture/<company>.xmi, as text.
+
+    The company is this server's; the caller cannot choose the file. Subjective UML
+    opens it when the company's model is opened.
+    """
+    from . import architecture_file
+
+    status, body = await asyncio.to_thread(architecture_file.read_company_xmi)
+    return JSONResponse(status_code=status, content=body)
+
+
 def _context_meta(raw) -> dict:
     """The client's description of how it built a prompt, reduced to short scalars."""
     if not isinstance(raw, dict):
