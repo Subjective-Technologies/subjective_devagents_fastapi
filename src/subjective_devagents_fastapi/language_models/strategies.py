@@ -1244,6 +1244,8 @@ class ApiAgent(ModelStrategy):
         ok = not result.startswith("Error:") and "[exit code " not in result
         if coordination and ok:
             coordination.observed(name, True)
+            if name == "Bash" and getattr(coordination, "after_bash", None):
+                coordination.after_bash(str(arguments.get("command", "")))
         emit("tool_result", {
             "tool_call_id": call_id,
             "name": name,

@@ -317,6 +317,8 @@ class ChannelSession:
         # Verify profile: a read-only runtime that may run tests, type checks and builds.
         self.verification = False
         self.runtime_profile = None
+        # The latest instruction (tail of the dispatch prompt): Manager names commits it bundles here.
+        self.assignment = ''
         self._last_touch = 0.0
         self._usage_pending = {}
 
@@ -605,6 +607,8 @@ class ChannelSession:
     def guard(self, name, arguments):
         if name not in {'Bash', 'Write', 'Edit'}:
             return
+        if name == 'Bash':
+            self.check_publication(str(arguments.get('command', '')))
         if self.identity.sandbox != 'workspace-write':
             command = str(arguments.get('command', ''))
             if name == 'Bash' and self.verification:
@@ -639,6 +643,70 @@ class ChannelSession:
             if foreign and affected:
                 raise ModelError('WORKTREE_OWNED', 'Explicit worktree adoption/reconciliation required')
         self.last_check = time.monotonic()
+
+    def _command_dir(self, command):
+        try:
+            return bash_workdir(command, self.identity.workspace)
+        except ModelError:
+            return None
+
+    def check_publication(self, command):
+        """Refuse a push that would publish commits of another task (PUBLICATION_SCOPE_CONFLICT)."""
+        from . import publication_scope as scope
+        if scope.COMMIT_MAKERS.search(command or ''):
+            # Remember HEAD so the commits this command creates are attributed to this task.
+            folder = self._command_dir(command)
+            if folder:
+                self._heads_before = {**getattr(self, '_heads_before', {}),
+                                      folder: (scope.git(folder, 'rev-parse', 'HEAD'), time.time())}
+        if not scope.PUSH.search(command or '') or not self.identity:
+            return
+        folder = self._command_dir(command)
+        if not folder:
+            raise ModelError('PUBLICATION_SCOPE_UNVERIFIED', 'git push needs a literal working directory')
+        state = None
+        for repo, remote, src, dst in scope.push_targets(command, folder):
+            pending = scope.unpublished(repo, remote, src, dst)
+            if not pending or not pending['commits']:
+                continue
+            state = state or self.call('snapshot')['state']
+            foreign = scope.foreign_commits(pending['commits'], state, self.assignment)
+            if not foreign:
+                continue
+            try:
+                self.call('publication_scope', repository=str(repo), target=f'{remote}/{dst}',
+                          candidate=pending['candidate'], commits=foreign)
+            except ModelError:
+                pass    # the refusal below does not depend on recording it
+            log.warning('Publication scope conflict channel=%s dispatch=%s target=%s/%s foreign=%d',
+                        self.binding['channel_id'], self.binding['dispatch_id'], remote, dst, len(foreign))
+            raise ModelError('PUBLICATION_SCOPE_CONFLICT', scope.conflict_message(repo, foreign, remote, dst))
+
+    def after_bash(self, command):
+        """Attribute commits a successful command created to this dispatch's task revision."""
+        from . import publication_scope as scope
+        if not scope.COMMIT_MAKERS.search(command or ''):
+            return
+        folder = self._command_dir(command)
+        if not folder:
+            return
+        before, started = getattr(self, '_heads_before', {}).pop(folder, (None, None))
+        head = scope.git(folder, 'rev-parse', 'HEAD')
+        if not head or head == before or started is None:
+            return
+        # Only commits this command wrote: a pull/merge also brings in other people's commits,
+        # which keep their older committer time and are never attributed to this task.
+        listing = scope.git(folder, 'log', '--no-merges', '--max-count=20', '--format=%H %ct',
+                            f'{before}..{head}' if before else '-1')
+        created = [line.split()[0] for line in (listing or '').splitlines()
+                   if len(line.split()) == 2 and int(line.split()[1]) >= int(started) - 5]
+        repository = scope.git(folder, 'rev-parse', '--show-toplevel') or folder
+        for sha in created[:20]:
+            try:
+                self.call('commit', sha=sha, repository=repository)
+            except ModelError as error:
+                log.warning('Commit ownership not recorded sha=%s code=%s', sha[:12], error.code)
+                return
 
     def revoked(self):
         if self.closed or time.monotonic() - self.last_check < 2:

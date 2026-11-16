@@ -228,3 +228,65 @@ def test_tool_loop_limit_returns_a_structured_continuation_summary(bound, monkey
     assert body['tool_rounds'] == 2 and body['work_completed'] == 'Edited the parser; now testing.'
     assert body['tests_run'] and body['tests_run'][0].startswith('pytest -q')
     assert {'files_changed', 'current_failure', 'next_action', 'workspace_state'} <= set(body)
+
+
+def test_acceptance_done_latch_real_bug_end_to_end(system):
+    """Coder -> Integration PASS -> Git push -> Release exact SHA live -> Manager DONE, browser unavailable.
+
+    Through the real DevAgents runtime and the real Chat journal/outbox: Manager ends DONE with an
+    optional confirmation, nothing runs after it, and a late duplicate PASS wakes nobody.
+    """
+    s = system
+    sha = '3ae003d259c1194c4256ed17a827111319567075'
+    roles = {'ai_manager': 'manager_agent', 'ai_integration': 'integration_agent', 'ai_git': 'git_agent',
+             'ai_release': 'release_agent'}
+    for agent, role in roles.items():
+        s.repository.add_member(s.channel, agent)
+        s.execution['agents'][agent] = {'user_id': agent, 'company_id': 'company_test', 'provider': 'codex',
+                                        'role_file': f'agents/roles/{role}.md', 'display_name': agent,
+                                        'mode': 'read' if role == 'integration_agent' else 'write'}
+        s.export['files'].append({'path': f'agents/roles/{role}.md', 'content': 'Do your role.'})
+    s.execution['manager_agent_id'] = 'ai_manager'
+    answers = {
+        'ai_manager': ['@ai_coder fix the modal', '@ai_integration verify ' + sha, '@ai_git push ' + sha,
+                       '@ai_release verify production',
+                       'Both fixes are live.\nDONE: production serves ' + sha[:7] + ' and the live bundle has the fix\n'
+                       'OPTIONAL_USER_CONFIRMATION: Hard-refresh and confirm the interaction if you want.'],
+        'ai_coder': ['IMPLEMENTATION_COMPLETE: ' + sha],
+        'ai_integration': ['VERIFICATION_PASS: ' + sha],
+        'ai_git': ['PUBLICATION_COMPLETE: refs/heads/main is now ' + sha],
+        'ai_release': ['/__build.json reports ' + sha + '\nDEPLOYMENT_VERIFIED: ' + sha +
+                       '\nOPTIONAL_USER_CONFIRMATION: authenticated browser session unavailable'],
+    }
+    turns = []
+
+    class Scripted(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            agent = request.coordination.actor
+            turns.append(agent)
+            return ModelResult('completed', answers[agent].pop(0) if answers[agent] else 'UNEXPECTED TURN')
+    s.model.strategies['api_agent:codex'] = Scripted()
+    s.journal.mutate(s.channel, 'owner', {'op': 'dispatch', 'agent_id': 'ai_manager',
+                                          'assignment': 'The modal is still inside the right pane on worktwins.com',
+                                          'execution': s.execution}, human=True)
+
+    def settle(rounds=40):
+        for _ in range(rounds):
+            tick(s)
+            if not [x for x in dispatches(s) if x['status'] in ACTIVE_DISPATCH]:
+                tick(s)
+                if not [x for x in dispatches(s) if x['status'] in ACTIVE_DISPATCH]:
+                    return
+            time.sleep(0.05)
+    settle()
+    task = s.journal.snapshot(s.channel)['task']
+    assert turns == ['ai_manager', 'ai_coder', 'ai_manager', 'ai_integration', 'ai_manager', 'ai_git', 'ai_manager',
+                     'ai_release', 'ai_manager']
+    assert task['status'] == 'DONE' and task['optional_user_confirmation'].startswith('Hard-refresh')
+    assert task['facts']['published_sha'] == [sha] and task['facts']['deployment_verified']
+    # No further automatic orchestration: more ticks, a watchdog sweep, nothing runs.
+    s.journal.sweep()
+    settle(3)
+    assert len(turns) == 9 and 'UNEXPECTED TURN' not in str(turns)
+    bodies = [m['body'] for m in s.database.query_all('SELECT body FROM messages WHERE conversation_id=?', (s.channel,))]
+    assert not any('NEEDS INPUT' in body for body in bodies)

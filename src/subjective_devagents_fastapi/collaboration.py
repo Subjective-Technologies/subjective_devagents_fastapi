@@ -102,6 +102,7 @@ def _execute_approved(service, job):
         channel = ChannelSession(binding, binding['agent_id'], '')
         channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
         channel.verification = selected.sandbox == 'read-only' and (selected.test_exec or selected.build_exec)
+        channel.assignment = execution['prompt'][-6000:]
         channel.runtime_profile = {'runtime_id': selected.runtime_id, 'sandbox': selected.sandbox,
                                    'test_exec': selected.test_exec, 'build_exec': selected.build_exec,
                                    'fs_write': selected.fs_write, 'node_versions': list(selected.node_versions),
