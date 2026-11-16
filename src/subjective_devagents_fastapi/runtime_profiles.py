@@ -117,10 +117,13 @@ def node_toolchains(refresh=False) -> list[NodeToolchain]:
             binary = entry / 'bin' / 'node'
             if version and os.access(binary, os.X_OK):
                 found.setdefault(str(entry / 'bin'), NodeToolchain(version, str(entry / 'bin'), 'nvm'))
+    seen = {os.path.realpath(Path(path) / 'node') for path in found}
     for directory in ('/usr/local/bin', '/usr/bin', '/bin'):
         binary = Path(directory) / 'node'
-        if str(directory) in found or not os.access(binary, os.X_OK):
+        # /bin is often a symlink to /usr/bin: one toolchain, listed once.
+        if not os.access(binary, os.X_OK) or os.path.realpath(binary) in seen:
             continue
+        seen.add(os.path.realpath(binary))
         try:
             output = subprocess.run([str(binary), '--version'], capture_output=True, text=True, timeout=5,
                                     env={'PATH': '/usr/bin:/bin'}).stdout
