@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 import os
+import re
 import threading
 from pathlib import Path
 import time
@@ -79,11 +80,17 @@ def _execute_approved(service, job):
                 return {'ok': True, 'turn_id': previous['id'], 'reused': True}
         else:
             conversation_id = None
+        capacity = model.capacity() if hasattr(model, 'capacity') else {'available': 1}
+        if capacity['available'] <= 0:
+            # Refuse instead of accepting into a hidden in-process queue: the journal then
+            # shows the dispatch waiting for capacity rather than failing to start.
+            raise ModelError('runtime_capacity', f"All {capacity.get('workers')} runtime workers are busy")
         # Profiles can select a configured provider/model, never arbitrary workspaces/accounts/URLs.
         identity = service.backend.identity({'provider': profile['provider'], 'model': profile.get('model', ''),
             'workspace': service._default_workspace(profile['provider'])}, execution_required=True)
         if identity.strategy != 'api_agent' or identity.ssh_host:
             raise ModelError('coordinated_runtime_required', 'Collaboration requires a local runtime with per-tool fencing')
+        selected, requirements = select_runtime(profile, identity, execution['prompt'])
         if profile.get('mode') == 'read':
             identifier = 'readonly-' + hashlib.sha256(identity.id.encode()).hexdigest()
             identity = replace(identity, id=identifier, sandbox='read-only')
@@ -94,6 +101,11 @@ def _execute_approved(service, job):
         from . import agent_workflow
         channel = ChannelSession(binding, binding['agent_id'], '')
         channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
+        channel.verification = selected.sandbox == 'read-only' and (selected.test_exec or selected.build_exec)
+        channel.runtime_profile = {'runtime_id': selected.runtime_id, 'sandbox': selected.sandbox,
+                                   'test_exec': selected.test_exec, 'build_exec': selected.build_exec,
+                                   'fs_write': selected.fs_write, 'node_versions': list(selected.node_versions),
+                                   'requirements': requirements.summary()}
         assigned = channel.call('snapshot')['state'].get('workflow_version')
         options = {'version': assigned} if isinstance(assigned, str) and agent_workflow._VERSION.fullmatch(assigned) else {}
         export = agent_workflow.fetch_export_as_service(profile['company_id'], **options)
@@ -110,6 +122,26 @@ def _execute_approved(service, job):
         attachments = load_attachments(service, execution['attachment_ref'], claims['owner_id']) if execution.get('attachment_ref') else ()
         turn = model.submit(conversation_id, prompt, binding['dispatch_id'], timeout=1800, attachments=attachments, coordination=channel)
         return {'ok': True, 'turn_id': turn['id']}
+
+
+_VERIFIER_ROLE = re.compile(r'integration|pytest|selenium|verif|test')
+
+
+def select_runtime(profile, identity, prompt):
+    """Choose the runtime profile the assigned action needs, before any model call.
+
+    A read-mode verifier asked to run tests/tsc/build gets the verify profile (test and
+    build execution, no source-editing tools). Node versions the assignment or the named
+    project pins must be installed; otherwise BLOCKED_NO_COMPATIBLE_RUNTIME, immediately.
+    """
+    from .runtime_profiles import available_profiles, requirements_for, select_profile
+    read = profile.get('mode') == 'read'
+    verifier = read and bool(_VERIFIER_ROLE.search(str(profile.get('role_file', ''))))
+    requirements = requirements_for(prompt, None if identity.ssh_host else identity.workspace, verifier=verifier)
+    if not read:
+        requirements.write = True   # a writer's profile also carries test and build execution
+    profiles = available_profiles(identity.id, 'read-only' if read else 'workspace-write', verify_allowed=read)
+    return select_profile(requirements, profiles), requirements
 
 
 def replay_completions(store):

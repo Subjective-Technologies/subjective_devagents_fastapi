@@ -260,14 +260,21 @@ def test_brief_journal_outage_is_not_a_revocation(bound, monkeypatch):
         raise ModelError('coordination_unavailable','down')
     session._client=unavailable;session.last_check=0
     assert not session.revoked()
-    clock=time.monotonic()+31
+    from subjective_devagents_fastapi.channel_coordination import UNREACHABLE_GRACE
+    # A Chat API redeploy takes ~2 minutes; the grace must outlast it.
+    assert UNREACHABLE_GRACE >= 180
+    clock=time.monotonic()+UNREACHABLE_GRACE-1
     monkeypatch.setattr(time,'monotonic',lambda:clock)
+    session.last_check=0
+    assert not session.revoked()
+    clock=time.monotonic()+UNREACHABLE_GRACE+1
+    session.last_check=0
     assert session.revoked() and session.revocation=='coordination_unavailable'
 
 
 def test_lease_lost_turn_reports_failure_not_operator_stop(bound, monkeypatch):
     session,journal,identity=bound;session.tool('acquire',{'repository':identity.workspace,'paths':['.']})
-    async def lost(self, request, emit, cancelled):
+    async def lost(self, request, emit, cancelled, progress=None):
         session.revocation='LEASE_RECOVERY_REQUIRED'
         from subjective_devagents_fastapi.language_models import ModelResult
         return ModelResult('cancelled', error_code='cancelled_during_request')

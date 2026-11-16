@@ -251,7 +251,23 @@ def concrete_user_decision(text):
         return False
     return bool(question)
 
-UNREACHABLE_GRACE = 30.0
+def _seconds(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+    return value if value >= 0 else float(default)
+
+
+# How long a running turn tolerates an unreachable journal before it stops. A Chat API
+# redeploy restarts its container (cold boot plus Litestream restore takes up to ~2
+# minutes); 30 seconds killed every running agent on every deploy. Keep it below the
+# journal's heartbeat timeout (300 s) so a revived journal still sees this worker alive.
+UNREACHABLE_GRACE = _seconds('COORDINATION_UNREACHABLE_GRACE', 240)
+# Bounded exponential backoff for one coordination request (seconds between tries).
+CALL_BACKOFF = tuple(float(x) for x in os.environ.get('COORDINATION_CALL_BACKOFF', '1,2,4,8').split(',') if x.strip())
+# Liveness pings tolerate outages through UNREACHABLE_GRACE instead of blocking a tool loop.
+_NO_RETRY = {'touch', 'heartbeat'}
 TOOL_OPERATIONS = {'task', 'recover_task_lease', 'recover', 'reissue', 'adopt_worktree', 'blocker', 'snapshot', 'acquire', 'release', 'fact', 'decision', 'discovery',
                    'capability', 'route', 'privilege', 'review', 'gate', 'worktree'}
 CONTROL_TOOL = {'type': 'function', 'function': {
@@ -298,6 +314,9 @@ class ChannelSession:
         self.pending_start = None
         self.start_acknowledged = False
         self.heartbeat_interval = max(1.0, float(os.environ.get('COORDINATION_HEARTBEAT_INTERVAL', '15')))
+        # Verify profile: a read-only runtime that may run tests, type checks and builds.
+        self.verification = False
+        self.runtime_profile = None
         self._last_touch = 0.0
         self._usage_pending = {}
 
@@ -305,6 +324,19 @@ class ChannelSession:
         return f'ChannelSession(channel={self.binding["channel_id"]!r}, instance={self.binding["instance_id"]!r})'
 
     def call(self, op, **data):
+        """One journal operation; transient outages are retried with bounded backoff."""
+        delays = () if op in _NO_RETRY else CALL_BACKOFF
+        for attempt in range(len(delays) + 1):
+            try:
+                return self._call_once(op, **data)
+            except ModelError as error:
+                if error.code != 'coordination_unavailable' or attempt >= len(delays):
+                    raise
+                log.warning('Coordination unavailable; retrying op=%s attempt=%d channel=%s',
+                            op, attempt + 1, self.binding['channel_id'])
+                time.sleep(delays[attempt])
+
+    def _call_once(self, op, **data):
         body = {**data, 'op': op, 'actor_id': self.actor,
                 'dispatch_id': self.binding['dispatch_id'], 'instance_id': self.binding['instance_id']}
         if 'lease_id' not in body and self.lease_id:
@@ -324,6 +356,9 @@ class ChannelSession:
                 with httpx.Client(timeout=12, follow_redirects=False, trust_env=False) as client:
                     response = client.post(base + route,
                         headers=self._headers(), json=body)
+                if response.status_code >= 500 or response.status_code == 429:
+                    # Container restarting, Worker warming up, issuer overloaded: transient.
+                    raise ModelError('coordination_unavailable', 'Channel coordination is temporarily unavailable')
                 payload = response.json()
                 if response.status_code != 200 or not payload.get('ok'):
                     error = payload.get('error')
@@ -433,7 +468,8 @@ class ChannelSession:
         if snapshot['workflow_id'] != self.binding['workflow_id']:
             raise ModelError('workflow_identity_conflict', 'Channel workflow identity changed')
         started = self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor,
-                            heartbeat_interval=self.heartbeat_interval)
+                            heartbeat_interval=self.heartbeat_interval,
+                            **({'runtime_profile': self.runtime_profile} if self.runtime_profile else {}))
         self.start_acknowledged = True
         if started.get('dispatch'):
             # A late delivery can atomically adopt an unclaimed successor; bind all later calls to it.
@@ -571,8 +607,13 @@ class ChannelSession:
             return
         if self.identity.sandbox != 'workspace-write':
             command = str(arguments.get('command', ''))
+            if name == 'Bash' and self.verification:
+                from .runtime_profiles import is_verification_command
+                if is_verification_command(command):
+                    return
             if name != 'Bash' or shell_effect(command) != 'READ_ONLY' or re.search(r'[<>$`()\n]', command):
-                raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Read-only runtime permits observation and test commands only')
+                raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Read-only runtime permits observation and test commands only'
+                                 + ('' if self.verification else '; this dispatch has no verify profile'))
             return
         if name == 'Bash' and shell_effect(str(arguments.get('command', ''))) == 'READ_ONLY':
             return
@@ -678,7 +719,9 @@ class ChannelSession:
         outcome = ('blocked' if self.blocked or status == 'blocked' else
                    'completed' if status == 'completed' else 'failed')
         data = {'status': outcome, 'error_code': error_code,
-                'executor_stopped': (status not in {'interrupted', 'timed_out'} or error_code == 'model_request_timed_out') and 'uncertain' not in str(error_code),
+                'executor_stopped': (status not in {'interrupted', 'timed_out'}
+                                     or error_code in {'model_request_timed_out', 'service_restarted', 'tool_timed_out'})
+                                    and 'uncertain' not in str(error_code),
                 'failed_before_start': not self.start_acknowledged}
         if self._usage_pending:
             data['usage_receipts'] = list(self._usage_pending.values())[-600:]

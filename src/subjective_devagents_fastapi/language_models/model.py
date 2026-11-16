@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import logging
 import math
+import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -15,9 +16,17 @@ from .strategies import Api, ApiAgent, ClaudeCli, Cli, CodexCli, CursorCli, Grok
 log = logging.getLogger(__name__)
 
 
+def _workers() -> int:
+    try:
+        value = int(os.environ.get("SUBJECTIVE_LANGUAGE_MODEL_WORKERS", "16"))
+    except ValueError:
+        value = 16
+    return min(max(value, 1), 128)
+
+
 class LanguageModel:
     def __init__(self, store: TurnStore, identities: IdentityRegistry,
-                 strategies: dict[str, ModelStrategy] | None = None, max_workers: int = 4):
+                 strategies: dict[str, ModelStrategy] | None = None, max_workers: int | None = None):
         self.store = store
         self.identities = identities
         self.strategies = strategies if strategies is not None else {
@@ -30,7 +39,10 @@ class LanguageModel:
             # Kimi has no CLI at all: the proxy is its only way in.
             "api_agent:kimi": ApiAgent(), "api_agent:antigravity": ApiAgent(),
         }
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="language-model")
+        # Turns are I/O bound (model HTTP, tool subprocesses). Four shared workers let
+        # four long turns starve every later dispatch until its start watchdog fired.
+        self.max_workers = max_workers or _workers()
+        self._executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="language-model")
         self._lock = threading.RLock()
         self._futures: dict[str, Future] = {}
         # Image bytes never enter SQLite; an accepted turn's images live here until it starts.
@@ -79,6 +91,12 @@ class LanguageModel:
                     raise ModelError("unavailable", "Could not dispatch the accepted turn.")
             return turn
 
+    def capacity(self) -> dict:
+        """Running/queued turns versus workers. Admission refuses rather than hiding a queue."""
+        with self._lock:
+            busy = sum(1 for future in self._futures.values() if not future.done())
+        return {"busy": busy, "workers": self.max_workers, "available": max(0, self.max_workers - busy)}
+
     def _forget(self, identifier: str):
         with self._lock:
             self._futures.pop(identifier, None)
@@ -126,6 +144,9 @@ class LanguageModel:
             # The strategy may have started work. Preserve uncertainty; do not retry.
             log.error("LanguageModel worker exception turn_id=%s exception_type=%s", identifier, type(error).__name__)
             result = ModelResult("interrupted", error_code="worker_exception")
+        if self._stopping.is_set() and result.status == "cancelled":
+            # Shutdown, not an operator stop: the logical task continues in a successor.
+            result = ModelResult("cancelled", result.text, result.session_id, "service_restarted")
         if result.status not in TERMINAL:
             # An unlisted status used to raise out of finish() and leave the row running.
             # The sender then polled until the process was restarted.

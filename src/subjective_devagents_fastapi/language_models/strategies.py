@@ -7,6 +7,7 @@ import difflib
 import json
 import os
 import pwd
+import re
 import shutil
 import tempfile
 import time
@@ -542,6 +543,24 @@ def agent_environment(identity) -> dict[str, str]:
     return {"HOME": identity.home or identity.workspace, "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
 
 
+def project_toolchain_env(command: str, identity) -> dict[str, str]:
+    """Put the Node version the project pins (.nvmrc, engines, CI) first on PATH.
+
+    The host default (/usr/bin/node) otherwise wins for every agent. Coder and verifier
+    then reproduce the same checks with the same toolchain. Remote hosts are left alone.
+    """
+    if identity.ssh_host or not identity.workspace:
+        return {}
+    try:
+        from ..channel_coordination import bash_workdir
+        from ..runtime_profiles import node_path_for
+        workdir = bash_workdir(command, identity.workspace)
+        path, toolchain = node_path_for(workdir, identity.workspace, agent_environment(identity)["PATH"])
+    except Exception:  # noqa: BLE001 - toolchain selection never blocks a command
+        return {}
+    return {"PATH": path} if toolchain else {}
+
+
 def agent_tool_set(identity) -> dict[str, dict]:
     names = set(AGENT_TOOLS) if identity.sandbox == "workspace-write" else set(AGENT_TOOLS) - MUTATING_TOOLS
     if identity.allowed_tools:
@@ -712,18 +731,19 @@ def _cap(text: str) -> str:
 
 
 def _run_bounded(argv: tuple[str, ...], stdin: str, identity, transport: ProcessTransport,
-                 cancelled: Cancelled, timeout: float, cap: bool = True) -> str:
+                 cancelled: Cancelled, timeout: float, cap: bool = True, env_override: dict | None = None) -> str:
     """cap=False skips the model-facing TOOL_OUTPUT_LIMIT truncation: Edit's read-before-write
     needs the file's real, complete content, never a truncated stand-in that then gets written
     back over the original (that silently destroyed any file over the cap — see Edit below)."""
-    env = agent_environment(identity)
+    env = {**agent_environment(identity), **(env_override or {})}
     wrapped, cwd = _localize(argv, env, identity)
     result = transport.run(Command(argv=wrapped, stdin=stdin, cwd=cwd, env=env),
                            timeout=timeout, cancelled=cancelled, on_stdout=lambda _chunk: None)
     if result.status == "remote_outcome_unknown":
         raise ToolAbort(ModelResult("interrupted", error_code="remote_outcome_unknown"))
     if result.status in {"cancelled", "timed_out"}:
-        raise ToolAbort(ModelResult(result.status, error_code=result.status))
+        # A command that ran out of time is a tool timeout, not a model request timeout.
+        raise ToolAbort(ModelResult(result.status, error_code="tool_timed_out" if result.status == "timed_out" else result.status))
     text = result.stdout
     if result.stderr:
         text = text + ("\n" if text else "") + result.stderr
@@ -864,7 +884,8 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
         command = str(arguments.get("command") or "").strip()
         if not command:
             return "Error: command is required."
-        return _run_bounded(("sh", "-c", command), "", identity, transport, cancelled, timeout)
+        return _run_bounded(("sh", "-c", command), "", identity, transport, cancelled, timeout,
+                            env_override=project_toolchain_env(command, identity))
     if name == "Read":
         path = str(arguments.get("file_path") or "").strip()
         if not path:
@@ -919,6 +940,83 @@ def execute_agent_tool(name: str, arguments: dict, identity, transport: ProcessT
     return f"Error: unknown tool {name!r}."
 
 
+_CHECK_COMMAND = re.compile(r"(?i)\b(?:pytest|vitest|jest|npm (?:run )?(?:test|build|lint|typecheck)|pnpm (?:test|build)|"
+                            r"yarn (?:test|build)|tsc|go (?:test|build|vet)|cargo (?:test|build|check)|make (?:test|build|check))\b")
+CONTINUATION_SUMMARY_LIMIT = 8000
+
+
+def continuation_summary(progress: dict, reason: str, identity, transport) -> str:
+    """Compact, structured state for a successor instance of the same logical task.
+
+    Built from this turn's own tool rounds and the execution host's Git status, never
+    from tool output bodies (which can hold secrets or very large logs).
+    """
+    messages = progress.get("messages") or []
+    first = progress.get("first_of_turn", 0)
+    calls, results = [], {}
+    files = set(progress.get("edited") or ())
+    last_note = ""
+    for item in messages[first:]:
+        if item.get("role") == "assistant":
+            if isinstance(item.get("content"), str) and item["content"].strip():
+                last_note = item["content"].strip()
+            for call in item.get("tool_calls") or []:
+                function = call.get("function") or {}
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except ValueError:
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                calls.append((call.get("id") or "", function.get("name") or "", arguments))
+                if function.get("name") in {"Write", "Edit"} and arguments.get("file_path"):
+                    files.add(str(arguments["file_path"]))
+        elif item.get("role") == "tool":
+            content = item.get("content") if isinstance(item.get("content"), str) else ""
+            results[item.get("tool_call_id") or ""] = not content.startswith("Error:") and "[exit code " not in content
+    if not calls:
+        return ""
+    from ..activity_preview import safe_tool_detail
+    commands, checks = [], []
+    for call_id, name, arguments in calls:
+        if name != "Bash":
+            continue
+        preview = safe_tool_detail(arguments.get("command"), command=True) or ""
+        outcome = {True: "ok", False: "failed"}.get(results.get(call_id), "not finished")
+        commands.append(f"{preview} -> {outcome}")
+        if _CHECK_COMMAND.search(str(arguments.get("command") or "")):
+            checks.append(f"{preview} -> {outcome}")
+    workspace_state = ""
+    if transport is not None and identity.workspace and not identity.ssh_host:
+        try:
+            env = agent_environment(identity)
+            wrapped, cwd = _localize(("git", "-C", identity.workspace, "status", "--porcelain=v1", "-b"), env, identity)
+            status = transport.run(Command(argv=wrapped, cwd=cwd, env=env), timeout=10,
+                                   cancelled=lambda: False, on_stdout=lambda _chunk: None)
+            if status.status == "completed" and status.returncode == 0:
+                lines = status.stdout.splitlines()
+                workspace_state = "\n".join(lines[:40]) + (f"\n... {len(lines) - 40} more" if len(lines) > 40 else "")
+        except Exception:  # noqa: BLE001 - observation only
+            workspace_state = ""
+    failing = [item for item in checks if item.endswith("failed")]
+    next_action = ("Resume from the last completed step; re-run the failing checks first: " + "; ".join(failing[-3:])
+                   if failing else "Resume from the last completed step; do not repeat finished work.")
+    body = {
+        "reason": reason,
+        "tool_rounds": progress.get("rounds", 0),
+        "work_completed": last_note[-1500:],
+        "files_changed": sorted(files)[:60],
+        "tests_run": checks[-15:],
+        "current_failure": failing[-1] if failing else reason,
+        "recent_commands": commands[-15:],
+        "workspace_state": workspace_state,
+        "next_action": next_action,
+    }
+    text = ("CONTINUATION_SUMMARY (automatic recovery of the same logical task; the workspace was preserved, "
+            "continue from it and do not restart from scratch):\n" + json.dumps(body, indent=1))
+    return text[:CONTINUATION_SUMMARY_LIMIT]
+
+
 class ApiAgent(ModelStrategy):
     """Provider-agnostic tool-use loop over an OpenAI-compatible chat-completions endpoint.
 
@@ -933,15 +1031,27 @@ class ApiAgent(ModelStrategy):
         self.transport = transport
 
     def run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
-        result = asyncio.run(self._run(request, emit, cancelled))
+        progress: dict = {}
+        result = asyncio.run(self._run(request, emit, cancelled, progress))
         revocation = getattr(request.coordination, "revocation", None)
         if result.status == "cancelled" and revocation and not cancelled():
             # Nobody pressed Stop: the channel took the write lease away. Say so, instead
             # of the operator-stop message the UI shows for a plain cancellation.
-            return ModelResult("failed", error_code="coordination_lease_lost:" + revocation)
+            result = ModelResult("failed", error_code="coordination_lease_lost:" + revocation)
+        if request.coordination and result.status not in {"completed", "blocked"} and progress.get("messages"):
+            # The logical task outlives this instance. Its successor continues from here.
+            try:
+                summary = continuation_summary(progress, result.error_code or result.status,
+                                               request.identity, progress.get("transport"))
+            except Exception:  # noqa: BLE001 - a summary must never hide the failure itself
+                summary = ""
+            if summary:
+                text = (result.text + "\n\n" if result.text else "") + summary
+                result = ModelResult(result.status, text, result.session_id, result.error_code)
         return result
 
-    async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled) -> ModelResult:
+    async def _run(self, request: ModelRequest, emit: Emit, cancelled: Cancelled, progress: dict | None = None) -> ModelResult:
+        progress = {} if progress is None else progress
         if cancelled():
             return ModelResult("cancelled", error_code="cancelled_before_start")
         identity = request.identity
@@ -986,7 +1096,9 @@ class ApiAgent(ModelStrategy):
         # Repositories as they were before the first Bash command; None until one runs.
         snapshot: dict | None = None
         edited: set[str] = set()
+        progress.update(messages=messages, first_of_turn=first_of_turn, edited=edited, transport=transport, rounds=0)
         for _ in range(MAX_TOOL_ROUNDS):
+            progress["rounds"] += 1
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return ModelResult("timed_out", error_code="timed_out")
@@ -1000,6 +1112,7 @@ class ApiAgent(ModelStrategy):
                     if more:
                         messages = fitted + turn_part[1:]
                         first_of_turn = len(fitted)
+                        progress.update(messages=messages, first_of_turn=first_of_turn)
                 if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                     return ModelResult("failed", error_code="context_too_large")
             emit("runtime_status", {"phase": "model"})

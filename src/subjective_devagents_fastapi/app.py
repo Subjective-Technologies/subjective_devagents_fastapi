@@ -2090,7 +2090,8 @@ async def api_collaboration_execute(request: Request, body: dict = Body(...)):
     try:
         return await asyncio.to_thread(execute, core().llm_service, body)
     except ModelError as error:
-        return JSONResponse(status_code=409, content={'ok': False, 'error': error.code})
+        # The message is a fixed, non-secret explanation (e.g. which Node version is missing).
+        return JSONResponse(status_code=409, content={'ok': False, 'error': error.code, 'message': str(error)[:400]})
 
 
 @app.post('/api/collaboration/attachments')
