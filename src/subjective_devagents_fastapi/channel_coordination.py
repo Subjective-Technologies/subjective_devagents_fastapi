@@ -125,6 +125,29 @@ def _prefix_directory(tokens):
     return None
 
 
+def lease_roots(identity):
+    """Folders a local write lease may cover: the execution workspace, plus this
+    server's company clone /<company>/<company>.
+
+    The workflow tells agents to write the company's model and code there
+    (WORKFLOW_V2_PATHS vm_root). Without it they copy the clone under the
+    workspace and the real file stays untouched. The company comes from this
+    server's own configuration, never from the agent.
+    """
+    roots = [Path(identity.workspace).resolve()]
+    from . import architecture_file, auth
+    company = architecture_file.company_root(auth.expected_company_name())
+    if company is not None:
+        company = company.resolve()
+        if company not in roots and company != Path('/'):
+            roots.append(company)
+    return roots
+
+
+def _inside(path, roots):
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
 def bash_workdir(command, workspace):
     """Directory a Bash command runs in.
 
@@ -571,9 +594,8 @@ class ChannelSession:
         if self.identity.ssh_host:
             raise ModelError('remote_scope_unverified', 'Recovery needs an execution-host observer')
         location = Path(repository).resolve()
-        root = Path(self.identity.workspace).resolve()
         registered = (self._state or {}).get('worktrees', {}).get(str(location))
-        if not location.is_relative_to(root) and not registered:
+        if not _inside(location, lease_roots(self.identity)) and not registered:
             raise ModelError('lease_outside_workspace', 'Cannot inspect an unrelated worktree')
         def git(*args):
             result = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(location), *args],
@@ -603,10 +625,9 @@ class ChannelSession:
             if self.identity.ssh_host:
                 raise ModelError('remote_scope_unverified', 'Remote path leases require a verified execution-host resolver')
             requested = str(Path(data.get('repository', self.identity.workspace)).resolve())
-            root = str(Path(self.identity.workspace).resolve())
             registered = (self._state or {}).get('worktrees', {}).get(requested)
             owned_worktree = registered and registered['instance_id'] == self.binding['instance_id']
-            if not owned_worktree and requested != '/' and not (requested == root or requested.startswith(root.rstrip('/') + '/')):
+            if not owned_worktree and requested != '/' and not _inside(Path(requested), lease_roots(self.identity)):
                 raise ModelError('lease_outside_workspace', 'Lease repository is outside execution workspace')
             data['repository'] = requested
             resolved = [(Path(requested) / p).resolve() for p in data.get('paths', ['.'])]

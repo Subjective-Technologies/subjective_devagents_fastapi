@@ -3,6 +3,7 @@ from dataclasses import replace
 import json
 import time
 import pytest
+from pathlib import Path
 from subjective_devagents_fastapi.channel_coordination import ChannelSession
 from subjective_devagents_fastapi.language_models import ApiAgent, Identity, ModelRequest
 from subjective_devagents_fastapi.language_models.contracts import ModelError
@@ -395,3 +396,44 @@ def test_inference_only_timeout_releases_executor_but_uncertain_tool_timeout_doe
     session,_,_=bound
     assert session.completion_payload('timed_out','model_request_timed_out')['data']['executor_stopped'] is True
     assert session.completion_payload('timed_out','timed_out')['data']['executor_stopped'] is False
+
+
+def test_company_clone_is_leasable_beside_the_workspace(bound, tmp_path, monkeypatch):
+    """/<company>/<company> is where the workflow writes the company's model and code."""
+    session, journal, identity = bound
+    fs = tmp_path / 'fs'
+    clone = fs / 'cardnexia' / 'cardnexia'
+    (clone / 'architecture').mkdir(parents=True)
+    (fs / 'othercorp' / 'othercorp').mkdir(parents=True)
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_ARCHITECTURE_ROOT', str(fs))
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_COMPANY_NAME', 'CardNexia')
+    session.tool('acquire', {'repository': str(clone), 'paths': ['architecture/cardnexia.xmi']})
+    assert journal.calls[-1]['repository'] == str(clone.resolve())
+    session.guard('Write', {'file_path': str(clone / 'architecture' / 'cardnexia.xmi')})
+    assert journal.calls[-1]['path'] == str((clone / 'architecture' / 'cardnexia.xmi').resolve())
+    # Another company's clone, or the folder above the clone, stays out of reach.
+    for outside in (fs / 'othercorp' / 'othercorp', fs / 'cardnexia', tmp_path / 'unrelated'):
+        with pytest.raises(ModelError) as error:
+            session.tool('acquire', {'repository': str(outside), 'paths': ['.']})
+        assert error.value.code == 'lease_outside_workspace'
+    with pytest.raises(ModelError) as error:
+        session.tool('acquire', {'repository': str(clone), 'paths': ['../../othercorp']})
+    assert error.value.code == 'lease_outside_repository'
+
+
+def test_without_a_company_only_the_workspace_is_leasable(bound, tmp_path, monkeypatch):
+    from subjective_devagents_fastapi import auth
+    session, journal, identity = bound
+    monkeypatch.delenv('SUBJECTIVE_DEVAGENTS_COMPANY_NAME', raising=False)
+    monkeypatch.setattr(auth, 'COMPANY_NAME_FILE', tmp_path / 'no-company-file')
+    from subjective_devagents_fastapi.channel_coordination import lease_roots
+    assert lease_roots(identity) == [Path(identity.workspace).resolve()]
+
+
+def test_agent_prompt_names_the_company_folder(tmp_path, monkeypatch):
+    from subjective_devagents_fastapi.language_models.strategies import agent_system_prompt
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_ARCHITECTURE_ROOT', str(tmp_path / 'fs'))
+    monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_COMPANY_NAME', 'CardNexia')
+    identity = Identity('runtime', 'codex', workspace=str(tmp_path), sandbox='workspace-write')
+    assert f"Company folder: {tmp_path / 'fs' / 'cardnexia' / 'cardnexia'}" in agent_system_prompt(identity)
+    assert 'Company folder' not in agent_system_prompt(Identity('runtime', 'codex', workspace=str(tmp_path)))

@@ -25,13 +25,21 @@ def company_slug(name: str) -> str:
     return "" if not slug or ".." in slug else slug[:80]
 
 
-def xmi_path(company_name: str) -> Path | None:
+def company_root(company_name: str) -> Path | None:
+    """/<company>/<company>: the company's clone on its own server (workflow vm_root)."""
     slug = company_slug(company_name)
     if not slug:
         return None
     # Tests point the root elsewhere; production reads from the filesystem root.
     root = Path(os.environ.get("SUBJECTIVE_DEVAGENTS_ARCHITECTURE_ROOT") or "/")
-    return root / slug / slug / "architecture" / f"{slug}.xmi"
+    return root / slug / slug
+
+
+def xmi_path(company_name: str) -> Path | None:
+    base = company_root(company_name)
+    if base is None:
+        return None
+    return base / "architecture" / f"{base.name}.xmi"
 
 
 def read_company_xmi() -> tuple[int, dict]:

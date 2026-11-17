@@ -703,6 +703,14 @@ def agent_system_prompt(identity) -> str:
     ]
     if identity.sandbox != "workspace-write":
         lines.append("This session is read-only: Bash, Write and Edit are unavailable.")
+    elif not identity.ssh_host:
+        from ..channel_coordination import lease_roots
+        extra = [str(root) for root in lease_roots(identity)[1:]]
+        if extra:
+            lines.append(
+                "Company folder: " + extra[0] + ". A write lease may cover it directly; edit company "
+                "files there in place and never copy it under the workspace root to work around a lease."
+            )
     if identity.allowed_tools:
         lines.append("Only these tools are available: " + ", ".join(sorted(identity.allowed_tools)))
     lines.append(
