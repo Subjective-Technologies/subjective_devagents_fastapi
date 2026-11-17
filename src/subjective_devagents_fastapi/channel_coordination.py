@@ -137,7 +137,9 @@ def lease_roots(identity):
     roots = [Path(identity.workspace).resolve()]
     from . import architecture_file, auth
     company = architecture_file.company_root(auth.expected_company_name())
-    if company is not None:
+    # Only a clone that exists on this server: the platform server has no /<company>/<company>,
+    # and naming a missing folder sent agents looking for it.
+    if company is not None and company.is_dir():
         company = company.resolve()
         if company not in roots and company != Path('/'):
             roots.append(company)

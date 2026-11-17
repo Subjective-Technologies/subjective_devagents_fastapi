@@ -435,5 +435,8 @@ def test_agent_prompt_names_the_company_folder(tmp_path, monkeypatch):
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_ARCHITECTURE_ROOT', str(tmp_path / 'fs'))
     monkeypatch.setenv('SUBJECTIVE_DEVAGENTS_COMPANY_NAME', 'CardNexia')
     identity = Identity('runtime', 'codex', workspace=str(tmp_path), sandbox='workspace-write')
+    # A clone that does not exist on this server is never named (agents went looking for it).
+    assert 'Company folder' not in agent_system_prompt(identity)
+    (tmp_path / 'fs' / 'cardnexia' / 'cardnexia').mkdir(parents=True)
     assert f"Company folder: {tmp_path / 'fs' / 'cardnexia' / 'cardnexia'}" in agent_system_prompt(identity)
     assert 'Company folder' not in agent_system_prompt(Identity('runtime', 'codex', workspace=str(tmp_path)))
