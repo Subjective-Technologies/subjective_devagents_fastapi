@@ -165,3 +165,32 @@ def test_assigned_version_response_cannot_silently_change_and_invalid_stamp_is_r
         aw.fetch_export(COMPANY, 'Bearer fixture', opener=opener, version='20261114000000')
     with pytest.raises(aw.WorkflowUnavailable, match='valid published workflow'):
         aw.fetch_export(COMPANY, 'Bearer fixture', opener=opener, version='invalid?version=other')
+
+
+def _published(version, files):
+    return {"version": {"version": version}, "files": [{"path": p, "content": c} for p, c in files.items()]}
+
+
+def test_a_version_republished_in_place_is_rewritten_on_disk(tmp_path):
+    """Production 2026-11-17: 20261117142005 was republished with different files under the same
+    id; servers kept the first copy on disk, so agents read stale policies and skills."""
+    first = _published("20261117142005", {"AGENTS.md": "stop when versions differ", "policies/p.md": "old"})
+    folder = aw.materialize(first, COMPANY, tmp_path)
+    assert (folder / "policies/p.md").read_text() == "old"
+    again = aw.materialize(first, COMPANY, tmp_path)
+    assert again == folder and (folder / "policies/p.md").read_text() == "old"     # same files: kept
+    second = _published("20261117142005", {"AGENTS.md": "runtime-enforced rules", "policies/p.md": "new"})
+    folder = aw.materialize(second, COMPANY, tmp_path)
+    assert (folder / "AGENTS.md").read_text() == "runtime-enforced rules"
+    assert (folder / "policies/p.md").read_text() == "new"
+    assert json.loads((folder / "runtime_identity.json").read_text())["digest"] == aw.export_digest(second)
+    assert not [p for p in folder.parent.iterdir() if "stale" in p.name]
+
+
+def test_a_folder_written_before_digests_is_refreshed(tmp_path):
+    export = _published("20261116095439", {"AGENTS.md": "current"})
+    legacy = tmp_path / COMPANY / "20261116095439"
+    legacy.mkdir(parents=True)
+    (legacy / "AGENTS.md").write_text("whatever was there")
+    folder = aw.materialize(export, COMPANY, tmp_path)
+    assert (folder / "AGENTS.md").read_text() == "current"

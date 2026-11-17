@@ -192,7 +192,7 @@ def _safe_relative(path: str) -> Path | None:
     return Path(*parts)
 
 
-def _sync_runtime_identity(folder: Path, version: str) -> None:
+def _sync_runtime_identity(folder: Path, version: str, digest: str | None = None) -> None:
     """Published DB revision is authoritative; explicitly reconcile legacy file identity."""
     identity_file = folder / "runtime_identity.json"
     version_file = folder / "WORKFLOW_VERSION"
@@ -200,7 +200,7 @@ def _sync_runtime_identity(folder: Path, version: str) -> None:
     previous = json.loads(identity_file.read_text()) if identity_file.is_file() else {}
     manifest = {"source": "published_workflow_database", "workflow_version": version,
                 "legacy_file_version": previous.get("legacy_file_version", observed),
-                "synchronized": True}
+                "digest": digest or previous.get("digest"), "synchronized": True}
     for name, content in (("WORKFLOW_VERSION", version + "\n"),
                           ("runtime_identity.json", json.dumps(manifest, sort_keys=True))):
         handle, temporary = tempfile.mkstemp(prefix=".identity-", dir=folder)
@@ -212,13 +212,37 @@ def _sync_runtime_identity(folder: Path, version: str) -> None:
             if os.path.exists(temporary): os.unlink(temporary)
 
 
+def _materialized_digest(folder: Path) -> str | None:
+    try:
+        return json.loads((folder / "runtime_identity.json").read_text()).get("digest")
+    except (OSError, ValueError):
+        return None
+
+
 def materialize(export: dict, company_id: str, root: Path) -> Path:
-    """Write one published version to <root>/<company>/<version>/ once; it never changes after."""
+    """Write one published version to <root>/<company>/<version>/.
+
+    Written once per version, but checked against the published files' digest on every use:
+    a folder holding other files under the same version id (a version republished in place,
+    or one written before digests were recorded) is replaced, so agents never read stale
+    skills or policies from disk.
+    """
     version = export["version"]["version"]
     target = root / company_id / version
+    digest = export_digest(export)
     if target.is_dir():
-        _sync_runtime_identity(target, version)
-        return target
+        if _materialized_digest(target) == digest:
+            _sync_runtime_identity(target, version, digest)
+            return target
+        log_workflow("WORKFLOW_RELOADED", company_id=company_id, workflow_version=version,
+                     reason="cached_files_differ_from_published", digest=digest)
+        stale = target.with_name(f".{version}-stale-{int(time.time() * 1000)}")
+        try:
+            os.replace(target, stale)
+        except OSError:
+            stale = None
+        if stale is not None:
+            shutil.rmtree(stale, ignore_errors=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{version}-", dir=target.parent))
     try:
@@ -229,7 +253,7 @@ def materialize(export: dict, company_id: str, root: Path) -> Path:
             destination = staging / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(str(item.get("content") or ""), encoding="utf-8")
-        _sync_runtime_identity(staging, version)
+        _sync_runtime_identity(staging, version, digest)
         try:
             os.replace(staging, target)
         except OSError:
