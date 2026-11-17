@@ -94,7 +94,9 @@ def test_clear_api_persists_and_broadcasts(client, monkeypatch):
     assert any(event["type"] == "llm-conversation" and event["conversation"]["messages"] == [] for event in events)
 
 
-def test_cleared_chat_replaces_d1_replica_messages(service):
+def test_cleared_chat_replaces_d1_replica_messages(service, monkeypatch):
+    # test_d1_sync's autouse fixture does not apply here: give the replica its namespace.
+    monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_D1_NAMESPACE", "00000000-0000-4000-8000-000000000003")
     from test_d1_sync import _db
     from subjective_devagents_fastapi.d1_client import SqliteExecutor
     from subjective_devagents_fastapi.d1_sync import sync_conversations

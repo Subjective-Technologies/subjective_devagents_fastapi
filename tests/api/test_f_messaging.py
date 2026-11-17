@@ -719,3 +719,16 @@ def test_f14_a_full_screen_redraw_is_drawn_rather_than_concatenated(client):
     # The lines landed on separate rows, not concatenated into one.
     assert "contentsof" not in rendered.replace(" ", "")[:200] or "\n" in rendered
     assert rendered.count("\n") >= 3, rendered
+
+
+def test_f15_clearing_a_chat_empties_its_messages_and_keeps_the_chat(client):
+    created = envelope(client.post("/api/llm/create-conversation", json={
+        "provider": "claude", "name": "f15-clear",
+    }), ok=True)["conversation"]
+    cleared = envelope(client.post("/api/llm/clear-conversation", json={"target": created["target"]}), ok=True)
+    assert cleared["conversation"]["target"] == created["target"]
+    assert cleared["conversation"]["messageCount"] == 0
+    assert envelope(client.get("/api/llm/conversations"), ok=True)["total"] == 1
+    refused = client.post("/api/llm/clear-conversation", json={"target": ""}).json()
+    assert refused["ok"] is False
+    envelope(client.post("/api/llm/delete-conversation", json={"target": created["target"]}), ok=True)

@@ -22,7 +22,7 @@ PROVIDERS = {
     "ssh": ("ssh", "subjective_ssh_datasource"),
 }
 # Agents with no CLI or plugin: they run only through the LLM proxy (ApiAgent).
-PROXY_ONLY = {"kimi"}
+PROXY_ONLY = {"kimi", "antigravity"}
 # `localchats` is a reader, not a writable agent: it imports history rather than
 # answering a turn, so it has a datasource but no entry in the new-chat picker.
 READ_ONLY_DATASOURCES = {"localchats"}

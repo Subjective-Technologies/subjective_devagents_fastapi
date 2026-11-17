@@ -19,7 +19,9 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: [self-hosted, linux]
+    # GitHub-hosted (the repository is public): the self-hosted runner group never
+    # picked this repository up, so every run sat queued until the next push cancelled it.
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
@@ -40,3 +42,31 @@ jobs:
           uv pip install pytest
       - name: Test
         run: python -m pytest -q tests
+
+  # There is no single deploy target: every company server (ours and each customer VPS)
+  # follows the `stable` tag with scripts/update_from_stable.sh, run by a systemd timer
+  # that company_setup.sh installs. This job only moves `stable` to a commit whose tests
+  # passed, and never backwards.
+  release:
+    name: Release (move stable)
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Move stable to the tested commit (fast-forward only)
+        run: |
+          git fetch --force origin 'refs/tags/stable:refs/tags/stable' || true
+          if git rev-parse -q --verify 'refs/tags/stable^{commit}' >/dev/null; then
+            if ! git merge-base --is-ancestor 'refs/tags/stable^{commit}' "$GITHUB_SHA"; then
+              echo "stable is not an ancestor of $GITHUB_SHA; not moving it backwards or sideways"
+              exit 0
+            fi
+          fi
+          git tag -f stable "$GITHUB_SHA"
+          git push -f origin refs/tags/stable
+          echo "stable -> $GITHUB_SHA"
