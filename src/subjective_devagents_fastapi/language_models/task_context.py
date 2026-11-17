@@ -170,14 +170,15 @@ def digest_tool_output(name, arguments, output):
             parts.append(f'{counts[0]} passed, {counts[1]} failed')
         body = error_excerpt(output, 400) if exit_code else '\n'.join(
             line[:160] for line in [l for l in output.splitlines() if l.strip()][-3:])
-        return (f'[Earlier tool output summarized; re-run if you need it in full: {" · ".join(parts)}'
+        return (f'[Earlier tool output summarized. Do not re-run this command: {" · ".join(parts)}'
                 + (f'\n{body}' if body else '') + ']')
     if name == 'Read':
         return (f"[Earlier Read of {arguments.get('file_path')} summarized: {output.count(chr(10)) + 1} lines. "
-                'Re-read the lines you need.]')
+                'Do not read this file again. Edit it or answer from this summary.]')
     if name in {'Grep', 'Glob'}:
         lines = [line for line in output.splitlines() if line.strip()]
-        return f"[Earlier {name} {arguments.get('pattern') or arguments.get('path') or ''} summarized: {len(lines)} result lines.]"
+        return (f"[Earlier {name} {arguments.get('pattern') or arguments.get('path') or ''} summarized: "
+                f"{len(lines)} result lines. Do not repeat this search.]")
     if name == 'Coordination':
         return '[Earlier Coordination result summarized; the current journal state is in the system prompt.]'
     return f'[Earlier {name} output summarized: {len(output)} chars.]'

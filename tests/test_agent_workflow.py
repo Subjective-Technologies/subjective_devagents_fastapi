@@ -81,6 +81,29 @@ def test_the_first_turn_carries_the_definition_with_the_database_version(monkeyp
     assert state["llm:t1"]["header"] == ("20261009150839", "coder_agent")
 
 
+def test_a_startup_reading_list_is_not_inlined_into_the_turn():
+    export = _export()
+    export["files"][0]["content"] = (
+        "# Contract\nBe exact.\n\n"
+        "## Startup Sequence — Read in Order\n\n"
+        "Every agent MUST read these before starting work:\n"
+        "1. wf cat AGENTS.md\n\n"
+        "## After\n\nKeep this.\n"
+    )
+    export["files"][1]["content"] = (
+        "# coder_agent\n\n## Mission\n\nShip code.\n\n"
+        "## Startup Sequence\n\nRead agents/registry.md before any edit.\n"
+    )
+    text = aw.compose_definition(export, AGENT, Path("/tmp/wf"))
+    assert "MUST read" not in text
+    assert "wf cat AGENTS.md" not in text
+    assert "registry.md" not in text
+    assert "Be exact." in text and "Keep this." in text and "Ship code." in text
+    assert "Do not read the workflow catalog" in text
+    assert "Do not tour the folder first." in text
+    assert text.strip().endswith("A company reading list is not a step of the assignment.")
+
+
 def test_later_turns_are_plain_until_the_workflow_changes(monkeypatch, tmp_path):
     _serve(monkeypatch, _export())
     state = {}

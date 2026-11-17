@@ -185,18 +185,20 @@ def test_journal_view_is_bounded_whatever_the_channel_age():
     assert len(session.tool('snapshot', {})) <= 8_000
 
 
-def test_long_read_loops_stay_bounded_without_handoff(monorepo, monkeypatch):
-    """Interpreted outputs are digested, so 40 large reads finish inside the budget."""
+def test_long_read_loops_stop_instead_of_running_out_the_timeout(monorepo, monkeypatch):
+    """A coder that only reads stops at the scoping cap. It does not keep requesting the model."""
+    from subjective_devagents_fastapi.language_models.strategies import CODER_SCOPING_ROUNDS
+
     root, dashboard, _, _ = monorepo
     monkeypatch.setenv('TEST_KEY', 'fixture')
     monkeypatch.setenv('SUBJECTIVE_AGENT_CONTEXT_TOKENS', '20000')
     identity, session, _ = coder_session(root)
-    script = [completion(tool_calls=[tool_call(f'r{n}', 'Read', file_path=str(dashboard / f'src/file{n % 12}.ts'))])
+    script = [completion(tool_calls=[tool_call(f'r{n}', 'Read', file_path=str(dashboard / f'src/file{n}.ts'))])
               for n in range(40)] + [completion(content='IMPLEMENTATION_COMPLETE: read everything')]
     with ScriptedProxy(script) as proxy:
         result = ApiAgent().run(ModelRequest('t', replace(identity, api_base_url=proxy.url), 'Read all', timeout=30,
                                              coordination=session), lambda *_: None, lambda: False)
-    assert result.status == 'completed'
+    assert result.status == 'blocked' and result.error_code == 'coder_scoping_limit'
+    assert len(proxy.requests) == CODER_SCOPING_ROUNDS
     sizes = [sum(len(tc.text_of(m.get('content'))) for m in request[2]['messages']) for request in proxy.requests]
     assert max(sizes) <= 0.9 * 20000 * tc.CHARS_PER_TOKEN
-    assert sizes[-1] < sizes[15] * 1.5          # flat, not linear in the number of reads

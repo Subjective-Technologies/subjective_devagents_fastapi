@@ -736,6 +736,65 @@ def test_coder_scoping_window_requires_evidence(request_data, monkeypatch, name,
         assert now > request_data.timeout
 
 
+def test_coder_search_stops_before_the_task_timeout(request_data, monkeypatch):
+    from types import SimpleNamespace
+
+    from subjective_devagents_fastapi.language_models import strategies
+
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    now = 0
+    monkeypatch.setattr(strategies, 'time', SimpleNamespace(monotonic=lambda: now))
+    calls = []
+
+    async def respond(_identity, _token, _messages, _tools, timeout, _cancelled):
+        nonlocal now
+        calls.append(timeout)
+        now += 0.01
+        return {'tool_calls': [tool_call(str(len(calls)), 'Grep', pattern=f'q{len(calls)}')]}, 'tool_calls', {}
+
+    control = SimpleNamespace(agent_role='coder_agent', context=lambda: 'test', revoked=lambda: False, checkpoint=lambda *_: None)
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', lambda *_args, **_kwargs: 'ok')
+    result = agent.run(replace(request_data, timeout=100, coordination=control), lambda *_: None, lambda: False)
+
+    assert result.status == 'blocked'
+    assert result.error_code == 'coder_scoping_limit'
+    assert len(calls) == strategies.CODER_SCOPING_ROUNDS
+    assert now < 100
+
+
+def test_coder_third_repeat_of_a_search_stops_the_turn(request_data, monkeypatch):
+    from types import SimpleNamespace
+
+    from subjective_devagents_fastapi.language_models import strategies
+
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    now = 0
+    monkeypatch.setattr(strategies, 'time', SimpleNamespace(monotonic=lambda: now))
+    executed = []
+
+    async def respond(_identity, _token, _messages, _tools, timeout, _cancelled):
+        nonlocal now
+        now += 0.01
+        return {'tool_calls': [tool_call(str(len(executed) + 1), 'Read', file_path='config.py')]}, 'tool_calls', {}
+
+    def dispatch(*_args, **_kwargs):
+        executed.append('Read')
+        return 'file body'
+
+    control = SimpleNamespace(agent_role='coder_agent', context=lambda: 'test', revoked=lambda: False, checkpoint=lambda *_: None)
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', dispatch)
+    result = agent.run(replace(request_data, timeout=100, coordination=control), lambda *_: None, lambda: False)
+
+    assert result.status == 'blocked'
+    assert result.error_code == 'coder_scoping_limit'
+    assert executed == ['Read']
+    assert now < 100
+
+
 def test_coordinated_model_timeout_exhaustion_has_explicit_reason(request_data, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setenv('TEST_AGENT_KEY','fixture-key')

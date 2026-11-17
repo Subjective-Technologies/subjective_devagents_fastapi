@@ -482,6 +482,10 @@ class Api(ModelStrategy):
 
 TOOL_OUTPUT_LIMIT = 20_000  # characters kept per tool result; bounds context growth across rounds
 MAX_TOOL_ROUNDS = 200
+# A coder that only searches used to run until the task timeout (as long as 30 minutes)
+# or until 200 rounds. Each round is another model request. Twelve rounds is enough to
+# read the files that implement a task and edit them. Past that, the turn stops.
+CODER_SCOPING_ROUNDS = 12
 
 AGENT_TOOLS = {
     "Bash": {"type": "function", "function": {
@@ -690,9 +694,28 @@ def shorten_tool_results(messages: list, first_of_turn: int, budget: int = MAX_C
         if text.startswith("[Earlier tool output left out"):
             continue
         messages[index] = {**messages[index],
-                           "content": f"[Earlier tool output left out to fit the context window: {len(text)} chars. Run it again if you need it.]"}
+                           "content": f"[Earlier tool output left out to fit the context window: {len(text)} chars. Do not run it again. Edit or answer from what you already have.]"}
         shortened += 1
     return shortened
+
+
+def _read_signature(call: dict) -> str | None:
+    """Identity of a read-only tool call. Repeating it is not progress."""
+    name = (call.get("function") or {}).get("name") or ""
+    try:
+        arguments = json.loads((call.get("function") or {}).get("arguments") or "{}")
+    except ValueError:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    if name in {"Read", "Grep", "Glob"}:
+        return name + "\0" + json.dumps(arguments, sort_keys=True, default=str)
+    if name == "Bash":
+        from ..channel_coordination import shell_effect
+        command = str(arguments.get("command") or "")
+        if shell_effect(command) == "READ_ONLY":
+            return "Bash\0" + command
+    return None
 
 
 def agent_system_prompt(identity) -> str:
@@ -1069,6 +1092,14 @@ class ApiAgent(ModelStrategy):
         messages = [{"role": "system", "content": agent_system_prompt(identity)}]
         if coordination:
             messages[0]["content"] += "\n" + coordination.context()
+        if scoping:
+            messages[0]["content"] += (
+                "\nCoder rule: a company reading list is not the assignment. "
+                "After the files that implement the assignment are in this turn, edit them or run the check. "
+                "Do not read, search, or run the same command again. "
+                "If a write is rejected for a missing lease, call Coordination to acquire a write lease and retry that edit once. "
+                "A search that does not edit or run a check ends the turn."
+            )
         messages += [{"role": m.role, "content": m.content} for m in request.history]
         if request.attachments:
             content = [{"type": "text", "text": request.prompt}] + [agent_image_block(a) for a in request.attachments]
@@ -1107,8 +1138,12 @@ class ApiAgent(ModelStrategy):
                 scoping = False
             emit(kind, data)
 
+        seen_reads: dict[str, int] = {}
         for _ in range(MAX_TOOL_ROUNDS):
             progress["rounds"] += 1
+            if scoping and progress["rounds"] > CODER_SCOPING_ROUNDS:
+                emit("activity", {"text": "Stopped: coder searched without editing or running a check"})
+                return scoping_limit()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return scoping_limit() if scoping else ModelResult("timed_out", error_code="timed_out")
@@ -1200,6 +1235,7 @@ class ApiAgent(ModelStrategy):
                     for diff in bash_file_diffs(snapshot, identity, transport, cancelled, budget, edited):
                         emit("file_diff", diff)
                 return ModelResult("completed", text)
+            repeat_stop = False
             for call in calls:
                 emit("runtime_status", {"phase": "working"})
                 if cancelled():
@@ -1209,6 +1245,19 @@ class ApiAgent(ModelStrategy):
                 if remaining <= 0:
                     return scoping_limit() if scoping else ModelResult("timed_out", error_code="timed_out")
                 name = (call.get("function") or {}).get("name") or ""
+                signature = _read_signature(call) if scoping else None
+                if signature and signature in seen_reads:
+                    seen_reads[signature] += 1
+                    emit("tool_call", {"tool_call_id": str(call.get("id") or ""), "name": name,
+                                       "detail": "repeated search skipped"})
+                    result_text = ("Already ran in this turn. Do not repeat it. "
+                                   "Use the earlier result, then edit the file or answer.")
+                    messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
+                    if seen_reads[signature] >= 3:
+                        repeat_stop = True
+                    continue
+                if signature:
+                    seen_reads[signature] = 1
                 if name == "Bash" and snapshot is None:
                     snapshot = workspace_snapshot(identity, transport, cancelled, min(30.0, remaining)) or {}
                     if scoping:
@@ -1245,6 +1294,9 @@ class ApiAgent(ModelStrategy):
                     if milestone or tools_since_checkpoint >= budget.checkpoint_every:
                         self._checkpoint(progress, request, "milestone" if milestone else "periodic")
                         tools_since_checkpoint = 0
+            if scoping and repeat_stop:
+                emit("activity", {"text": "Stopped: coder repeated a search instead of editing"})
+                return scoping_limit()
         return scoping_limit() if scoping else ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod

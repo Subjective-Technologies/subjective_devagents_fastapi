@@ -44,6 +44,10 @@ _VERSION = re.compile(r"^\d{14}$")
 # header block with the git version. The version now comes from the database.
 _STAMPED_BLOCK = re.compile(r"<!-- workflow-header:begin[^\n]*-->.*?<!-- workflow-header:end -->\n*", re.S)
 _HEADER = re.compile(r"^\s*\[WF:[^\]]*\]\[agent:[^\]]*\]")
+# Published contracts differ by company. Subjective Technologies inlines a
+# "read these files before starting" tour. Cardnexia does not. The IDE used to
+# paste that tour into every turn, so those agents searched instead of editing.
+_STARTUP_HEADING = re.compile(r"(?i)^#{1,3}[ \t]+.*(?:startup sequence|read in order)\b")
 _RUNTIME_ATTESTATION = re.compile(r"(?m)^\[RT:[^\n]*\]\n?")
 _EXECUTION_CLAIM = re.compile(
     r"\b(?:EXECUTION_STARTED|IMPLEMENTATION_COMPLETE|COMMITTED|PUSHED|DEPLOYED|DEPLOY_VERIFIED)\b"
@@ -269,6 +273,29 @@ def agent_id_for(role_file: str) -> str:
     return Path(role_file).stem
 
 
+def without_startup_reading_list(text: str) -> str:
+    """Drop a contract/role section that orders a catalog read before the assignment.
+
+    The files stay on disk. The turn opens one only when the assignment names it.
+    """
+    lines = str(text or "").splitlines()
+    start = next((index for index, line in enumerate(lines) if _STARTUP_HEADING.match(line)), None)
+    if start is None:
+        return str(text or "").strip()
+    level = len(lines[start]) - len(lines[start].lstrip("#"))
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.match(r"^#{1,%d}[ \t]+\S" % level, lines[index]):
+            end = index
+            break
+    replacement = [
+        "## Assignment first",
+        "Do not read the workflow catalog, role files, or architecture before the assignment. "
+        "Open a workflow file only when the user message names that file.",
+    ]
+    return "\n".join([*lines[:start], *replacement, *lines[end:]]).strip()
+
+
 def compose_definition(export: dict, agent: dict, workflow_dir: Path) -> str:
     files = {item["path"]: item for item in export["files"] if isinstance(item, dict) and item.get("path")}
     role_file = str(agent.get("role_file") or "")
@@ -295,13 +322,18 @@ def compose_definition(export: dict, agent: dict, workflow_dir: Path) -> str:
         f"Your company's workflow, version {version}, is on disk at {workflow_dir}.",
         "Any path in these instructions such as workflow/skills/<name>/SKILL.md or "
         "/subjective/workflow/<path> means the same relative path under that folder. "
-        "Read skills, knowledge and policies from there when a task needs them.",
+        "Open a file there only when this assignment names it. Do not tour the folder first.",
     ]
     if contract:
-        parts += ["", "## Contract (AGENTS.md)", _STAMPED_BLOCK.sub("", contract["content"]).strip()]
-    parts += ["", f"## Your role ({role_file})", _STAMPED_BLOCK.sub("", role["content"]).strip()]
+        parts += ["", "## Contract (AGENTS.md)", without_startup_reading_list(_STAMPED_BLOCK.sub("", contract["content"]))]
+    parts += ["", f"## Your role ({role_file})", without_startup_reading_list(_STAMPED_BLOCK.sub("", role["content"]))]
     if skills:
         parts += ["", "## Skills you can read"] + [f"- {skill}: {path}" for skill, path in skills]
+    parts += [
+        "",
+        "## This turn",
+        "Start on the user message. A company reading list is not a step of the assignment.",
+    ]
     return "\n".join(parts).strip()
 
 
