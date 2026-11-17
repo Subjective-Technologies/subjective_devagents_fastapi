@@ -1049,8 +1049,10 @@ class ApiAgent(ModelStrategy):
             return ModelResult("failed", error_code="authentication_required")
         tools = agent_tool_set(identity)
         coordination = request.coordination
+        scoping = getattr(coordination, "agent_role", None) == "coder_agent"
         if coordination:
-            from ..channel_coordination import CONTROL_TOOL
+            from ..channel_coordination import CONTROL_TOOL, shell_effect
+            from ..runtime_profiles import is_verification_command
             tools["Coordination"] = CONTROL_TOOL
             if identity.sandbox == 'read-only' and (not identity.allowed_tools or 'Bash' in identity.allowed_tools):
                 # ChannelSession.guard classifies these commands; Write/Edit stay absent.
@@ -1092,11 +1094,24 @@ class ApiAgent(ModelStrategy):
                                                       "historical_messages_dropped": dropped, "checkpoints": 0,
                                                       "start_tokens": estimate_tokens(messages)})
         last_tokens, tools_since_checkpoint = None, 0
+
+        def scoping_limit():
+            self._checkpoint(progress, request, "coder_scoping_limit")
+            return ModelResult("blocked", "BLOCKED: Coder reached the scoping limit without changing files or "
+                               "completing a check. Review the checkpoint and narrow the assignment before retrying.",
+                               error_code="coder_scoping_limit")
+
+        def tool_event(kind, data):
+            nonlocal scoping
+            if kind == "file_diff":
+                scoping = False
+            emit(kind, data)
+
         for _ in range(MAX_TOOL_ROUNDS):
             progress["rounds"] += 1
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return ModelResult("timed_out", error_code="timed_out")
+                return scoping_limit() if scoping else ModelResult("timed_out", error_code="timed_out")
             tokens = estimate_tokens(messages)
             level = budget.level(tokens)
             if level in {"compact", "handoff"} or (coordination and level == "checkpoint"):
@@ -1149,6 +1164,8 @@ class ApiAgent(ModelStrategy):
                 if not isinstance(outcome, ModelResult):
                     break
                 emit("model_usage", {"id": usage_id, "model": identity.model, "status": outcome.error_code or outcome.status})
+                if scoping and outcome.status == "timed_out" and deadline <= time.monotonic():
+                    return scoping_limit()
                 if coordination and outcome.error_code == "context_too_large":
                     # The provider refused this payload: never resend it. Checkpoint, hand off.
                     emit("context_compaction", {"provider_rejected": True, "estimated_input_tokens": tokens})
@@ -1160,9 +1177,8 @@ class ApiAgent(ModelStrategy):
                 emit("runtime_status", {"phase": "model"})
             message, finish_reason, usage = outcome
             emit("model_usage", {"id": usage_id, "status": "completed", **usage})
-            if coordination:
-                # For durable collaboration, timeout is a no-progress window.
-                # Healthy tool loops can exceed a single 30-minute wall clock.
+            # Read-only exploration does not extend Coder's initial window.
+            if coordination and not scoping:
                 deadline = time.monotonic() + request.timeout
             text = message.get("content") or ""
             from ..channel_coordination import concrete_user_decision
@@ -1191,28 +1207,45 @@ class ApiAgent(ModelStrategy):
                     return ModelResult("cancelled", error_code="cancelled_mid_tool")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return ModelResult("timed_out", error_code="timed_out")
+                    return scoping_limit() if scoping else ModelResult("timed_out", error_code="timed_out")
                 name = (call.get("function") or {}).get("name") or ""
                 if name == "Bash" and snapshot is None:
                     snapshot = workspace_snapshot(identity, transport, cancelled, min(30.0, remaining)) or {}
-                result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, emit,
+                    if scoping:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return scoping_limit()
+                result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, tool_event,
                                              edited, coordination)
                 if isinstance(result_text, ModelResult):
+                    if scoping and result_text.status == "timed_out" and deadline <= time.monotonic():
+                        return scoping_limit()
                     return result_text
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result_text})
                 if coordination:
-                    deadline = time.monotonic() + request.timeout
                     tools_since_checkpoint += 1
                     try:
                         arguments = json.loads((call.get("function") or {}).get("arguments") or "{}") if name == "Bash" else {}
                     except ValueError:
                         arguments = {}
                     command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
-                    milestone = name == "Bash" and "[exit code" not in result_text[-200:] and bool(_MILESTONE.search(command))
+                    bash_ok = name == "Bash" and not result_text.startswith("Error:") and "[exit code " not in result_text
+                    milestone = bash_ok and bool(_MILESTONE.search(command))
+                    if scoping and bash_ok:
+                        if is_verification_command(command):
+                            scoping = False
+                        elif snapshot and shell_effect(command) != "READ_ONLY":
+                            remaining = deadline - time.monotonic()
+                            if remaining > 0:
+                                updated = workspace_snapshot(identity, transport, cancelled, min(5.0, remaining))
+                                if updated is not None and updated != snapshot:
+                                    scoping = False
+                    if not scoping:
+                        deadline = time.monotonic() + request.timeout
                     if milestone or tools_since_checkpoint >= budget.checkpoint_every:
                         self._checkpoint(progress, request, "milestone" if milestone else "periodic")
                         tools_since_checkpoint = 0
-        return ModelResult("failed", error_code="tool_loop_limit_exceeded")
+        return scoping_limit() if scoping else ModelResult("failed", error_code="tool_loop_limit_exceeded")
 
     @staticmethod
     def _dispatch(call: dict, tools: dict, identity, transport, cancelled, timeout, emit, edited=None, coordination=None, fenced=False):

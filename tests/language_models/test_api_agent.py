@@ -680,6 +680,62 @@ def test_coordinated_progress_renews_window_without_hiding_stalled_requests(requ
     assert result.status=='completed' and time.monotonic()-started>.5
 
 
+@pytest.mark.parametrize(('name', 'arguments', 'changed', 'expected'), [
+    ('Grep', {'pattern': 'example'}, False, 'blocked'),
+    ('Bash', {'command': 'rg pytest .'}, False, 'blocked'),
+    ('Edit', {'file_path': 'example.txt'}, False, 'blocked'),
+    ('Edit', {'file_path': 'example.txt'}, True, 'completed'),
+    ('Bash', {'command': 'sed -i s/example/fixed/ example.txt'}, True, 'completed'),
+    ('Bash', {'command': 'pytest -q'}, False, 'completed'),
+])
+def test_coder_scoping_window_requires_evidence(request_data, monkeypatch, name, arguments, changed, expected):
+    from types import SimpleNamespace
+
+    from subjective_devagents_fastapi.language_models import strategies
+
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    now = 0
+    monkeypatch.setattr(strategies, 'time', SimpleNamespace(monotonic=lambda: now))
+    calls = []
+
+    async def respond(_identity, _token, _messages, _tools, timeout, _cancelled):
+        nonlocal now
+        calls.append(timeout)
+        now += min(2, timeout)
+        if timeout < 2:
+            return strategies.ModelResult('timed_out', error_code='timed_out')
+        if len(calls) == 3:
+            return {'content': 'Done'}, 'stop', {}
+        return {'tool_calls': [tool_call(str(len(calls)), name, **arguments)]}, 'tool_calls', {}
+
+    def dispatch(_call, _tools, _identity, _transport, _cancelled, _timeout, emit, *_args):
+        if name == 'Edit' and changed:
+            emit('file_diff', {'path': arguments['file_path']})
+        return 'ok'
+
+    def snapshot(*_args):
+        dirty = {'example.txt': 'changed'} if changed and now > 2 else {}
+        return {'repo': {'head': 'head', 'dirty': dirty}}
+
+    checkpoints = []
+    control = SimpleNamespace(agent_role='coder_agent', context=lambda: 'test', revoked=lambda: False,
+                              checkpoint=checkpoints.append)
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', dispatch)
+    monkeypatch.setattr(strategies, 'workspace_snapshot', snapshot)
+    monkeypatch.setattr(strategies, 'bash_file_diffs', lambda *_args: [])
+    result = agent.run(replace(request_data, coordination=control), lambda *_: None, lambda: False)
+
+    assert result.status == expected
+    if expected == 'blocked':
+        assert now == request_data.timeout
+        assert result.error_code == 'coder_scoping_limit'
+        assert checkpoints[-1]['reason'] == 'coder_scoping_limit'
+    else:
+        assert now > request_data.timeout
+
+
 def test_coordinated_model_timeout_exhaustion_has_explicit_reason(request_data, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setenv('TEST_AGENT_KEY','fixture-key')
