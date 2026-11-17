@@ -255,7 +255,8 @@ def test_acceptance_done_latch_real_bug_end_to_end(system):
                        'Both fixes are live.\nDONE: production serves ' + sha[:7] + ' and the live bundle has the fix\n'
                        'OPTIONAL_USER_CONFIRMATION: Hard-refresh and confirm the interaction if you want.'],
         'ai_coder': ['IMPLEMENTATION_COMPLETE: ' + sha],
-        'ai_integration': ['VERIFICATION_PASS: ' + sha],
+        'ai_integration': ['VERIFICATION_PASS: ' + sha + '\nACCEPTANCE_VERIFIED: AC1 — opened New task in a browser; '
+                           'the modal renders above the page, not inside the right pane'],
         'ai_git': ['PUBLICATION_COMPLETE: refs/heads/main is now ' + sha],
         'ai_release': ['/__build.json reports ' + sha + '\nDEPLOYMENT_VERIFIED: ' + sha +
                        '\nOPTIONAL_USER_CONFIRMATION: authenticated browser session unavailable'],
@@ -266,6 +267,9 @@ def test_acceptance_done_latch_real_bug_end_to_end(system):
         def run(self, request, emit, cancelled):
             agent = request.coordination.actor
             turns.append(agent)
+            # A real executed check: the backend attests it as [RT:...successful=1] on the result.
+            emit('tool_call', {'tool_call_id': 'c1', 'name': 'Bash', 'detail': 'npx playwright test'})
+            emit('tool_result', {'tool_call_id': 'c1', 'name': 'Bash', 'ok': True, 'output_chars': 10})
             return ModelResult('completed', answers[agent].pop(0) if answers[agent] else 'UNEXPECTED TURN')
     s.model.strategies['api_agent:codex'] = Scripted()
     s.journal.mutate(s.channel, 'owner', {'op': 'dispatch', 'agent_id': 'ai_manager',

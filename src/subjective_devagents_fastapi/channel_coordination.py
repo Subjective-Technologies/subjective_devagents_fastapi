@@ -395,7 +395,7 @@ class ChannelSession:
             except (httpx.HTTPError, ValueError, KeyError, TypeError):
                 raise ModelError('coordination_unavailable', 'Channel coordination is unavailable') from None
         self._state = result.get('state', self._state)
-        if result.get('code') in {'LEASE_CONFLICT', 'WORKFLOW_VERSION_CONFLICT'}:
+        if result.get('code') in {'LEASE_CONFLICT', 'WORKFLOW_VERSION_CONFLICT', 'WORKFLOW_VERSION_MISMATCH'}:
             raise ModelError(result['code'], json.dumps({k: v for k, v in result.items() if k != 'state'}))
         return result
 
@@ -496,6 +496,7 @@ class ChannelSession:
             raise ModelError('workflow_identity_conflict', 'Channel workflow identity changed')
         started = self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor,
                             heartbeat_interval=self.heartbeat_interval,
+                            **(getattr(self, 'workflow_meta', None) or {}),
                             **({'runtime_profile': self.runtime_profile} if self.runtime_profile else {}))
         self.start_acknowledged = True
         if started.get('dispatch'):
@@ -512,9 +513,12 @@ class ChannelSession:
         if not identity.ssh_host and legacy.is_file():
             observed = legacy.read_text()[:80].strip()
             if observed != version:
+                # A workflow folder on disk is not a source: agents run the published database
+                # version. Edits there reach agents only through Import Workflow + publish.
                 self.call('gate', id='legacy-workflow-version-' + self.binding['instance_id'],
                     kind='WORKFLOW_VERSION_DIAGNOSTIC', result='failed', metadata={
-                        'source': str(legacy), 'observed': observed, 'authoritative': version})
+                        'source': str(legacy), 'observed': observed, 'authoritative': version,
+                        'note': 'local folder is not published; use Team Design Import Workflow + publish'})
         return self.context()
 
     def compact_state(self, state, limit=CONTEXT_STATE_LIMIT):

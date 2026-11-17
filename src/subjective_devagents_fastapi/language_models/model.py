@@ -39,6 +39,21 @@ def work_trail(trail):
 
 
 class LanguageModel:
+
+    def turn_evidence(self, identifier: str) -> dict:
+        """Tool calls this turn actually executed, from its recorded events (not from model text)."""
+        try:
+            events = self.store.events(identifier)
+        except Exception:  # noqa: BLE001 - no evidence is reported as none
+            return {"turnId": identifier}
+        runtime = next((item["data"] for item in events if item["kind"] == "runtime"), {})
+        calls = [item["data"] for item in events if item["kind"] == "tool_call"]
+        results = [item["data"] for item in events if item["kind"] == "tool_result"]
+        return {"turnId": identifier, "strategy": runtime.get("strategy") or "",
+                "toolCallsCount": len(calls),
+                "successfulToolCalls": sum(1 for item in results if item.get("ok") is True),
+                "toolsUsed": sorted({str(item.get("name") or "") for item in calls if item.get("name")})}
+
     def __init__(self, store: TurnStore, identities: IdentityRegistry,
                  strategies: dict[str, ModelStrategy] | None = None, max_workers: int | None = None):
         self.store = store
@@ -193,6 +208,12 @@ class LanguageModel:
         if coordination and result.status == "completed":
             try:
                 result = replace(result, text=coordination.canonical_reply(result.text))
+                # Backend-owned [RT:] line from this turn's recorded tool events. The Chat API
+                # accepts functional acceptance (ACCEPTANCE_VERIFIED) only with executed checks,
+                # and a model cannot forge this line: lookalikes are stripped first.
+                if coordination.delegation:   # server runtime; the browser path attests in llm_service
+                    from ..agent_workflow import ensure_runtime_attestation
+                    result = replace(result, text=ensure_runtime_attestation(result.text, self.turn_evidence(identifier)))
             except ModelError as error:
                 result = ModelResult("interrupted", error_code=error.code)
         try:

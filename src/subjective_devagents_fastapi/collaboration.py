@@ -108,9 +108,17 @@ def _execute_approved(service, job):
                                    'test_exec': selected.test_exec, 'build_exec': selected.build_exec,
                                    'fs_write': selected.fs_write, 'node_versions': list(selected.node_versions),
                                    'requirements': requirements.summary()}
-        assigned = channel.call('snapshot')['state'].get('workflow_version')
-        options = {'version': assigned} if isinstance(assigned, str) and agent_workflow._VERSION.fullmatch(assigned) else {}
-        export = agent_workflow.fetch_export_as_service(profile['company_id'], **options)
+        # Never pinned: every dispatch loads the company's CURRENT published workflow. The
+        # channel's version is only the floor (the newest one already proven); an older load is
+        # refused (WORKFLOW_VERSION_MISMATCH) and its successor reloads.
+        known = channel.call('snapshot')['state'].get('workflow_version')
+        try:
+            loaded = agent_workflow.resolve_current(profile['company_id'], known)
+        except agent_workflow.WorkflowVersionMismatch as error:
+            raise ModelError('WORKFLOW_VERSION_MISMATCH', str(error)) from None
+        export = loaded['export']
+        channel.workflow_meta = {'workflow_source': loaded['source'], 'workflow_digest': loaded['digest'],
+                                 'workflow_loaded_at': loaded['loaded_at']}
         folder = agent_workflow.materialize(export, profile['company_id'], agent_workflow.workflow_root(service.app_home))
         definition = agent_workflow.compose_definition(export, profile, folder)
         from .deploy_methods import facts_block

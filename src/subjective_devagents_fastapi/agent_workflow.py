@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -54,6 +55,29 @@ class WorkflowUnavailable(Exception):
     """The agent's workflow could not be loaded; the turn is refused, not guessed."""
 
 
+class WorkflowVersionMismatch(WorkflowUnavailable):
+    """The published workflow we could load is older than one the channel already ran."""
+
+
+WORKFLOW_SOURCE = "published_workflow_database"
+_log = logging.getLogger("subjective_devagents.workflow")
+
+
+def log_workflow(event: str, **fields) -> None:
+    """Structured workflow-loading events (WORKFLOW_VERSION_RESOLVED / _MISMATCH / WORKFLOW_RELOADED)."""
+    try:
+        _log.info(json.dumps({"event": "workflow." + event, "ts": time.time(), **fields}, default=str))
+    except Exception:  # noqa: BLE001 - observability never stops a turn
+        pass
+
+
+def export_digest(export: dict) -> str:
+    """Digest of the published files themselves: proves which prompts an execution received."""
+    material = sorted((str(item.get("path")), str(item.get("content") or "")) for item in export.get("files") or []
+                      if isinstance(item, dict))
+    return hashlib.sha256(json.dumps(material).encode("utf-8")).hexdigest()
+
+
 _cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
 
@@ -67,15 +91,56 @@ def workflow_root(app_home: str) -> Path:
     return Path(configured) if configured else Path(app_home) / "workflows"
 
 
-def fetch_export_as_service(company_id: str, *, opener=urllib.request.urlopen, version: str = '') -> dict:
+def fetch_export_as_service(company_id: str, *, opener=urllib.request.urlopen, version: str = '', force: bool = False) -> dict:
     """The published workflow read with DevAgents' own service token (agents' wf command)."""
     token = (os.environ.get("SUBJECTIVE_DEVAGENTS_WORKFLOW_SERVICE_TOKEN") or "").strip()
     if not token:
         raise WorkflowUnavailable("DevAgents has no workflow service token configured.")
-    return fetch_export(company_id, "", opener=opener, service_token=token, version=version)
+    return fetch_export(company_id, "", opener=opener, service_token=token, version=version, force=force)
 
 
-def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "", version: str = '') -> dict:
+def resolve_current(company_id: str, known_version: str | None, *, opener=urllib.request.urlopen) -> dict:
+    """The company's CURRENT published workflow for one dispatch, with provenance.
+
+    Never pinned to the version a channel first ran: every dispatch loads what is published
+    now (fresh fetch; the cached copy only if the workflow service is unreachable). A result
+    older than ``known_version`` (the newest version the channel has already proven) is
+    refused with WorkflowVersionMismatch, so obsolete prompts never run silently.
+    Returns {export, version, source, digest, loaded_at, reloaded}.
+    """
+    known = known_version if isinstance(known_version, str) and _VERSION.fullmatch(known_version) else None
+    source = WORKFLOW_SOURCE
+    try:
+        export = fetch_export_as_service(company_id, opener=opener, force=True)
+    except WorkflowVersionMismatch:
+        raise
+    except WorkflowUnavailable:
+        cached = _cached_service_export(company_id)
+        if cached is None:
+            raise
+        export, source = cached, WORKFLOW_SOURCE + ":cached"
+    version = export["version"]["version"]
+    if known and version < known:
+        log_workflow("WORKFLOW_VERSION_MISMATCH", company_id=company_id, authoritative=known, loaded=version, source=source)
+        raise WorkflowVersionMismatch(
+            f"Published workflow {version} is older than {known}, which this channel already ran.")
+    digest = export_digest(export)
+    reloaded = bool(known and version != known)
+    log_workflow("WORKFLOW_RELOADED" if reloaded else "WORKFLOW_VERSION_RESOLVED", company_id=company_id,
+                 workflow_version=version, previous=known, source=source, digest=digest)
+    return {"export": export, "version": version, "source": source, "digest": digest,
+            "loaded_at": time.time(), "reloaded": reloaded}
+
+
+def _cached_service_export(company_id: str) -> dict | None:
+    with _cache_lock:
+        hits = [hit for (company, _), hit in _cache.items() if company == company_id]
+    if not hits:
+        return None
+    return max(hits, key=lambda hit: hit[1]["version"]["version"])[1]
+
+
+def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "", version: str = '', force: bool = False) -> dict:
     """The company's current published workflow, as the caller (or the service) sees it."""
     if not _COMPANY.match(company_id or ""):
         raise WorkflowUnavailable("This agent names no valid workflow company.")
@@ -88,7 +153,7 @@ def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.u
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
-        if hit and now - hit[0] < EXPORT_CACHE_SECONDS:
+        if hit and not force and now - hit[0] < EXPORT_CACHE_SECONDS:
             return hit[1]
     request = urllib.request.Request(
         f"{workflow_api()}/companies/{company_id}/workflow/export" + (f'?version={version}' if version else ''),
