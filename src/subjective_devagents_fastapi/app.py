@@ -925,16 +925,65 @@ async def api_workflow_file(path: str = Query(default=""), company: str = Query(
 
 
 @app.get("/api/architecture/xmi")
-async def api_architecture_xmi():
+async def api_architecture_xmi(company: str = Query(default="")):
     """This company's UML model, /<company>/<company>/architecture/<company>.xmi, as text.
 
-    The company is this server's; the caller cannot choose the file. Subjective UML
-    opens it when the company's model is opened.
+    The company is this server's; the caller cannot choose the file. ``company``,
+    when given, must name this server's company (404 company_mismatch otherwise).
+    Subjective UML opens it when the company's model is opened. ``sha256`` is what
+    a later save passes back as ``base_sha256``.
     """
     from . import architecture_file
 
-    status, body = await asyncio.to_thread(architecture_file.read_company_xmi)
+    status, body = await asyncio.to_thread(architecture_file.read_company_xmi, company)
     return JSONResponse(status_code=status, content=body)
+
+
+# The model plus JSON quoting; the file itself is bounded by architecture_file.MAX_BYTES.
+ARCHITECTURE_XMI_MAX_BODY = 2 * 16 * 1024 * 1024 + 4096
+
+
+@app.put("/api/architecture/xmi")
+async def api_save_architecture_xmi(request: Request, company: str = Query(default="")):
+    """Save this company's UML model from Subjective UML.
+
+    Body: ``{"xmi_text": "...", "base_sha256": "<sha256 from the load>", "company": "..."}``.
+    ``base_sha256`` "" means the editor loaded no file; leaving it out overwrites
+    whatever is there. 409 conflict when the file changed since the load, with the
+    current ``sha256``. The XML must be well-formed and declare no entities.
+    """
+    from . import architecture_file
+
+    length = request.headers.get("Content-Length", "")
+    if length.isdigit() and int(length) > ARCHITECTURE_XMI_MAX_BODY:
+        return JSONResponse(status_code=413, content={"ok": False, "error": "file_too_large"})
+    content = bytearray()
+    async for chunk in request.stream():
+        content.extend(chunk)
+        if len(content) > ARCHITECTURE_XMI_MAX_BODY:
+            return JSONResponse(status_code=413, content={"ok": False, "error": "file_too_large"})
+    try:
+        body = json.loads(bytes(content) or b"{}")
+    except ValueError:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_json"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_json"})
+    requested = company or str(body.get("company") or "")
+    status, result = await asyncio.to_thread(
+        architecture_file.write_company_xmi,
+        body.get("xmi_text"),
+        body.get("base_sha256"),
+        requested,
+    )
+    if status == 200:
+        claims = getattr(request.state, "devagents_claims", None) or {}
+        default_log("info", "Architecture XMI saved", {
+            "path": result.get("path"),
+            "size": result.get("size"),
+            "sha256": result.get("sha256"),
+            "user_id": str(claims.get("uid") or claims.get("user_id") or claims.get("credential") or ""),
+        })
+    return JSONResponse(status_code=status, content=result)
 
 
 def _context_meta(raw) -> dict:
