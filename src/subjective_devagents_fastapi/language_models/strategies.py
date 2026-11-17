@@ -698,7 +698,9 @@ def shorten_tool_results(messages: list, first_of_turn: int, budget: int = MAX_C
 def agent_system_prompt(identity) -> str:
     lines = [
         "You are a coding assistant with tool access to one real workspace. Use tools to inspect or "
-        "change it instead of guessing; call one tool at a time and wait for its result.",
+        "change it instead of guessing. When several independent steps are needed (reading or searching "
+        "several files, inspecting several directories), request them together in one response: they "
+        "run in order and you get every result at once. Wait for results before calls that depend on them.",
         f"Workspace root: {identity.workspace}",
     ]
     if identity.sandbox != "workspace-write":
