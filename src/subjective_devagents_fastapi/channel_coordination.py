@@ -8,6 +8,7 @@ import hashlib
 import logging
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -41,9 +42,84 @@ _STATUS_LINE = re.compile(
 )
 
 
+def _split_shell(command):
+    """[(segment, separator after it)] split on &&, ||, ;, | and newlines outside quotes.
+
+    A separator inside quotes is an argument: `sed -n '1,9p;20,30p' f` and `grep 'a\\|b' f`
+    are one read-only command each. Splitting them used to make them UNKNOWN, so they took
+    the write path and were refused (2026-11-18, TAGGY-3521). An unterminated quote yields
+    one segment that shlex then rejects, which fails closed as before.
+    """
+    text, parts, current, quote, index = command or '', [], [], None, 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            current.append(char)
+            if char == '\\' and quote == '"' and index + 1 < len(text):
+                current.append(text[index + 1])
+                index += 1
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == '\\' and index + 1 < len(text):
+            current.extend(text[index:index + 2])
+            index += 2
+            continue
+        if char in '\'"':
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        pair = text[index:index + 2]
+        separator = pair if pair in {'&&', '||'} else (char if char in ';|\n' else None)
+        if separator:
+            parts.append((''.join(current).strip(), ';' if separator == '\n' else separator))
+            current = []
+            index += len(separator)
+            continue
+        current.append(char)
+        index += 1
+    parts.append((''.join(current).strip(), None))
+    return parts
+
+
 def _segments(command):
-    parts = [piece.strip() for piece in re.split(r'\s*(?:&&|\|\||;|\|)\s*', command or '')]
-    return [piece for piece in parts if piece] or ['']
+    parts = [piece for piece, _ in _split_shell(command) if piece]
+    return parts or ['']
+
+
+_HARMLESS_REDIRECT = {'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'}
+
+
+def _writes_by_redirect(part):
+    """True when a segment redirects output into a file (`> out`, `>> log`, `2>file`)."""
+    quote, index = None, 0
+    while index < len(part):
+        char = part[index]
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in '\'"':
+            quote = char
+        elif char == '\\':
+            index += 1
+        elif char == '>':
+            index += 1
+            if index < len(part) and part[index] in '>|':
+                index += 1
+            if index < len(part) and part[index] == '&':
+                index += 1                          # >&2, 2>&1: duplicates a descriptor
+                continue
+            rest = part[index:].lstrip()
+            target = re.match(r'[^\s;&|<>]*', rest).group(0).strip('\'"')
+            if target not in _HARMLESS_REDIRECT:
+                return True
+            continue
+        index += 1
+    return False
 
 
 def _positional(tokens):
@@ -159,12 +235,7 @@ def bash_workdir(command, workspace):
     """
     root = Path(workspace).resolve()
     current = root
-    bits = re.split(r'\s*(&&|\|\||;|\|)\s*', command or '')
-    index = 0
-    while index < len(bits):
-        part = bits[index].strip()
-        separator = bits[index + 1] if index + 1 < len(bits) else None
-        index += 2
+    for part, separator in _split_shell(command):
         if not part:
             continue
         try:
@@ -196,6 +267,8 @@ def bash_workdir(command, workspace):
 
 
 def _segment_effect(part):
+    if _writes_by_redirect(part):
+        return 'WRITE'
     try:
         tokens = shlex.split(part, posix=True)
     except ValueError:
@@ -326,6 +399,12 @@ class ChannelSession:
         self.actor, self._authorization, self._client = actor, authorization, client
         self.runtime = ''
         self.lease_id = None
+        # Write leases this instance holds: id -> canonical paths (logical and physical).
+        self.held = {}
+        self.lease_events = []
+        # ApiAgent turns this on for an authorized workspace-write Coder. guard() itself
+        # still refuses a mutation that has no covering lease (WRITE_LEASE_REQUIRED).
+        self.auto_acquire = False
         self.last_check = 0.0
         self.revocation = None
         self._unreachable_since = None
@@ -697,6 +776,12 @@ class ChannelSession:
             result = self.call(operation, **data)
         if operation == 'acquire':
             self.lease_id = result['lease']['id']
+            self._hold(result['lease'])
+        if operation == 'recover_task_lease':
+            for lease in result.get('leases') or []:
+                self._hold(lease)
+        if operation == 'release':
+            self.held.pop(data.get('lease_id', self.lease_id), None)
         if operation == 'release' and data.get('lease_id', self.lease_id) == self.lease_id:
             # The agent gave its own lease back. Heartbeating it afterwards fails, and that
             # failure must not read as a revocation that stops the turn.
@@ -735,8 +820,6 @@ class ChannelSession:
             return
         if self.privilege and self.privilege['privilege_level'] != 'scoped':
             self.call('privilege', **self.privilege)
-        if not self.lease_id:
-            raise ModelError('WRITE_LEASE_REQUIRED', 'Acquire a covering Coordination write lease before executing')
         if self.identity.ssh_host:
             raise ModelError('remote_scope_unverified', 'Remote execution scopes are not verified')
         # Bash runs in a leading `cd <dir>` or `--prefix <dir>`, otherwise the workspace root.
@@ -745,7 +828,19 @@ class ChannelSession:
             target = bash_workdir(str(arguments.get('command', '')), self.identity.workspace)
         else:
             target = str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
-        checked = self.call('check', path=target)
+        try:
+            checked = self._covering_check(target)
+        except ModelError:
+            raise
+        if checked is None and self.auto_acquire:
+            # No lease yet. A routine prerequisite, not an extra model round: this authorized
+            # workspace-write Coder acquires the narrowest lease for the target, once.
+            # A held lease that does not cover the target is LEASE_SCOPE_MISMATCH above,
+            # not a silent widen. A conflict is its own outcome.
+            self._acquire_for(name, target)
+            checked = self._covering_check(target)
+        if checked is None:
+            raise ModelError('WRITE_LEASE_REQUIRED', 'Acquire a covering Coordination write lease before executing')
         self.lease_id = checked.get('lease', {}).get('id', self.lease_id)
         state = checked['state']
         for tree in state['worktrees'].values():
@@ -755,6 +850,97 @@ class ChannelSession:
             if foreign and affected:
                 raise ModelError('WORKTREE_OWNED', 'Explicit worktree adoption/reconciliation required')
         self.last_check = time.monotonic()
+
+    _DEAD_LEASE = {'LEASE_RECOVERY_REQUIRED', 'LEASE_NOT_FOUND', 'LEASE_OWNER_MISMATCH'}
+
+    def _hold(self, lease):
+        if isinstance(lease, dict) and lease.get('id') and lease.get('mode', 'write') == 'write':
+            logical = posixpath.normpath(lease.get('repository') or '/')
+            physical = posixpath.normpath(lease.get('physical_repository') or logical)
+            scopes = []
+            for scope in lease.get('absolute_paths') or []:
+                scope = posixpath.normpath(scope)
+                scopes.append(scope)
+                if physical != logical and (scope == logical or scope.startswith(logical + '/')):
+                    scopes.append(posixpath.normpath(posixpath.join(physical, posixpath.relpath(scope, logical))))
+            self.held[lease['id']] = scopes
+
+    def _covering_check(self, target):
+        """`check` against a lease that may cover the target.
+
+        None means this instance holds nothing to check. LEASE_SCOPE_MISMATCH is raised
+        when a held lease exists and does not cover the target (do not treat that as
+        "no lease" and acquire a wider one). A dead lease id is dropped and skipped.
+        """
+        target = posixpath.normpath(target)
+        covering = [lid for lid, scopes in self.held.items()
+                    if scopes and any(target == scope or target.startswith(scope.rstrip('/') + '/') for scope in scopes)]
+        # No absolute_paths yet (the journal names the lease but not its folders): ask the server.
+        unknown = [lid for lid, scopes in self.held.items() if not scopes and lid not in covering]
+        fallback = [self.lease_id] if self.lease_id and self.lease_id not in covering and self.lease_id not in unknown else []
+        scope_error = None
+        for lease_id in covering + unknown + fallback:
+            try:
+                return self.call('check', path=target, lease_id=lease_id)
+            except ModelError as error:
+                if error.code == 'LEASE_SCOPE_MISMATCH':
+                    scope_error = error
+                    continue
+                if error.code not in self._DEAD_LEASE:
+                    raise
+                self.held.pop(lease_id, None)
+                if self.lease_id == lease_id:
+                    self.lease_id = None
+        if scope_error is not None:
+            raise scope_error
+        return None
+
+    def _lease_scope(self, name, target):
+        """(repository, [path]) of an automatic lease: the Git repository holding the target,
+        narrowed to the file (Write/Edit) or the command's directory (Bash)."""
+        path = Path(target)
+        folder = path if name == 'Bash' else path.parent
+        probe = folder
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        roots = lease_roots(self.identity)
+        try:
+            top = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(probe), 'rev-parse', '--show-toplevel'],
+                                 capture_output=True, text=True, timeout=5,
+                                 env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': self.identity.home or self.identity.workspace})
+            repository = Path(top.stdout.strip()).resolve() if top.returncode == 0 and top.stdout.strip() else None
+        except (OSError, subprocess.SubprocessError):
+            repository = None
+        if repository is None or not _inside(repository, roots) or not _inside(path.resolve(), [repository]):
+            # Outside Git, or a repository above the allowed roots: the narrowest allowed root.
+            repository = next((root for root in sorted(roots, key=lambda r: -len(str(r)))
+                               if _inside(path.resolve(), [root])), None)
+        if repository is None:
+            raise ModelError('lease_outside_workspace', 'Tool target is outside the execution workspace')
+        scope = path if name != 'Bash' else folder
+        return str(repository), [os.path.relpath(str(scope.resolve()), str(repository))]
+
+    def _lease_event(self, kind, **detail):
+        entry = {'kind': kind, 'at': time.time(), 'dispatch_id': self.binding['dispatch_id'], **detail}
+        self.lease_events = (self.lease_events + [entry])[-50:]
+        log.info('coordination.%s channel=%s dispatch=%s %s', kind, self.binding['channel_id'],
+                 self.binding['dispatch_id'], ' '.join(f'{k}={v}' for k, v in detail.items()))
+
+    def _acquire_for(self, name, target):
+        if self.identity.sandbox != 'workspace-write':
+            raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Read-only runtime cannot acquire write leases')
+        repository, paths = self._lease_scope(name, target)
+        self._lease_event('LEASE_ACQUISITION_ATTEMPT', tool=name, repository=repository, paths=paths)
+        try:
+            result = json.loads(self.tool('acquire', {'repository': repository, 'paths': paths, 'mode': 'write',
+                                                      'automatic': True}))
+        except ModelError as error:
+            self._lease_event('LEASE_CONFLICT' if error.code == 'LEASE_CONFLICT' else 'LEASE_ACQUISITION_FAILED',
+                              tool=name, code=error.code, repository=repository, paths=paths)
+            raise
+        self._lease_event('LEASE_ACQUISITION_SUCCESS', tool=name, lease_id=result['lease']['id'],
+                          repository=repository, paths=paths)
+        return result
 
     def _command_dir(self, command):
         try:

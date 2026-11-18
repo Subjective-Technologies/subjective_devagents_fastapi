@@ -52,7 +52,9 @@ def test_real_file_write_requires_lease_and_forwards_canonical_context(bound,mon
         result=ApiAgent().run(request,lambda *_:None,lambda:False)
     assert result.status=='completed'
     assert open(target).read()=='allowed'
-    assert any('WRITE_LEASE_REQUIRED' in str(m.get('content')) for m in proxy.requests[1][2]['messages'] if m['role']=='tool')
+    tool_msgs=[m for _method,_url,body in proxy.requests for m in body['messages'] if m['role']=='tool']
+    assert tool_msgs and not any('WRITE_LEASE_REQUIRED' in str(m.get('content')) for m in tool_msgs)
+    assert any(c['op']=='acquire' and c.get('automatic') for c in journal.calls)
     assert any('agent_instance_id' in str(m['content']) and 'ai_coder:run' in str(m['content']) for m in proxy.requests[0][2]['messages'])
     assert any(c['op']=='capability' and c['status']=='proven' and c['capability']=='fs_write' for c in journal.calls)
     assert 'Bearer test-only' not in repr(session)
@@ -156,6 +158,65 @@ def test_read_only_shell_does_not_require_a_write_lease(bound):
         with pytest.raises(ModelError, match='write lease') as error:
             session.guard('Bash', {'command': command})
         assert error.value.code == 'WRITE_LEASE_REQUIRED'
+
+
+def test_quoted_separators_stay_one_command_and_redirects_write():
+    from subjective_devagents_fastapi.channel_coordination import shell_effect
+    assert shell_effect("sed -n '640,670p;1555,1610p;1820,1860p' src/ui/app.js") == 'READ_ONLY'
+    assert shell_effect("grep -n 'a\\|b' x.js") == 'READ_ONLY'
+    assert shell_effect("cat a.js | grep 'x|y'") == 'READ_ONLY'
+    assert shell_effect('echo hi > out.txt') == 'WRITE'
+    assert shell_effect('find / -name x 2>/dev/null') == 'READ_ONLY'
+    assert shell_effect("sed -i 's/a/b/' file") == 'WRITE'
+
+
+def test_auto_acquire_covers_the_first_write_and_reuses_the_lease(bound):
+    session, journal, identity = bound
+    session.auto_acquire = True
+    session.guard('Write', {'file_path': 'note.txt'})
+    acquires = [c for c in journal.calls if c['op'] == 'acquire']
+    assert len(acquires) == 1 and acquires[0].get('automatic') is True
+    assert journal.calls[-1]['op'] == 'check'
+    assert journal.calls[-1]['path'] == identity.workspace + '/note.txt'
+    session.guard('Edit', {'file_path': 'note.txt'})
+    assert len([c for c in journal.calls if c['op'] == 'acquire']) == 1
+
+
+def test_auto_acquire_reports_a_conflict_and_does_not_widen_a_narrow_lease(bound):
+    session, journal, identity = bound
+    session.auto_acquire = True
+
+    def conflict(body):
+        if body['op'] == 'acquire':
+            return {'code': 'LEASE_CONFLICT', 'lease': {'id': 'other', 'agent_id': 'ai_other'}}
+        return journal(body)
+
+    session._client = conflict
+    with pytest.raises(ModelError) as error:
+        session.guard('Write', {'file_path': 'note.txt'})
+    assert error.value.code == 'LEASE_CONFLICT'
+    assert not (Path(identity.workspace) / 'note.txt').exists()
+    # A lease we already hold that misses the target stays a scope mismatch.
+    session._client = journal
+    session.auto_acquire = True
+    session.tool('acquire', {'repository': identity.workspace, 'paths': ['pkg']})
+    sub = Path(identity.workspace) / 'pkg'
+    sub.mkdir()
+    covered = [str(sub.resolve())]
+
+    def scoped(body):
+        result = journal(body)
+        if body['op'] == 'check':
+            target = body['path']
+            if not any(scope == target or target.startswith(scope.rstrip('/') + '/') for scope in covered):
+                raise ModelError('LEASE_SCOPE_MISMATCH', 'Tool target is outside lease')
+        return result
+
+    session._client = scoped
+    with pytest.raises(ModelError, match='outside lease') as mismatch:
+        session.guard('Bash', {'command': 'npm run build'})
+    assert mismatch.value.code == 'LEASE_SCOPE_MISMATCH'
+    assert not any(c.get('automatic') for c in journal.calls)
 
 
 def test_status_chatter_is_not_a_decision(bound):

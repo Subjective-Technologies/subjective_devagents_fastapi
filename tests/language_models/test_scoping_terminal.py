@@ -77,6 +77,52 @@ def test_scoping_limit_stops_every_model_call_and_returns_a_compact_checkpoint(r
     assert 'Returned to Manager for rescoping' in result.text
 
 
+def test_coordination_refusals_do_not_spend_the_scoping_budget(request_data, monkeypatch):
+    """A tool the journal refuses before it runs is not exploration. Real searches still are."""
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    calls = []
+    refusal = 'Error: WRITE_LEASE_REQUIRED: Acquire a covering Coordination write lease before executing'
+
+    async def respond(_identity, _token, messages, _tools, _timeout, _cancelled):
+        calls.append(messages)
+        n = len(calls)
+        if n <= strategies.COORDINATION_EXCLUDED_ROUNDS:
+            return {'content': 'edit', 'tool_calls': [tool_call(str(n), 'Write', file_path='src/ui/app.js', content='x')]}, 'tool_calls', {}
+        return {'content': f'read {n}', 'tool_calls': [tool_call(str(n), 'Read', file_path='src/ui/app.js', offset=n)]}, 'tool_calls', {}
+
+    def dispatch(call, *_a, **_k):
+        name = (call.get('function') or {}).get('name')
+        return refusal if name == 'Write' else SENTINEL
+
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', dispatch)
+    control = Control()
+    result = agent.run(replace(request_data, timeout=600, coordination=control), lambda *_: None, lambda: False)
+    assert result.status == 'blocked' and result.error_code == 'coder_scoping_limit'
+    assert len(calls) == strategies.COORDINATION_EXCLUDED_ROUNDS + strategies.CODER_SCOPING_ROUNDS
+    assert control.terminal == 'coder_scoping_limit'
+
+
+def test_repeated_coordination_refusal_is_not_scoping_limit(request_data, monkeypatch):
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    calls = []
+    refusal = 'Error: coordination_unavailable: Channel coordination is temporarily unavailable\n{"error_code": "coordination_unavailable", "executed": false, "ok": false}'
+
+    async def respond(_identity, _token, _messages, _tools, _timeout, _cancelled):
+        calls.append(1)
+        n = len(calls)
+        return {'content': 'edit', 'tool_calls': [tool_call(str(n), 'Read', file_path='src/ui/app.js', offset=n)]}, 'tool_calls', {}
+
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', lambda *_a, **_k: refusal)
+    result = agent.run(replace(request_data, timeout=600, coordination=Control()), lambda *_: None, lambda: False)
+    assert result.status == 'failed' and result.error_code == 'coordination_unavailable'
+    assert len(calls) == strategies.COORDINATION_EXCLUDED_ROUNDS + 1
+    assert result.error_code != 'coder_scoping_limit'
+
+
 def test_narrowed_successor_gets_a_fresh_budget_and_no_old_tool_history(request_data, monkeypatch):
     monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
     first_calls, first = [], Control()

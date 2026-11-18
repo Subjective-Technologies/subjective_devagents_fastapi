@@ -488,6 +488,39 @@ MAX_TOOL_ROUNDS = 200
 # round, so the same search also stops after three minutes once two rounds have run.
 CODER_SCOPING_ROUNDS = 12
 CODER_SCOPING_SECONDS = 180
+# A round whose every tool call the coordination layer refused before it ran (no lease yet,
+# journal unreachable, workspace fenced) is not exploration: it does not count toward the
+# scoping limit. Bounded, so a coordination layer that keeps refusing still ends the turn.
+COORDINATION_EXCLUDED_ROUNDS = 4
+
+# Coordination refusals the runtime returns to the model as structured, machine-readable
+# outcomes: (retryable, recovery action). They happen before the tool executes.
+COORDINATION_ERRORS = {
+    'WRITE_LEASE_REQUIRED': (True, 'ACQUIRE_LEASE'), 'LEASE_SCOPE_MISMATCH': (True, 'ACQUIRE_LEASE'),
+    'LEASE_NOT_FOUND': (True, 'ACQUIRE_LEASE'), 'LEASE_RECOVERY_REQUIRED': (True, 'RECOVER_LEASE'),
+    'LEASE_CONFLICT': (False, 'WAIT_FOR_OWNER'), 'coordination_unavailable': (True, 'RETRY_LATER'),
+    'WORKSPACE_BUSY': (True, 'RETRY_LATER'), 'lease_outside_workspace': (False, 'USE_WORKSPACE_PATH'),
+    'lease_outside_repository': (False, 'USE_WORKSPACE_PATH'), 'WORKTREE_OWNED': (False, 'MANAGER_RECOVERY'),
+    'BLOCKED_EXECUTION_CAPABILITY': (False, 'NONE'), 'remote_scope_unverified': (False, 'NONE'),
+    'DISPATCH_TERMINAL': (False, 'NONE'),
+}
+
+
+def coordination_refusal(error, name: str, arguments: dict) -> str:
+    """Human-readable line first (backward compatible), then a structured JSON outcome."""
+    retryable, action = COORDINATION_ERRORS.get(error.code, (False, 'NONE'))
+    target = arguments.get('file_path') or arguments.get('path') or (
+        short(str(arguments.get('command') or ''), 160) if name == 'Bash' else None)
+    return (f"Error: {error.code}: {error}\n" + json.dumps(
+        {'ok': False, 'error_code': error.code, 'retryable': retryable, 'recovery_action': action,
+         'target': target, 'executed': False}, sort_keys=True))
+
+
+def coordination_refused(result_text) -> bool:
+    """The tool never ran: the coordination layer refused it first."""
+    if not isinstance(result_text, str) or not result_text.startswith('Error: '):
+        return False
+    return result_text[7:].split(':', 1)[0] in COORDINATION_ERRORS
 # A read during that search must not hold the rest of the 30-minute task window.
 CODER_SCOPING_READ_SECONDS = 20
 
@@ -1088,6 +1121,10 @@ class ApiAgent(ModelStrategy):
         tools = agent_tool_set(identity)
         coordination = request.coordination
         scoping = getattr(coordination, "agent_role", None) == "coder_agent"
+        if coordination and scoping and identity.sandbox == "workspace-write":
+            # Ordinary authorized edits acquire their own lease inside guard(). The model
+            # does not spend a round calling Coordination acquire first.
+            coordination.auto_acquire = True
         if coordination:
             from ..channel_coordination import CONTROL_TOOL, shell_effect
             from ..runtime_profiles import is_verification_command
@@ -1112,7 +1149,8 @@ class ApiAgent(ModelStrategy):
                 "\nCoder rule: a company reading list is not the assignment. "
                 "After the files that implement the assignment are in this turn, edit them or run the check. "
                 "Do not read, search, or run the same command again. "
-                "If a write is rejected for a missing lease, call Coordination to acquire a write lease and retry that edit once. "
+                "The runtime acquires the write lease for an authorized edit. "
+                "Call Coordination acquire only when a tool result says LEASE_CONFLICT or LEASE_SCOPE_MISMATCH. "
                 "A search that does not edit or run a check ends the turn."
             )
         messages += [{"role": m.role, "content": m.content} for m in request.history]
@@ -1183,14 +1221,16 @@ class ApiAgent(ModelStrategy):
             emit(kind, data)
 
         seen_reads: dict[str, int] = {}
+        excluded_rounds, excluded_seconds = 0, 0.0
         for _ in range(MAX_TOOL_ROUNDS):
             progress["rounds"] += 1
-            if scoping and progress["rounds"] <= CODER_SCOPING_ROUNDS:
-                scoping_stats["scoping_steps"] = progress["rounds"]
-            if scoping and progress["rounds"] > CODER_SCOPING_ROUNDS:
+            counted = progress["rounds"] - excluded_rounds
+            if scoping and counted <= CODER_SCOPING_ROUNDS:
+                scoping_stats["scoping_steps"] = counted
+            if scoping and counted > CODER_SCOPING_ROUNDS:
                 emit("activity", {"text": "Stopped: coder searched without editing or running a check"})
                 return scoping_limit()
-            if scoping and progress["rounds"] > 2 and time.monotonic() - scoping_started > CODER_SCOPING_SECONDS:
+            if scoping and counted > 2 and time.monotonic() - scoping_started - excluded_seconds > CODER_SCOPING_SECONDS:
                 emit("activity", {"text": "Stopped: coder searched too long without editing or running a check"})
                 return scoping_limit()
             remaining = deadline - time.monotonic()
@@ -1287,6 +1327,7 @@ class ApiAgent(ModelStrategy):
                         emit("file_diff", diff)
                 return ModelResult("completed", text)
             repeat_stop = False
+            refused_calls = 0
             for call in calls:
                 emit("runtime_status", {"phase": "working"})
                 if cancelled():
@@ -1330,8 +1371,14 @@ class ApiAgent(ModelStrategy):
                         shell_effect(command) == "READ_ONLY" and not is_verification_command(command))
                     if read_only:
                         tool_timeout = min(remaining, CODER_SCOPING_READ_SECONDS)
+                tool_started = time.monotonic()
                 result_text = self._dispatch(call, tools, identity, transport, cancelled, tool_timeout, tool_event,
                                              edited, coordination)
+                if coordination_refused(result_text):
+                    refused_calls += 1
+                    excluded_seconds += time.monotonic() - tool_started
+                    emit("tool_blocked", {"event": "TOOL_BLOCKED_COORDINATION", "tool_call_id": str(call.get("id") or ""),
+                                          "name": name, "error_code": result_text[7:].split(":", 1)[0]})
                 if isinstance(result_text, ModelResult):
                     if scoping and result_text.status == "timed_out" and deadline <= time.monotonic():
                         return scoping_limit()
@@ -1368,6 +1415,19 @@ class ApiAgent(ModelStrategy):
                     if milestone or tools_since_checkpoint >= budget.checkpoint_every:
                         self._checkpoint(progress, request, "milestone" if milestone else "periodic")
                         tools_since_checkpoint = 0
+            if scoping and calls and refused_calls == len(calls):
+                # Nothing ran this round: a prerequisite failed, the coder did not explore.
+                excluded_rounds += 1
+                scoping_stats["excluded_steps"] = scoping_stats.get("excluded_steps", 0) + 1
+                emit("scoping_step", {"event": "SCOPING_STEP_EXCLUDED", "round": progress["rounds"],
+                                      "reason": "coordination_refused"})
+                if excluded_rounds > COORDINATION_EXCLUDED_ROUNDS:
+                    # Coordination keeps refusing: an infrastructure outcome, retried by policy.
+                    return ModelResult("failed", "Coordination refused every tool call of the last rounds.",
+                                       error_code="coordination_unavailable")
+            elif scoping:
+                emit("scoping_step", {"event": "SCOPING_STEP_COUNTED", "round": progress["rounds"],
+                                      "counted": progress["rounds"] - excluded_rounds})
             if scoping and repeat_stop:
                 emit("activity", {"text": "Stopped: coder repeated a search instead of editing"})
                 return scoping_limit()
@@ -1393,7 +1453,7 @@ class ApiAgent(ModelStrategy):
                 with mutation_fence(coordination):
                     return ApiAgent._dispatch(call, tools, identity, transport, cancelled, timeout, emit, edited, coordination, True)
             except ModelError as error:
-                return f"Error: {error.code}: {error}"
+                return coordination_refusal(error, name, arguments)
         if coordination:
             activity = getattr(coordination, 'activity', None)
             if activity:
@@ -1405,7 +1465,14 @@ class ApiAgent(ModelStrategy):
                     return ModelResult("completed", coordination.ask(arguments))
                 coordination.guard(name, arguments)
             except ModelError as error:
-                return f"Error: {error.code}: {error}"
+                if error.code == 'LEASE_CONFLICT' and name in {'Write', 'Edit', 'Bash'}:
+                    # A healthy writer of another task owns the target. Retrying cannot help and
+                    # searching around it is not "scoping": stop with an explicit blocker.
+                    emit("activity", {"text": "Stopped: another task holds the write lease for this target"})
+                    return ModelResult("blocked", "BLOCKED: LEASE_CONFLICT: the write target is leased by another "
+                                       "active task.\n" + coordination_refusal(error, name, arguments),
+                                       error_code="lease_conflict")
+                return coordination_refusal(error, name, arguments)
         if name == "AskUser":
             question = str(arguments.get("question") or "").strip()
             if not question:

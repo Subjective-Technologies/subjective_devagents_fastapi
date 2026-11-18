@@ -55,6 +55,13 @@ os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 def mutation_fence(session):
     if session.identity.ssh_host:
         raise ModelError('remote_scope_unverified', 'Remote mutation cannot use a local fence')
+    holder = getattr(_local, 'holder', None)
+    if holder and holder[1].get('dispatch_id') == session.binding['dispatch_id'] \
+            and holder[1].get('instance_id') == session.binding['instance_id']:
+        # Already fenced by this execution (the guard acquiring a lease inside a fenced tool
+        # call). A second flock on a new descriptor would wait for ourselves.
+        yield
+        return
     folder = Path(os.environ.get('SUBJECTIVE_CHAT_HOME', str(Path(session.identity.home or session.identity.workspace) / '.subjective_chat'))) / 'mutation-fences'
     if session.fence_root:
         folder = Path(session.fence_root)
