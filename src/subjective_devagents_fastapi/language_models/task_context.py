@@ -398,6 +398,89 @@ def build_checkpoint(messages, first_of_turn, edited, workspace, *, reason, role
     return checkpoint
 
 
+SCOPING_SCHEMA = 'scoping/1'
+SCOPING_CHECKPOINT_LIMIT = 4000
+SCOPING_FIELDS = ('confirmed', 'files_inspected', 'checks_completed', 'files_changed', 'hypothesis',
+                  'smallest_next_change', 'unresolved', 'repositories')
+_FILE_TOKEN = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w-][\w.-]*\.[A-Za-z][A-Za-z0-9]{0,5})(?![\w/])")
+_NEXT_LINE = re.compile(r"(?i)\b(?:next|i will|i'll|should|need to|then)\b")
+
+
+def _relative(path, workspace):
+    path = str(path)
+    if workspace and os.path.isabs(path):
+        try:
+            rel = os.path.relpath(path, workspace)
+        except ValueError:
+            return path
+        return path if rel.startswith('..') else rel
+    return path
+
+
+def scoping_checkpoint(messages, first_of_turn, edited, workspace, *, stats, previous=None, repositories=True,
+                       limit=SCOPING_CHECKPOINT_LIMIT):
+    """What Manager needs to narrow a Coder assignment after SCOPING_LIMIT. Small by design.
+
+    Never the transcript: which files were looked at, what the coder concluded, what failed,
+    and the smallest change it would make next. A narrowed successor gets it so it does not
+    repeat the discovery; its own scoping budget starts fresh.
+    """
+    previous = previous if isinstance(previous, dict) and previous.get('schema') == SCOPING_SCHEMA else {}
+    base = build_checkpoint(messages, first_of_turn, edited, workspace, reason='coder_scoping_limit',
+                            role='coder_agent', rounds=int(stats.get('scoping_steps') or 0), repositories=repositories)
+    calls = _calls_by_id(messages)
+    inspected = [f for f in previous.get('files_inspected') or [] if isinstance(f, str)]
+    notes = []
+    for item in messages[first_of_turn:]:
+        if item.get('role') != 'assistant':
+            continue
+        note = text_of(item.get('content')).strip()
+        if note:
+            notes.append(note)
+        for call in item.get('tool_calls') or []:
+            name, arguments = calls.get(call.get('id') or '', ('', {}))
+            found = []
+            if name == 'Read' and arguments.get('file_path'):
+                found = [arguments['file_path']]
+            elif name in {'Grep', 'Glob'} and arguments.get('path'):
+                found = [arguments['path']]
+            elif name == 'Bash':
+                found = _FILE_TOKEN.findall(str(arguments.get('command') or ''))
+            for path in found:
+                path = _relative(path, workspace)
+                if path and path not in inspected:
+                    inspected.append(path)
+    # Facts a predecessor confirmed stay (up to four); this dispatch's newest fill the rest.
+    kept = [c for c in previous.get('confirmed') or [] if isinstance(c, str)][-4:]
+    fresh = []
+    for note in notes:
+        line = note.splitlines()[0].strip()[:240]
+        if line and line not in kept and line not in fresh:
+            fresh.append(line)
+    confirmed = kept + fresh[-(8 - len(kept)):]
+    last = notes[-1] if notes else ''
+    nxt = next((line.strip() for line in reversed(last.splitlines()) if _NEXT_LINE.search(line)), '')
+    checkpoint = {
+        'schema': SCOPING_SCHEMA, 'reason': 'coder_scoping_limit', 'phase': 'NEEDS_RESCOPE', 'task_phase': 'NEEDS_RESCOPE',
+        'confirmed': confirmed, 'files_inspected': inspected[:40],
+        'checks_completed': (base['tests_passed'] + base['tests_failed'])[-6:],
+        'files_changed': [_relative(f, workspace) for f in base['files_changed']][:20],
+        'hypothesis': last[:500], 'smallest_next_change': nxt[:300],
+        'unresolved': [f"{f['command'][:160]} -> exit {f['exit_code']}" for f in base['failures'][:4]],
+        'repositories': base['repositories'][:6],
+        'scoping': {key: int(stats.get(key) or 0) for key in ('scoping_steps', 'file_reads', 'searches',
+                                                               'planning_turns', 'files_modified', 'checks_completed')},
+    }
+    # Bounded: drop the oldest entries first, never the counts or the identity fields.
+    for key in ('confirmed', 'files_inspected', 'unresolved', 'checks_completed'):
+        while len(json.dumps(checkpoint)) > limit and len(checkpoint[key]) > 2:
+            checkpoint[key] = checkpoint[key][1:]
+    if len(json.dumps(checkpoint)) > limit:
+        checkpoint['hypothesis'] = checkpoint['hypothesis'][:200]
+        checkpoint['confirmed'] = [line[:120] for line in checkpoint['confirmed']]
+    return checkpoint
+
+
 def progress_key(checkpoint):
     """Changes only when the task moved: files, passing checks, completed work, or open failures."""
     if not checkpoint:

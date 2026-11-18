@@ -332,6 +332,9 @@ class ChannelSession:
         self.identity = None
         self.closed = False
         self.blocked = False
+        # Set once this dispatch reached a terminal outcome here (SCOPING_LIMIT): from then on
+        # it executes nothing. Only finish() still reports, and the journal fences it too.
+        self.terminal = None
         self.privilege = None
         self._state = None
         self.tool_capabilities = set()
@@ -455,7 +458,21 @@ class ChannelSession:
                     self._authorization = ''
                 raise
 
+    def mark_terminal(self, reason):
+        """No model request, tool, heartbeat or "next step" after this. Idempotent."""
+        if not self.terminal:
+            self.terminal = str(reason)
+            log.info('Dispatch terminal channel=%s dispatch=%s reason=%s',
+                     self.binding['channel_id'], self.binding['dispatch_id'], self.terminal)
+
+    def can_execute(self):
+        return not self.closed and not self.terminal
+
     def activity(self, tool=None, *, phase=None, detail=None, call_id=None, usage=None):
+        if not self.can_execute():
+            if isinstance(usage, dict) and isinstance(usage.get('id'), str):
+                self._usage_pending[usage['id']] = usage   # still billed with the finish receipt
+            return
         if isinstance(usage, dict) and isinstance(usage.get('id'), str):
             self._usage_pending[usage['id']] = usage
         phase = phase or ('working' if tool else None)
@@ -575,6 +592,8 @@ class ChannelSession:
 
     def checkpoint(self, checkpoint):
         """Persist a structured checkpoint in the journal (best effort, never blocks the work)."""
+        if not self.can_execute():
+            return
         try:
             self.call('checkpoint', checkpoint=checkpoint)
         except ModelError as error:
@@ -618,6 +637,8 @@ class ChannelSession:
                 'preserved': True, 'observed_at': time.time(), 'source': 'runtime_git_status'}
 
     def tool(self, operation, data):
+        if self.terminal:
+            raise ModelError('DISPATCH_TERMINAL', 'This dispatch is terminal and executes nothing more')
         if operation not in TOOL_OPERATIONS or not isinstance(data, dict):
             raise ModelError('coordination_operation_forbidden', 'Unknown or privileged coordination operation')
         data = dict(data)
@@ -689,6 +710,8 @@ class ChannelSession:
         return json.dumps(result, sort_keys=True)
 
     def guard(self, name, arguments):
+        if self.terminal:
+            raise ModelError('DISPATCH_TERMINAL', 'This dispatch is terminal and executes nothing more')
         if name not in {'Bash', 'Write', 'Edit'}:
             return
         if name == 'Bash':
@@ -798,6 +821,8 @@ class ChannelSession:
                 return
 
     def revoked(self):
+        if self.terminal:
+            return True   # anything still running for this dispatch is cancelled
         if self.closed or time.monotonic() - self.last_check < 2:
             return False
         self.last_check = time.monotonic()

@@ -687,6 +687,7 @@ def test_coordinated_progress_renews_window_without_hiding_stalled_requests(requ
     ('Edit', {'file_path': 'example.txt'}, True, 'completed'),
     ('Bash', {'command': 'sed -i s/example/fixed/ example.txt'}, True, 'completed'),
     ('Bash', {'command': 'pytest -q'}, False, 'completed'),
+    ('Bash', {'command': 'python fix.py'}, True, 'blocked'),
 ])
 def test_coder_scoping_window_requires_evidence(request_data, monkeypatch, name, arguments, changed, expected):
     from types import SimpleNamespace
@@ -731,9 +732,72 @@ def test_coder_scoping_window_requires_evidence(request_data, monkeypatch, name,
     if expected == 'blocked':
         assert now == request_data.timeout
         assert result.error_code == 'coder_scoping_limit'
-        assert checkpoints[-1]['reason'] == 'coder_scoping_limit'
+        # The compact scoping checkpoint travels with the BLOCKED result (one journal transaction).
+        assert result.checkpoint['reason'] == 'coder_scoping_limit' and result.checkpoint['schema'] == 'scoping/1'
+        assert not any(c.get('reason') == 'coder_scoping_limit' for c in checkpoints)
     else:
         assert now > request_data.timeout
+
+
+def test_coder_slow_search_stops_on_the_clock(request_data, monkeypatch):
+    """Two slow rounds may still edit. A third, after three minutes with no edit, stops."""
+    from types import SimpleNamespace
+
+    from subjective_devagents_fastapi.language_models import strategies
+
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    now = 0
+    monkeypatch.setattr(strategies, 'time', SimpleNamespace(monotonic=lambda: now))
+    calls = []
+
+    async def respond(_identity, _token, _messages, _tools, timeout, _cancelled):
+        nonlocal now
+        calls.append(timeout)
+        now += 100
+        return {'tool_calls': [tool_call(str(len(calls)), 'Grep', pattern=f'q{len(calls)}')]}, 'tool_calls', {}
+
+    control = SimpleNamespace(agent_role='coder_agent', context=lambda: 'test', revoked=lambda: False, checkpoint=lambda *_: None)
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', lambda *_args, **_kwargs: 'ok')
+    result = agent.run(replace(request_data, timeout=1800, coordination=control), lambda *_: None, lambda: False)
+
+    assert result.status == 'blocked'
+    assert result.error_code == 'coder_scoping_limit'
+    assert len(calls) == 2
+    assert now < 1800
+
+
+def test_coder_read_only_search_cannot_hold_the_task_window(request_data, monkeypatch):
+    from types import SimpleNamespace
+
+    from subjective_devagents_fastapi.language_models import strategies
+
+    monkeypatch.setenv('TEST_AGENT_KEY', 'fixture-key')
+    now = 0
+    monkeypatch.setattr(strategies, 'time', SimpleNamespace(monotonic=lambda: now))
+    timeouts = []
+
+    async def respond(_identity, _token, _messages, _tools, timeout, _cancelled):
+        nonlocal now
+        now += 0.01
+        if timeouts:
+            return {'content': 'Done'}, 'stop', {}
+        return {'tool_calls': [tool_call('one', 'Bash', command='sed -n p DatasourcePicker.tsx')]}, 'tool_calls', {}
+
+    def dispatch(_call, _tools, _identity, _transport, _cancelled, timeout, *_args):
+        timeouts.append(timeout)
+        return 'ok'
+
+    control = SimpleNamespace(agent_role='coder_agent', context=lambda: 'test', revoked=lambda: False, checkpoint=lambda *_: None)
+    agent = ApiAgent()
+    monkeypatch.setattr(agent, '_call', respond)
+    monkeypatch.setattr(agent, '_dispatch', dispatch)
+    monkeypatch.setattr(strategies, 'workspace_snapshot', lambda *_args: {'repo': {'head': 'head', 'dirty': {}}})
+    result = agent.run(replace(request_data, timeout=1800, coordination=control), lambda *_: None, lambda: False)
+
+    assert result.status == 'completed'
+    assert timeouts == [strategies.CODER_SCOPING_READ_SECONDS]
 
 
 def test_coder_search_stops_before_the_task_timeout(request_data, monkeypatch):

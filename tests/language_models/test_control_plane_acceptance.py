@@ -363,3 +363,102 @@ def test_context_handoff_successor_runs_from_the_checkpoint_not_the_transcript(s
     assert len(second) < len(first) / 5
     kinds = [e['kind'] for e in s.journal.snapshot(s.channel)['events']]
     assert 'SUCCESSOR_AFTER_CONTEXT_LIMIT' in kinds and 'TASK_CHECKPOINT' in kinds
+
+
+def test_scoping_limit_acceptance_xmi_editor(system, monkeypatch):
+    """Production incident conv_8a72147b (2026-11-18, TAGGY-3521), end to end.
+
+    The broad Coder assignment spends its scoping budget in the REAL ApiAgent loop without
+    editing. Expected: dispatch BLOCKED, task NEEDS_RESCOPE, no further Coder model call,
+    Manager woken at once; Manager narrows to one file; the new Coder dispatch implements.
+    """
+    import json as _json
+    from subjective_devagents_fastapi.language_models import ApiAgent
+    from subjective_devagents_fastapi.language_models import strategies
+    from test_api_agent import tool_call
+    s = system
+    monkeypatch.setenv('FIXTURE_KEY', 'fixture')
+    s.repository.add_member(s.channel, 'ai_manager')
+    s.execution['agents']['ai_manager'] = {'user_id': 'ai_manager', 'company_id': 'company_test', 'provider': 'codex',
+                                           'role_file': 'agents/roles/manager_agent.md', 'display_name': 'Manager',
+                                           'mode': 'write'}
+    s.export['files'].append({'path': 'agents/roles/manager_agent.md', 'content': 'Plan and dispatch.'})
+    s.execution['manager_agent_id'] = 'ai_manager'
+    broad = ('Make XMI code editable, add Apply and Save, support Undo, update diagram/explorer/properties, '
+             'handle invalid XMI, add tests.')
+    narrow = 'In src/ui/app.js only, implement Apply for edited XMI.'
+    manager_answers = ['@ai_coder ' + broad, '@ai_coder ' + narrow, 'Apply is implemented; waiting for the next step.']
+    turns, coder_model_calls = [], []
+
+    searching = ApiAgent()
+
+    async def search(_identity, _token, messages, _tools, _timeout, _cancelled):
+        coder_model_calls.append(len(messages))
+        n = len(coder_model_calls)
+        return {'content': f'Reading the code view (step {n}).',
+                'tool_calls': [tool_call(str(n), 'Read', file_path='a.py', offset=n)]}, 'tool_calls', {}
+    monkeypatch.setattr(searching, '_call', search)
+
+    class Runtime(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            agent = request.coordination.actor
+            turns.append((agent, request.prompt))
+            if agent == 'ai_manager':
+                return ModelResult('completed', manager_answers.pop(0) if manager_answers else 'UNEXPECTED TURN')
+            if len([t for t in turns if t[0] == 'ai_coder']) == 1:
+                return searching.run(request, emit, cancelled)      # the real loop hits SCOPING_LIMIT
+            emit('tool_call', {'tool_call_id': 'c1', 'name': 'Bash', 'detail': 'node --test'})
+            emit('tool_result', {'tool_call_id': 'c1', 'name': 'Bash', 'ok': True, 'output_chars': 10})
+            return ModelResult('completed', 'IMPLEMENTATION_COMPLETE: Apply in src/ui/app.js; node --test passed')
+    s.model.strategies['api_agent:codex'] = Runtime()
+    s.journal.mutate(s.channel, 'owner', {'op': 'dispatch', 'agent_id': 'ai_manager', 'assignment': 'TAGGY-3521',
+                                          'execution': s.execution}, human=True)
+
+    def settle(until, rounds=80):
+        for _ in range(rounds):
+            tick(s)
+            if until():
+                return
+            time.sleep(0.05)
+
+    coder_blocked = lambda: any(x['agent_id'] == 'ai_coder' and x['status'] == 'BLOCKED' for x in dispatches(s))
+    settle(coder_blocked)
+    state = s.journal.snapshot(s.channel)
+    blocked = next(x for x in state['dispatches'].values() if x['agent_id'] == 'ai_coder')
+    assert blocked['status'] == 'BLOCKED' and blocked['failure_code'] == 'CODER_SCOPING_LIMIT'
+    assert state['task']['phase'] == 'NEEDS_RESCOPE'
+    assert len(coder_model_calls) == strategies.CODER_SCOPING_ROUNDS
+    # Manager is runnable in the same transaction that blocked the Coder.
+    woken = [x for x in state['dispatches'].values() if x['agent_id'] == 'ai_manager' and x['status'] == 'DISPATCHED']
+    assert woken and woken[0]['created_at'] == blocked['completed_at']
+
+    implemented = lambda: s.journal.snapshot(s.channel)['task']['facts']['implementation_complete']
+    settle(implemented)
+    state = s.journal.snapshot(s.channel)
+    coders = sorted((x for x in state['dispatches'].values() if x['agent_id'] == 'ai_coder'), key=lambda x: x['created_at'])
+    assert [x['status'] for x in coders] == ['BLOCKED', 'COMPLETED']
+    assert coders[1]['parent_dispatch_id'] == blocked['id'] and coders[1]['rescope_reason'] == 'SCOPING_LIMIT'
+    # The blocked dispatch never ran again: still exactly its own model calls.
+    assert len(coder_model_calls) == strategies.CODER_SCOPING_ROUNDS
+    rescope_prompt = next(p for a, p in turns if a == 'ai_manager' and 'RESCOPE_REQUIRED' in p)
+    assert '0 files changed' in rescope_prompt
+    successor_prompt = [p for a, p in turns if a == 'ai_coder'][1]
+    assert narrow in successor_prompt and 'narrowed successor of dispatch ' + blocked['id'] in successor_prompt
+    assert '"files_inspected"' in successor_prompt and 'a.py' in successor_prompt   # handed over, not rediscovered
+    assert len(successor_prompt) < 24_000    # a brief, not the old transcript
+    events = [e['kind'] for e in state['events']]
+    for kind in ('SCOPING_LIMIT_REACHED', 'DISPATCH_BLOCKED', 'MANAGER_RESCOPE_REQUESTED', 'RESCOPE_DISPATCH_CREATED'):
+        assert kind in events, kind
+    # Late model output for the blocked dispatch: audit only.
+    session = ChannelSession(ChannelCoordination_binding(state, blocked), 'ai_coder', '')
+    session.start_acknowledged = True
+    session.finish('completed', None, result={'text': 'late'})
+    after = s.journal.snapshot(s.channel)
+    assert after['dispatches'][blocked['id']]['status'] == 'BLOCKED' and 'LATE_RESULT_IGNORED' in [e['kind'] for e in after['events']]
+    assert 'UNEXPECTED TURN' not in str(turns)
+    _json.dumps(after)  # journal stays serializable
+
+
+def ChannelCoordination_binding(state, item):
+    from subjective_chat_api.coordination import ChannelCoordination
+    return ChannelCoordination.binding(state, item)

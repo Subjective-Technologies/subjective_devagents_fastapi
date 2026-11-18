@@ -483,9 +483,13 @@ class Api(ModelStrategy):
 TOOL_OUTPUT_LIMIT = 20_000  # characters kept per tool result; bounds context growth across rounds
 MAX_TOOL_ROUNDS = 200
 # A coder that only searches used to run until the task timeout (as long as 30 minutes)
-# or until 200 rounds. Each round is another model request. Twelve rounds is enough to
-# read the files that implement a task and edit them. Past that, the turn stops.
+# or until 200 rounds. Each round is another model request. Twelve rounds is enough for
+# a fast coder to read the files and edit them. A slow model spends minutes on each
+# round, so the same search also stops after three minutes once two rounds have run.
 CODER_SCOPING_ROUNDS = 12
+CODER_SCOPING_SECONDS = 180
+# A read during that search must not hold the rest of the 30-minute task window.
+CODER_SCOPING_READ_SECONDS = 20
 
 AGENT_TOOLS = {
     "Bash": {"type": "function", "function": {
@@ -697,6 +701,17 @@ def shorten_tool_results(messages: list, first_of_turn: int, budget: int = MAX_C
                            "content": f"[Earlier tool output left out to fit the context window: {len(text)} chars. Do not run it again. Edit or answer from what you already have.]"}
         shortened += 1
     return shortened
+
+
+def _snapshot_wrote(before: dict, after: dict) -> bool:
+    """True when a write command changed a repository this turn already observed.
+
+    An empty before-snapshot is a failed capture, not a clean tree. Treating it as
+    changed let the next command leave the search cap without editing anything.
+    """
+    if not before or not after:
+        return False
+    return after != before
 
 
 def _read_signature(call: dict) -> str | None:
@@ -1115,6 +1130,7 @@ class ApiAgent(ModelStrategy):
         transport = self.transport or (SshTunnel(identity.ssh_host, identity.os_user or None)
                                        if identity.ssh_host else LocalProcess())
         deadline = time.monotonic() + request.timeout
+        scoping_started = time.monotonic()
         # Repositories as they were before the first Bash command; None until one runs.
         snapshot: dict | None = None
         edited: set[str] = set()
@@ -1126,23 +1142,56 @@ class ApiAgent(ModelStrategy):
                                                       "start_tokens": estimate_tokens(messages)})
         last_tokens, tools_since_checkpoint = None, 0
 
+        # Scoping budget: what the coder did before its first edit or check. Repeated reads
+        # and searches never reset it; only implementation progress ends scoping.
+        scoping_stats = progress.setdefault("scoping", {"scoping_steps": 0, "file_reads": 0, "searches": 0,
+                                                        "planning_turns": 0, "files_modified": 0,
+                                                        "checks_completed": 0})
+
         def scoping_limit():
-            self._checkpoint(progress, request, "coder_scoping_limit")
-            return ModelResult("blocked", "BLOCKED: Coder reached the scoping limit without changing files or "
-                               "completing a check. Review the checkpoint and narrow the assignment before retrying.",
-                               error_code="coder_scoping_limit")
+            """SCOPING_LIMIT is terminal for this dispatch: checkpoint, then execute nothing more.
+
+            The checkpoint travels with the BLOCKED result (one journal transaction). The session
+            is fenced before returning, so no heartbeat, tool or model request follows.
+            """
+            from .task_context import scoping_checkpoint
+            checkpoint = None
+            try:
+                checkpoint = scoping_checkpoint(progress.get("messages") or [], progress.get("first_of_turn", 0),
+                                                progress.get("edited"), identity.workspace, stats=scoping_stats,
+                                                previous=getattr(coordination, "previous_checkpoint", None)
+                                                if coordination else None, repositories=not identity.ssh_host)
+                checkpoint["context"] = {"last_tokens": (progress.get("context_stats") or {}).get("last_tokens")}
+            except Exception:  # noqa: BLE001 - a missing checkpoint never hides the block itself
+                log.warning("Scoping checkpoint not built", exc_info=True)
+            emit("scoping_limit", {"event": "SCOPING_LIMIT_REACHED", **scoping_stats})
+            mark = getattr(coordination, "mark_terminal", None) if coordination else None
+            if mark:
+                mark("coder_scoping_limit")
+            files = len((checkpoint or {}).get("files_changed") or [])
+            checks = len((checkpoint or {}).get("checks_completed") or [])
+            text = ("BLOCKED: Coder reached the scoping limit without changing files or completing a check.\n"
+                    f"SCOPING_LIMIT: {scoping_stats['scoping_steps']} scoping steps, {files} files changed, "
+                    f"{checks} checks completed. Returned to Manager for rescoping.")
+            return ModelResult("blocked", text, error_code="coder_scoping_limit", checkpoint=checkpoint)
 
         def tool_event(kind, data):
             nonlocal scoping
             if kind == "file_diff":
                 scoping = False
+                scoping_stats["files_modified"] += 1
             emit(kind, data)
 
         seen_reads: dict[str, int] = {}
         for _ in range(MAX_TOOL_ROUNDS):
             progress["rounds"] += 1
+            if scoping and progress["rounds"] <= CODER_SCOPING_ROUNDS:
+                scoping_stats["scoping_steps"] = progress["rounds"]
             if scoping and progress["rounds"] > CODER_SCOPING_ROUNDS:
                 emit("activity", {"text": "Stopped: coder searched without editing or running a check"})
+                return scoping_limit()
+            if scoping and progress["rounds"] > 2 and time.monotonic() - scoping_started > CODER_SCOPING_SECONDS:
+                emit("activity", {"text": "Stopped: coder searched too long without editing or running a check"})
                 return scoping_limit()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1216,6 +1265,8 @@ class ApiAgent(ModelStrategy):
             if coordination and not scoping:
                 deadline = time.monotonic() + request.timeout
             text = message.get("content") or ""
+            if scoping and isinstance(text, str) and text.strip():
+                scoping_stats["planning_turns"] += 1
             from ..channel_coordination import concrete_user_decision
             user_decision = bool(coordination and isinstance(text, str) and "NEEDS INPUT:" in text and concrete_user_decision(text))
             if isinstance(text, str) and text.strip() and not user_decision:
@@ -1264,7 +1315,22 @@ class ApiAgent(ModelStrategy):
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             return scoping_limit()
-                result_text = self._dispatch(call, tools, identity, transport, cancelled, remaining, tool_event,
+                tool_timeout = remaining
+                if scoping and name == "Read":
+                    scoping_stats["file_reads"] += 1
+                elif scoping and name in {"Grep", "Glob"}:
+                    scoping_stats["searches"] += 1
+                if scoping and name in {"Read", "Grep", "Glob", "Bash"}:
+                    try:
+                        preview = json.loads((call.get("function") or {}).get("arguments") or "{}")
+                    except ValueError:
+                        preview = {}
+                    command = str(preview.get("command") or "") if isinstance(preview, dict) else ""
+                    read_only = name != "Bash" or (
+                        shell_effect(command) == "READ_ONLY" and not is_verification_command(command))
+                    if read_only:
+                        tool_timeout = min(remaining, CODER_SCOPING_READ_SECONDS)
+                result_text = self._dispatch(call, tools, identity, transport, cancelled, tool_timeout, tool_event,
                                              edited, coordination)
                 if isinstance(result_text, ModelResult):
                     if scoping and result_text.status == "timed_out" and deadline <= time.monotonic():
@@ -1279,15 +1345,23 @@ class ApiAgent(ModelStrategy):
                         arguments = {}
                     command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
                     bash_ok = name == "Bash" and not result_text.startswith("Error:") and "[exit code " not in result_text
+                    # A check that ran counts even when it fails: a reproduced failure is progress.
+                    bash_ran = name == "Bash" and not result_text.startswith("Error:")
                     milestone = bash_ok and bool(_MILESTONE.search(command))
+                    if scoping and bash_ran and is_verification_command(command):
+                        scoping = False
+                        scoping_stats["checks_completed"] += 1
+                    elif scoping and name == "Bash" and shell_effect(command) == "READ_ONLY":
+                        scoping_stats["searches"] += 1
                     if scoping and bash_ok:
-                        if is_verification_command(command):
-                            scoping = False
-                        elif snapshot and shell_effect(command) != "READ_ONLY":
+                        if shell_effect(command) == "WRITE" and snapshot:
+                            # An unclassified command (a script, pip) used to leave the search
+                            # cap whenever any file hash in the workspace differed, including
+                            # a hash this command did not write. Only a write command can.
                             remaining = deadline - time.monotonic()
                             if remaining > 0:
                                 updated = workspace_snapshot(identity, transport, cancelled, min(5.0, remaining))
-                                if updated is not None and updated != snapshot:
+                                if _snapshot_wrote(snapshot, updated or {}):
                                     scoping = False
                     if not scoping:
                         deadline = time.monotonic() + request.timeout
