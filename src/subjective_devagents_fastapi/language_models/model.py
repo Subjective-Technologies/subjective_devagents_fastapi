@@ -208,9 +208,8 @@ class LanguageModel:
         if coordination and result.status == "completed":
             try:
                 result = replace(result, text=coordination.canonical_reply(result.text))
-                # Backend-owned [RT:] line from this turn's recorded tool events. The Chat API
-                # accepts functional acceptance (ACCEPTANCE_VERIFIED) only with executed checks,
-                # and a model cannot forge this line: lookalikes are stripped first.
+                # Backend-owned [RT:] line from this turn's recorded tool events. Tool counts
+                # are progress, not functional acceptance. A model cannot forge this line.
                 if coordination.delegation:   # server runtime; the browser path attests in llm_service
                     from ..agent_workflow import ensure_runtime_attestation
                     result = replace(result, text=ensure_runtime_attestation(result.text, self.turn_evidence(identifier)))

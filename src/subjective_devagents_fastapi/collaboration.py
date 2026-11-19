@@ -106,7 +106,8 @@ def _execute_approved(service, job):
         channel.assignment = execution['prompt'][-6000:]
         channel.runtime_profile = {'runtime_id': selected.runtime_id, 'sandbox': selected.sandbox,
                                    'test_exec': selected.test_exec, 'build_exec': selected.build_exec,
-                                   'fs_write': selected.fs_write, 'node_versions': list(selected.node_versions),
+                                   'browser_exec': selected.browser_exec, 'fs_write': selected.fs_write,
+                                   'node_versions': list(selected.node_versions),
                                    'requirements': requirements.summary()}
         # Never pinned: every dispatch loads the company's CURRENT published workflow. The
         # channel's version is only the floor (the newest one already proven); an older load is
@@ -136,20 +137,17 @@ def _execute_approved(service, job):
         return {'ok': True, 'turn_id': turn['id']}
 
 
-_VERIFIER_ROLE = re.compile(r'integration|pytest|selenium|verif|test')
-
-
 def select_runtime(profile, identity, prompt):
     """Choose the runtime profile the assigned action needs, before any model call.
 
-    A read-mode verifier asked to run tests/tsc/build gets the verify profile (test and
-    build execution, no source-editing tools). Node versions the assignment or the named
-    project pins must be installed; otherwise BLOCKED_NO_COMPATIBLE_RUNTIME, immediately.
+    Requirements come from the assignment, not the agent filename. A browser assignment
+    with no validated browser/driver raises BLOCKED_NO_COMPATIBLE_RUNTIME here, before
+    any model request. Node versions the assignment or the named project pins must be
+    installed.
     """
     from .runtime_profiles import available_profiles, requirements_for, select_profile
     read = profile.get('mode') == 'read'
-    verifier = read and bool(_VERIFIER_ROLE.search(str(profile.get('role_file', ''))))
-    requirements = requirements_for(prompt, None if identity.ssh_host else identity.workspace, verifier=verifier)
+    requirements = requirements_for(prompt, None if identity.ssh_host else identity.workspace, verifier=False)
     if not read:
         requirements.write = True   # a writer's profile also carries test and build execution
     profiles = available_profiles(identity.id, 'read-only' if read else 'workspace-write', verify_allowed=read)

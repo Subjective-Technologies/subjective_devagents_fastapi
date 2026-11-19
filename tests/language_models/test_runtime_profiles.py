@@ -118,6 +118,33 @@ def test_no_compatible_runtime_is_an_immediate_explicit_blocker(toolchains):
     assert error.value.code == 'BLOCKED_NO_COMPATIBLE_RUNTIME' and 'Node 26 not installed' in str(error.value)
 
 
+def test_browser_assignment_is_blocked_when_the_runtime_has_no_browser(monkeypatch, toolchains):
+    """A browser task must fail before any model call. Reading the repo is not a substitute."""
+    monkeypatch.delenv('SUBJECTIVE_BROWSER_EXEC', raising=False)
+    need = rp.requirements_for('Run the browser test and click Apply in the UML code view')
+    assert need.browser_exec is True
+    profiles = rp.available_profiles('id', 'workspace-write', verify_allowed=True)
+    assert all(profile.browser_exec is False for profile in profiles)
+    with pytest.raises(ModelError) as error:
+        rp.select_profile(need, profiles)
+    assert error.value.code == 'BLOCKED_NO_COMPATIBLE_RUNTIME'
+    assert 'missing browser_exec' in str(error.value)
+    compatible = rp.RuntimeProfile('browser', 'read-only', (), test_exec=True, browser_exec=True)
+    assert rp.select_profile(need, [compatible]).runtime_id == 'browser'
+
+
+def test_select_runtime_rejects_browser_work_without_a_model(tmp_path, monkeypatch):
+    monkeypatch.delenv('SUBJECTIVE_BROWSER_EXEC', raising=False)
+    from subjective_devagents_fastapi.collaboration import select_runtime
+    identity = Identity('runtime', 'claude', model='t', strategy='api_agent', workspace=str(tmp_path), home=str(tmp_path),
+                        sandbox='read-only', api_base_url='http://unused', api_key_env='K')
+    with pytest.raises(ModelError) as error:
+        select_runtime({'mode': 'read', 'role_file': 'agents/roles/architecture_compliance_agent.md'}, identity,
+                       'Exercise the browser and click Apply')
+    assert error.value.code == 'BLOCKED_NO_COMPATIBLE_RUNTIME'
+    assert 'browser_exec' in str(error.value)
+
+
 def test_least_privileged_profile_wins(toolchains):
     profiles = rp.available_profiles('id', 'read-only', verify_allowed=True)
     assert rp.select_profile(rp.Requirements(), profiles).runtime_id == 'id:read'

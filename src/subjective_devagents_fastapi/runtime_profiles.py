@@ -53,13 +53,15 @@ class NodeToolchain:
 class Requirements:
     test_exec: bool = False
     build_exec: bool = False
+    browser_exec: bool = False
     write: bool = False
     node_majors: set[int] = field(default_factory=set)
     node_sources: dict[int, str] = field(default_factory=dict)
 
     def summary(self) -> dict:
-        return {'test_exec': self.test_exec, 'build_exec': self.build_exec, 'write': self.write,
-                'node_majors': sorted(self.node_majors), 'node_sources': {str(k): v for k, v in self.node_sources.items()}}
+        return {'test_exec': self.test_exec, 'build_exec': self.build_exec, 'browser_exec': self.browser_exec,
+                'write': self.write, 'node_majors': sorted(self.node_majors),
+                'node_sources': {str(k): v for k, v in self.node_sources.items()}}
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,8 @@ def node_path_for(workdir, workspace, base_path):
 
 _TEST = re.compile(r'(?i)\b(?:run(?:ning)?\s+(?:the\s+)?(?:\w+\s+){0,3}tests?|test\s+suite|pytest|vitest|jest|'
                    r'npm\s+(?:run\s+)?test|go\s+test|cargo\s+test|playwright)\b')
+_BROWSER = re.compile(r'(?i)\b(?:browsers?|playwright|selenium|cypress|puppeteer|end[- ]to[- ]end|\be2e\b|'
+                      r'click(?:ing)?\s+(?:the\s+)?(?:button|link|ui))\b')
 _BUILD = re.compile(r'(?i)\b(?:run(?:ning)?\s+(?:the\s+)?(?:\w+\s+){0,2}build|npm\s+run\s+build|tsc\b|typecheck|'
                     r'type[- ]check|vite\s+build|go\s+build|cargo\s+build|compile)')
 # Only an instruction names a requirement ("run Node 22 tests", "on Node 22", "requires
@@ -292,7 +296,8 @@ _PATHLIKE = re.compile(r'(?<![\w@:/.-])((?:/subjective/)?(?:clients|services|lib
 def requirements_for(assignment, workspace=None, *, verifier=False) -> Requirements:
     """Requirements of the latest instruction. Older history is not an assignment."""
     text = str(assignment or '')[-6000:]
-    result = Requirements(test_exec=bool(_TEST.search(text)) or verifier, build_exec=bool(_BUILD.search(text)) or verifier)
+    result = Requirements(test_exec=bool(_TEST.search(text)) or verifier, build_exec=bool(_BUILD.search(text)) or verifier,
+                          browser_exec=bool(_BROWSER.search(text)))
     for match in _NODE.finditer(text):
         major = int(match.group(1))
         if 10 <= major <= 60:
@@ -319,26 +324,41 @@ def requirements_for(assignment, workspace=None, *, verifier=False) -> Requireme
     return result
 
 
+def browser_runtime_validated() -> bool:
+    """True only when the operator marked this host and a browser plus a driver exist.
+
+    A package name in an agent prompt is not validation. Unset SUBJECTIVE_BROWSER_EXEC
+    means no profile advertises browser_exec.
+    """
+    if os.environ.get('SUBJECTIVE_BROWSER_EXEC') != 'validated':
+        return False
+    browser = shutil.which('chromium') or shutil.which('google-chrome') or shutil.which('chromium-browser')
+    driver = shutil.which('chromedriver') or shutil.which('playwright')
+    return bool(browser and driver)
+
+
 def available_profiles(identity_id, sandbox, *, verify_allowed) -> list[RuntimeProfile]:
     nodes = tuple(item.label() for item in node_toolchains())
     pythons = python_versions()
     go = bool(shutil.which('go', path='/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin'))
+    browser = browser_runtime_validated()
     profiles = []
     if sandbox == 'workspace-write':
         profiles.append(RuntimeProfile(identity_id, 'workspace-write', nodes, fs_write=True, git_write=True,
-                                       test_exec=True, build_exec=True, python_versions=pythons, go_available=go))
+                                       test_exec=True, build_exec=True, browser_exec=browser,
+                                       python_versions=pythons, go_available=go))
     if verify_allowed or sandbox == 'workspace-write':
         profiles.append(RuntimeProfile(identity_id + ':verify', 'read-only', nodes, test_exec=True, build_exec=True,
-                                       python_versions=pythons, go_available=go))
+                                       browser_exec=browser, python_versions=pythons, go_available=go))
     profiles.append(RuntimeProfile(identity_id + ':read', 'read-only', nodes, test_exec=False, build_exec=False,
-                                   python_versions=pythons, go_available=go))
+                                   browser_exec=False, python_versions=pythons, go_available=go))
     return profiles
 
 
 def select_profile(requirements: Requirements, profiles: list[RuntimeProfile]) -> RuntimeProfile:
     """The least-privileged compatible profile, or BLOCKED_NO_COMPATIBLE_RUNTIME."""
     reasons = []
-    ordered = sorted(profiles, key=lambda p: (p.fs_write, p.build_exec, p.test_exec))
+    ordered = sorted(profiles, key=lambda p: (p.fs_write, p.browser_exec, p.build_exec, p.test_exec))
     for profile in ordered:
         installed = {(_parse_version(v) or (0,))[0] for v in profile.node_versions}
         missing = sorted(requirements.node_majors - installed)
@@ -350,6 +370,9 @@ def select_profile(requirements: Requirements, profiles: list[RuntimeProfile]) -
             continue
         if requirements.build_exec and not profile.build_exec:
             reasons.append(f'{profile.runtime_id}: no build execution')
+            continue
+        if requirements.browser_exec and not profile.browser_exec:
+            reasons.append(f'{profile.runtime_id}: missing browser_exec')
             continue
         if missing:
             reasons.append(f'{profile.runtime_id}: Node {"/".join(map(str, missing))} not installed')
