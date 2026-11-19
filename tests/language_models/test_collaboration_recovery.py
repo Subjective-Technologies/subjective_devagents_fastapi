@@ -100,9 +100,12 @@ def test_manager_dispatch_coder_dies_retry_preserves_worktree(system):
                                               'execution': s.execution})['dispatch']
     binding = ChannelCoordination.binding(s.journal.snapshot(s.channel), first)
     coder_a = ChannelSession(binding, 'ai_coder', '')
+    coder_a.delegation = dict(binding, owner_id='owner')
     coder_a.start(s.identity, '20261114000000', 'coder_agent')
     coder_a.tool('acquire', {'repository': str(s.repo), 'paths': ['.']})
     (s.repo / 'a.py').write_text('coder A unfinished\n')
+    coder_a.call('checkpoint', checkpoint={'phase': 'IMPLEMENTING', 'files_changed': ['a.py'],
+                                           'next_action': 'Finish the existing change in a.py'})
     # Preserve a real interrupted operation marker as well as uncommitted bytes.
     git_dir = Path(git(s.repo, 'rev-parse', '--absolute-git-dir'))
     (git_dir / 'CHERRY_PICK_HEAD').write_text(git(s.repo, 'rev-parse', 'HEAD'))
@@ -119,6 +122,11 @@ def test_manager_dispatch_coder_dies_retry_preserves_worktree(system):
     assert (s.repo / 'a.py').read_text() == 'coder B continued A\n'
     assert (git_dir / 'CHERRY_PICK_HEAD').exists()
     state = s.journal.snapshot(s.channel)
+    assert state['task']['workspace_identity']['path'] == str(s.repo.resolve())
+    stat = s.repo.stat()
+    assert state['task']['workspace_identity']['directory_id'] == f'{stat.st_dev}:{stat.st_ino}'
+    payload = s.database.query_one('SELECT payload FROM coordination_jobs WHERE dispatch_id=?', (successor['id'],))
+    assert 'Finish the existing change in a.py' in json.loads(payload['payload'])['prompt']
     assert state['dispatches'][first['id']]['status'] == 'ABANDONED'
     assert state['dispatches'][first['id']]['superseded_by'] == successor['id']
     inherited = [lease for lease in state['leases'].values() if lease.get('recovered_from')]

@@ -235,8 +235,8 @@ def test_tool_loop_limit_returns_a_structured_continuation_summary(bound, monkey
 def test_acceptance_done_latch_real_bug_end_to_end(system):
     """Coder -> Integration PASS -> Git push -> Release exact SHA live -> Manager DONE, browser unavailable.
 
-    Through the real DevAgents runtime and the real Chat journal/outbox: Manager ends DONE with an
-    optional confirmation, nothing runs after it, and a late duplicate PASS wakes nobody.
+    Through the DevAgents runtime and Chat outbox, Manager requests closure. The requester
+    supplies the missing functional evidence and closes the task.
     """
     s = system
     sha = '3ae003d259c1194c4256ed17a827111319567075'
@@ -250,7 +250,7 @@ def test_acceptance_done_latch_real_bug_end_to_end(system):
         s.export['files'].append({'path': f'agents/roles/{role}.md', 'content': 'Do your role.'})
     s.execution['manager_agent_id'] = 'ai_manager'
     answers = {
-        'ai_manager': ['@ai_coder fix the modal', '@ai_integration verify ' + sha, '@ai_git push ' + sha,
+        'ai_manager': ['@ai_coder fix the modal', '@ai_git push ' + sha,
                        '@ai_release verify production',
                        'Both fixes are live.\nDONE: production serves ' + sha[:7] + ' and the live bundle has the fix\n'
                        'OPTIONAL_USER_CONFIRMATION: Hard-refresh and confirm the interaction if you want.'],
@@ -267,7 +267,7 @@ def test_acceptance_done_latch_real_bug_end_to_end(system):
         def run(self, request, emit, cancelled):
             agent = request.coordination.actor
             turns.append(agent)
-            # A real executed check: the backend attests it as [RT:...successful=1] on the result.
+            # Tool telemetry is observable, while this scripted turn supplies no browser artifact.
             emit('tool_call', {'tool_call_id': 'c1', 'name': 'Bash', 'detail': 'npx playwright test'})
             emit('tool_result', {'tool_call_id': 'c1', 'name': 'Bash', 'ok': True, 'output_chars': 10})
             return ModelResult('completed', answers[agent].pop(0) if answers[agent] else 'UNEXPECTED TURN')
@@ -286,14 +286,19 @@ def test_acceptance_done_latch_real_bug_end_to_end(system):
             time.sleep(0.05)
     settle()
     task = s.journal.snapshot(s.channel)['task']
-    assert turns == ['ai_manager', 'ai_coder', 'ai_manager', 'ai_integration', 'ai_manager', 'ai_git', 'ai_manager',
-                     'ai_release', 'ai_manager']
-    assert task['status'] == 'DONE' and task['optional_user_confirmation'].startswith('Hard-refresh')
+    assert turns[:8] == ['ai_manager', 'ai_coder', 'ai_integration', 'ai_manager', 'ai_git', 'ai_manager',
+                         'ai_release', 'ai_manager']
+    assert set(turns[8:]) <= {'ai_manager'}
+    assert task['status'] != 'DONE' and task['acceptance_criteria'][0]['status'] != 'VERIFIED'
+    closed = s.journal.mutate(s.channel, 'owner', {'op': 'acceptance', 'acceptance_id': 'AC1',
+                              'status': 'VERIFIED', 'evidence': 'Requester checked modal placement'}, human=True)
+    assert closed['code'] == 'TASK_DONE_BY_REQUESTER'
+    count_at_close = len(turns)
     assert task['facts']['published_sha'] == [sha] and task['facts']['deployment_verified']
     # No further automatic orchestration: more ticks, a watchdog sweep, nothing runs.
     s.journal.sweep()
     settle(3)
-    assert len(turns) == 9 and 'UNEXPECTED TURN' not in str(turns)
+    assert len(turns) == count_at_close
     bodies = [m['body'] for m in s.database.query_all('SELECT body FROM messages WHERE conversation_id=?', (s.channel,))]
     assert not any('NEEDS INPUT' in body for body in bodies)
 

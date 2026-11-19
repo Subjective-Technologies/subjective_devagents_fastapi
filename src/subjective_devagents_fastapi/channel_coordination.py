@@ -11,6 +11,7 @@ import os
 import posixpath
 import re
 import shlex
+import socket
 import subprocess
 from pathlib import Path
 import time
@@ -592,8 +593,14 @@ class ChannelSession:
             raise ModelError('coordination_disabled', 'Channel coordination is disabled')
         if snapshot['workflow_id'] != self.binding['workflow_id']:
             raise ModelError('workflow_identity_conflict', 'Channel workflow identity changed')
+        workspace = {}
+        if self.delegation:
+            directory = Path(identity.workspace).resolve()
+            stat = directory.stat()
+            workspace = {'workspace_identity': {'host': socket.gethostname(), 'path': str(directory),
+                                                'directory_id': f'{stat.st_dev}:{stat.st_ino}'}}
         started = self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor,
-                            heartbeat_interval=self.heartbeat_interval,
+                            heartbeat_interval=self.heartbeat_interval, **workspace,
                             **(getattr(self, 'workflow_meta', None) or {}),
                             **({'runtime_profile': self.runtime_profile} if self.runtime_profile else {}))
         self.start_acknowledged = True

@@ -37,6 +37,9 @@ def fetch_assignment(hint):
             response = client.post(base + route, headers={'X-Workflow-Service-Token': token})
         payload = response.json()
         if response.status_code != 200 or not payload.get('ok'):
+            error = payload.get('error')
+            if isinstance(error, dict) and error.get('code') in {'WORKSPACE_CHANGED', 'STAGE_DEPENDENCIES'}:
+                raise ModelError(error['code'], str(error.get('message') or error['code'])[:400])
             raise ModelError('runtime_assignment_unavailable', 'Approved runtime assignment is unavailable')
         job = payload['data']
     except (httpx.HTTPError, ValueError, KeyError, TypeError):
@@ -87,8 +90,15 @@ def _execute_approved(service, job):
             raise ModelError('runtime_capacity', 'The runtime is draining for a restart; this dispatch waits until it is back'
                              if capacity.get('draining') else f"All {capacity.get('workers')} runtime workers are busy")
         # Profiles can select a configured provider/model, never arbitrary workspaces/accounts/URLs.
+        workspace = service._default_workspace(profile['provider'])
+        if job.get('workspace'):
+            base = Path(workspace).resolve()
+            pinned = Path(job['workspace']).resolve()
+            if not pinned.is_relative_to(base) or not pinned.is_dir():
+                raise ModelError('WORKSPACE_CHANGED', 'Original task workspace is unavailable under the authorized root')
+            workspace = str(pinned)
         identity = service.backend.identity({'provider': profile['provider'], 'model': profile.get('model', ''),
-            'workspace': service._default_workspace(profile['provider'])}, execution_required=True)
+            'workspace': workspace}, execution_required=True)
         if identity.strategy != 'api_agent' or identity.ssh_host:
             raise ModelError('coordinated_runtime_required', 'Collaboration requires a local runtime with per-tool fencing')
         assignment = execution.get('runtime_assignment') or execution.get('assignment_brief') or execution['prompt']
