@@ -316,21 +316,24 @@ _PATHLIKE = re.compile(r'(?<![\w@:/.-])((?:/subjective/)?(?:clients|services|lib
 def requirements_for(assignment, workspace=None, *, verifier=False, stage=None,
                      capabilities=None) -> Requirements:
     """Use the approved stage contract, or infer direct actions from an old assignment."""
+    text = str(assignment or '')[-6000:]
+    directives = '\n'.join(part.strip() for part in re.split(r'[.!?](?=\s|$)|\n', text)
+                           if not re.search(r'(?i)\b(?:later|eventually|will|before DONE)\b', part))
     if capabilities is not None:
         if not isinstance(capabilities, list) or any(not isinstance(name, str) for name in capabilities):
             raise ModelError('BLOCKED_NO_COMPATIBLE_RUNTIME', 'Invalid approved runtime capabilities')
         required = frozenset(CAPABILITY_ALIASES.get(name, name) for name in capabilities)
         if not required <= RUNTIME_CAPABILITIES:
             raise ModelError('BLOCKED_NO_COMPATIBLE_RUNTIME', 'Unknown approved runtime capability')
-        return Requirements(stage=stage, capabilities=required, write='fs_write' in required,
-                            test_exec='test_exec' in required, build_exec='build_exec' in required,
-                            browser_exec='browser_exec' in required)
-    text = str(assignment or '')[-6000:]
-    directives = '\n'.join(part.strip() for part in re.split(r'[.!?](?=\s|$)|\n', text)
-                           if not re.search(r'(?i)\b(?:later|eventually|will|before DONE)\b', part))
-    result = Requirements(test_exec=bool(_TEST.search(directives)) or verifier,
-                          build_exec=bool(_BUILD.search(directives)) or verifier,
-                          browser_exec=bool(_BROWSER.search(directives)), write=bool(_WRITE.match(directives)))
+        result = Requirements(stage=stage, capabilities=required, write='fs_write' in required,
+                              test_exec='test_exec' in required, build_exec='build_exec' in required,
+                              browser_exec='browser_exec' in required)
+        if not (result.test_exec or result.build_exec):
+            return result
+    else:
+        result = Requirements(test_exec=bool(_TEST.search(directives)) or verifier,
+                              build_exec=bool(_BUILD.search(directives)) or verifier,
+                              browser_exec=bool(_BROWSER.search(directives)), write=bool(_WRITE.match(directives)))
     for match in _NODE.finditer(directives):
         major = int(match.group(1))
         if 10 <= major <= 60:
