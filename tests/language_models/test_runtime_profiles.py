@@ -224,3 +224,41 @@ def test_select_runtime_gives_integration_the_verify_profile(tmp_path, toolchain
     with pytest.raises(ModelError) as error:
         select_runtime({'mode': 'read', 'role_file': 'agents/roles/integration_agent.md'}, identity, 'run tests on Node 26')
     assert error.value.code == 'BLOCKED_NO_COMPATIBLE_RUNTIME'
+
+
+@pytest.mark.parametrize(('stage', 'assignment', 'needs', 'suffix'), [
+    ('planning', 'Plan XMI editing. The feature must pass end-to-end browser verification before DONE.',
+     ['fs_read'], ':read'),
+    ('implementation', 'Implement the XMI Code view. Later the verifier will run Playwright end-to-end tests.',
+     ['fs_read', 'fs_write'], ''),
+    ('verification', 'Run unit and build checks without running the browser suite.',
+     ['fs_read', 'test_exec', 'build_exec'], ':verify'),
+])
+def test_approved_stage_selects_least_privileged_profile(tmp_path, monkeypatch, stage, assignment, needs, suffix):
+    from subjective_devagents_fastapi.collaboration import select_runtime
+    monkeypatch.delenv('SUBJECTIVE_BROWSER_EXEC', raising=False)
+    identity = Identity('runtime', 'codex', workspace=str(tmp_path), sandbox='workspace-write')
+    agent = {'mode': 'write', 'role_file': 'agents/roles/constellation.md', 'display_name': 'January'}
+    selected, required = select_runtime(agent, identity, assignment, stage=stage, capabilities=needs,
+                                        grants=['fs_read', 'fs_write', 'test_exec', 'build_exec', 'browser_exec'])
+    assert selected.runtime_id == 'runtime' + suffix
+    assert required.summary()['required_runtime_capabilities'] == sorted(needs)
+    assert not selected.browser_exec
+
+
+def test_verified_browser_and_write_permissions_are_independent(tmp_path, monkeypatch):
+    from subjective_devagents_fastapi.collaboration import select_runtime
+    identity = Identity('runtime', 'codex', workspace=str(tmp_path), sandbox='workspace-write')
+    agent = {'mode': 'read', 'role_file': 'agents/roles/november.md'}
+    needs = ['fs_read', 'test_exec', 'browser_exec']
+    monkeypatch.setattr(rp, 'browser_runtime_validated', lambda: False)
+    with pytest.raises(ModelError, match='missing browser_exec'):
+        select_runtime(agent, identity, 'Verify XMI', stage='functional_verification', capabilities=needs, grants=needs)
+    monkeypatch.setattr(rp, 'browser_runtime_validated', lambda: True)
+    selected, _ = select_runtime(agent, identity, 'Verify XMI', stage='functional_verification', capabilities=needs, grants=needs)
+    assert selected.sandbox == 'read-only' and selected.browser_exec and not selected.fs_write
+    assert not selected.build_exec
+    with pytest.raises(ModelError, match='not authorized for browser_exec'):
+        select_runtime(agent, identity, '', stage='functional_verification', capabilities=needs, grants=needs[:-1])
+    with pytest.raises(ModelError, match='no write access'):
+        select_runtime(agent, identity, '', stage='implementation', capabilities=['fs_write'], grants=['fs_write'])

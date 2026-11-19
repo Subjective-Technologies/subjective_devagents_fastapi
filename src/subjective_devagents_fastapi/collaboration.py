@@ -91,8 +91,12 @@ def _execute_approved(service, job):
             'workspace': service._default_workspace(profile['provider'])}, execution_required=True)
         if identity.strategy != 'api_agent' or identity.ssh_host:
             raise ModelError('coordinated_runtime_required', 'Collaboration requires a local runtime with per-tool fencing')
-        selected, requirements = select_runtime(profile, identity, execution['prompt'])
-        if profile.get('mode') == 'read':
+        assignment = execution.get('runtime_assignment') or execution.get('assignment_brief') or execution['prompt']
+        selected, requirements = select_runtime(
+            profile, identity, assignment, stage=execution.get('authorized_stage'),
+            capabilities=execution.get('required_runtime_capabilities'),
+            grants=execution.get('authorized_runtime_capabilities'))
+        if selected.sandbox != identity.sandbox:
             identifier = 'readonly-' + hashlib.sha256(identity.id.encode()).hexdigest()
             identity = replace(identity, id=identifier, sandbox='read-only')
             try:
@@ -104,10 +108,8 @@ def _execute_approved(service, job):
         channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
         channel.verification = selected.sandbox == 'read-only' and (selected.test_exec or selected.build_exec)
         channel.assignment = execution['prompt'][-6000:]
-        channel.runtime_profile = {'runtime_id': selected.runtime_id, 'sandbox': selected.sandbox,
-                                   'test_exec': selected.test_exec, 'build_exec': selected.build_exec,
-                                   'browser_exec': selected.browser_exec, 'fs_write': selected.fs_write,
-                                   'node_versions': list(selected.node_versions),
+        channel.runtime_profile = {**selected.as_dict(), 'node_versions': list(selected.node_versions),
+                                   'python_versions': list(selected.python_versions),
                                    'requirements': requirements.summary()}
         # Never pinned: every dispatch loads the company's CURRENT published workflow. The
         # channel's version is only the floor (the newest one already proven); an older load is
@@ -137,21 +139,23 @@ def _execute_approved(service, job):
         return {'ok': True, 'turn_id': turn['id']}
 
 
-def select_runtime(profile, identity, prompt):
-    """Choose the runtime profile the assigned action needs, before any model call.
-
-    Requirements come from the assignment, not the agent filename. A browser assignment
-    with no validated browser/driver raises BLOCKED_NO_COMPATIBLE_RUNTIME here, before
-    any model request. Node versions the assignment or the named project pins must be
-    installed.
-    """
+def select_runtime(profile, identity, assignment, *, stage=None, capabilities=None, grants=None):
+    """Match stage requirements against authorized host profiles before any model call."""
     from .runtime_profiles import available_profiles, requirements_for, select_profile
-    read = profile.get('mode') == 'read'
-    requirements = requirements_for(prompt, None if identity.ssh_host else identity.workspace, verifier=False)
-    if not read:
-        requirements.write = True   # a writer's profile also carries test and build execution
-    profiles = available_profiles(identity.id, 'read-only' if read else 'workspace-write', verify_allowed=read)
-    return select_profile(requirements, profiles), requirements
+    sandbox = 'workspace-write' if profile.get('mode') == 'write' and identity.sandbox == 'workspace-write' else 'read-only'
+    requirements = requirements_for(assignment, None if identity.ssh_host else identity.workspace,
+                                    stage=stage, capabilities=capabilities)
+    profiles = available_profiles(identity.id, sandbox, verify_allowed=True)
+    if identity.allowed_tools:
+        tools = set(identity.allowed_tools)
+        bash = 'Bash' in tools
+        profiles = [replace(candidate, fs_read=bash or bool(tools & {'Read', 'Grep', 'Glob'}),
+                            fs_write=candidate.fs_write and (bash or bool(tools & {'Write', 'Edit'})),
+                            git_read=candidate.git_read and bash, git_write=candidate.git_write and bash,
+                            shell_exec=candidate.shell_exec and bash, test_exec=candidate.test_exec and bash,
+                            build_exec=candidate.build_exec and bash, browser_exec=candidate.browser_exec and bash)
+                    for candidate in profiles]
+    return select_profile(requirements, profiles, grants=grants), requirements
 
 
 def replay_completions(store):

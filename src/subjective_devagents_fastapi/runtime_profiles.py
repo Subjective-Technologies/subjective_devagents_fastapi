@@ -7,7 +7,7 @@ project pins, not the host default. This module
 * discovers installed toolchains (Node from nvm and system paths, Python, Go),
 * resolves a project's Node pin from .nvmrc, .node-version, package.json engines and
   CI workflow node-version (in that order),
-* derives requirements from the assignment text,
+* uses approved stage requirements, with a fallback for older assignments,
 * selects a compatible profile, or reports BLOCKED_NO_COMPATIBLE_RUNTIME at once,
 * classifies verification commands (tests, type checks, builds) that a read-only
   verifier may run without source-editing tools.
@@ -24,7 +24,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from .language_models.contracts import ModelError
@@ -51,6 +51,8 @@ class NodeToolchain:
 
 @dataclass
 class Requirements:
+    stage: str | None = None
+    capabilities: frozenset[str] = field(default_factory=lambda: frozenset({'fs_read'}))
     test_exec: bool = False
     build_exec: bool = False
     browser_exec: bool = False
@@ -59,9 +61,16 @@ class Requirements:
     node_sources: dict[int, str] = field(default_factory=dict)
 
     def summary(self) -> dict:
-        return {'test_exec': self.test_exec, 'build_exec': self.build_exec, 'browser_exec': self.browser_exec,
+        return {'stage': self.stage, 'required_runtime_capabilities': sorted(self.runtime_capabilities()),
+                'test_exec': self.test_exec, 'build_exec': self.build_exec, 'browser_exec': self.browser_exec,
                 'write': self.write, 'node_majors': sorted(self.node_majors),
                 'node_sources': {str(k): v for k, v in self.node_sources.items()}}
+
+    def runtime_capabilities(self) -> frozenset[str]:
+        return self.capabilities | {name for name, needed in (
+            ('fs_write', self.write), ('test_exec', self.test_exec), ('build_exec', self.build_exec),
+            ('browser_exec', self.browser_exec),
+        ) if needed}
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,13 @@ class RuntimeProfile:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+CAPABILITY_ALIASES = {'shell': 'shell_exec', 'filesystem': 'fs_read'}
+RUNTIME_CAPABILITIES = frozenset({
+    'shell_exec', 'fs_read', 'fs_write', 'git_read', 'git_write', 'test_exec',
+    'build_exec', 'browser_exec', 'network_access',
+})
 
 
 def _parse_version(text):
@@ -280,12 +296,16 @@ def node_path_for(workdir, workspace, base_path):
 
 # ---- requirements ---------------------------------------------------------------------
 
-_TEST = re.compile(r'(?i)\b(?:run(?:ning)?\s+(?:the\s+)?(?:\w+\s+){0,3}tests?|test\s+suite|pytest|vitest|jest|'
-                   r'npm\s+(?:run\s+)?test|go\s+test|cargo\s+test|playwright)\b')
-_BROWSER = re.compile(r'(?i)\b(?:browsers?|playwright|selenium|cypress|puppeteer|end[- ]to[- ]end|\be2e\b|'
-                      r'click(?:ing)?\s+(?:the\s+)?(?:button|link|ui))\b')
+_TEST = re.compile(r'(?i)\b(?:run(?:ning)?\s+(?:the\s+)?(?:\w+\s+){0,3}tests?|pytest|vitest|jest|'
+                   r'npm\s+(?:run\s+)?test|go\s+test|cargo\s+test|npx\s+playwright\s+test)\b')
+_BROWSER = re.compile(r'(?i)\b(?:(?:run|execute|exercise|verify|test|open|launch)\s+'
+                      r'[^.!?\n]{0,55}\b(?:browsers?|playwright|selenium|cypress|puppeteer)|'
+                      r'click\s+(?:the\s+)?(?:button|link|ui)|npx\s+playwright\s+test)\b')
+_WRITE = re.compile(r'(?i)^(?:please\s+)?(?:implement|fix|patch|edit|refactor|add|update|remove|create|write)\b')
 _BUILD = re.compile(r'(?i)\b(?:run(?:ning)?\s+(?:the\s+)?(?:\w+\s+){0,2}build|npm\s+run\s+build|tsc\b|typecheck|'
                     r'type[- ]check|vite\s+build|go\s+build|cargo\s+build|compile)')
+_BROWSER_TOOL = re.compile(r'(?i)(?:^|[ /])(?:playwright|selenium|cypress|puppeteer|chromedriver|'
+                           r'chromium(?:-browser)?|google-chrome)(?=[\s;|&]|$)')
 # Only an instruction names a requirement ("run Node 22 tests", "on Node 22", "requires
 # Node 24"); a mention in quoted history ("Integration got Node 18") is not one.
 _NODE = re.compile(r'(?i)\b(?:on|with|under|using|use|requires?|run|pinned\s+to|needs?)\s+'
@@ -293,12 +313,25 @@ _NODE = re.compile(r'(?i)\b(?:on|with|under|using|use|requires?|run|pinned\s+to|
 _PATHLIKE = re.compile(r'(?<![\w@:/.-])((?:/subjective/)?(?:clients|services|libs|apps|tools|websites|worktwins)/[\w.-]+(?:/[\w.-]+)?)')
 
 
-def requirements_for(assignment, workspace=None, *, verifier=False) -> Requirements:
-    """Requirements of the latest instruction. Older history is not an assignment."""
+def requirements_for(assignment, workspace=None, *, verifier=False, stage=None,
+                     capabilities=None) -> Requirements:
+    """Use the approved stage contract, or infer direct actions from an old assignment."""
+    if capabilities is not None:
+        if not isinstance(capabilities, list) or any(not isinstance(name, str) for name in capabilities):
+            raise ModelError('BLOCKED_NO_COMPATIBLE_RUNTIME', 'Invalid approved runtime capabilities')
+        required = frozenset(CAPABILITY_ALIASES.get(name, name) for name in capabilities)
+        if not required <= RUNTIME_CAPABILITIES:
+            raise ModelError('BLOCKED_NO_COMPATIBLE_RUNTIME', 'Unknown approved runtime capability')
+        return Requirements(stage=stage, capabilities=required, write='fs_write' in required,
+                            test_exec='test_exec' in required, build_exec='build_exec' in required,
+                            browser_exec='browser_exec' in required)
     text = str(assignment or '')[-6000:]
-    result = Requirements(test_exec=bool(_TEST.search(text)) or verifier, build_exec=bool(_BUILD.search(text)) or verifier,
-                          browser_exec=bool(_BROWSER.search(text)))
-    for match in _NODE.finditer(text):
+    directives = '\n'.join(part.strip() for part in re.split(r'[.!?](?=\s|$)|\n', text)
+                           if not re.search(r'(?i)\b(?:later|eventually|will|before DONE)\b', part))
+    result = Requirements(test_exec=bool(_TEST.search(directives)) or verifier,
+                          build_exec=bool(_BUILD.search(directives)) or verifier,
+                          browser_exec=bool(_BROWSER.search(directives)), write=bool(_WRITE.match(directives)))
+    for match in _NODE.finditer(directives):
         major = int(match.group(1))
         if 10 <= major <= 60:
             result.node_majors.add(major)
@@ -345,34 +378,40 @@ def available_profiles(identity_id, sandbox, *, verify_allowed) -> list[RuntimeP
     profiles = []
     if sandbox == 'workspace-write':
         profiles.append(RuntimeProfile(identity_id, 'workspace-write', nodes, fs_write=True, git_write=True,
-                                       test_exec=True, build_exec=True, browser_exec=browser,
+                                       test_exec=True, build_exec=True,
                                        python_versions=pythons, go_available=go))
     if verify_allowed or sandbox == 'workspace-write':
         profiles.append(RuntimeProfile(identity_id + ':verify', 'read-only', nodes, test_exec=True, build_exec=True,
-                                       browser_exec=browser, python_versions=pythons, go_available=go))
+                                       python_versions=pythons, go_available=go))
+    if browser:
+        profiles.extend(replace(profile, runtime_id=profile.runtime_id + ':browser', browser_exec=True)
+                        for profile in list(profiles))
     profiles.append(RuntimeProfile(identity_id + ':read', 'read-only', nodes, test_exec=False, build_exec=False,
                                    browser_exec=False, python_versions=pythons, go_available=go))
     return profiles
 
 
-def select_profile(requirements: Requirements, profiles: list[RuntimeProfile]) -> RuntimeProfile:
+def select_profile(requirements: Requirements, profiles: list[RuntimeProfile], *, grants=None) -> RuntimeProfile:
     """The least-privileged compatible profile, or BLOCKED_NO_COMPATIBLE_RUNTIME."""
     reasons = []
-    ordered = sorted(profiles, key=lambda p: (p.fs_write, p.browser_exec, p.build_exec, p.test_exec))
+    required = requirements.runtime_capabilities()
+    if grants is not None:
+        permitted = {CAPABILITY_ALIASES.get(name, name) for name in grants}
+        missing = required - permitted
+        if missing:
+            raise ModelError('BLOCKED_NO_COMPATIBLE_RUNTIME', 'Agent is not authorized for ' + ', '.join(sorted(missing)))
+        profiles = [RuntimeProfile(**{**profile.as_dict(), **{
+            name: False for name in RUNTIME_CAPABILITIES - permitted
+        }}) for profile in profiles]
+    ordered = sorted(profiles, key=lambda p: (p.sandbox == 'workspace-write', p.browser_exec, p.build_exec, p.test_exec))
     for profile in ordered:
         installed = {(_parse_version(v) or (0,))[0] for v in profile.node_versions}
         missing = sorted(requirements.node_majors - installed)
-        if requirements.write and not profile.fs_write:
-            reasons.append(f'{profile.runtime_id}: no write access')
-            continue
-        if requirements.test_exec and not profile.test_exec:
-            reasons.append(f'{profile.runtime_id}: no test execution')
-            continue
-        if requirements.build_exec and not profile.build_exec:
-            reasons.append(f'{profile.runtime_id}: no build execution')
-            continue
-        if requirements.browser_exec and not profile.browser_exec:
-            reasons.append(f'{profile.runtime_id}: missing browser_exec')
+        unavailable = [name for name in sorted(required) if not getattr(profile, name)]
+        if unavailable:
+            reasons.append(f'{profile.runtime_id}: ' + ', '.join(
+                {'fs_write': 'no write access', 'test_exec': 'no test execution', 'build_exec': 'no build execution'}
+                .get(name, 'missing ' + name) for name in unavailable))
             continue
         if missing:
             reasons.append(f'{profile.runtime_id}: Node {"/".join(map(str, missing))} not installed')
@@ -469,3 +508,11 @@ def is_verification_command(command) -> bool:
             return False
         saw_command = saw_command or kind == 'command'
     return saw_command
+
+
+def verification_capability(command):
+    if _BROWSER_TOOL.search(command):
+        return 'browser_exec'
+    if is_verification_command(command):
+        return 'build_exec' if _BUILD.search(command) else 'test_exec'
+    return None

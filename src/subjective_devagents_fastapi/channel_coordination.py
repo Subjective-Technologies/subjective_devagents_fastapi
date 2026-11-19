@@ -800,10 +800,23 @@ class ChannelSession:
         if name not in {'Bash', 'Write', 'Edit'}:
             return
         if name == 'Bash':
-            self.check_publication(str(arguments.get('command', '')))
+            command = str(arguments.get('command', ''))
+            profile = self.runtime_profile or {}
+            if profile:
+                from .runtime_profiles import verification_capability
+                for segment in _segments(command):
+                    capability = verification_capability(segment)
+                    if capability and not profile.get(capability, True):
+                        raise ModelError('BLOCKED_EXECUTION_CAPABILITY', f'This dispatch has no {capability}')
+                    if not capability and not profile.get('shell_exec', True):
+                        raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'This dispatch has no general shell execution')
+                from .publication_scope import COMMIT_MAKERS, PUSH
+                if not profile.get('git_write', True) and (COMMIT_MAKERS.search(command) or PUSH.search(command)):
+                    raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'This dispatch has no git_write')
+            self.check_publication(command)
             if self.identity:
                 from .deploy_methods import refuse_local_deploy
-                folder = self._command_dir(str(arguments.get('command', '')))
+                folder = self._command_dir(command)
                 if folder:
                     refuse_local_deploy(str(arguments.get('command', '')), folder)
         if self.identity.sandbox != 'workspace-write':

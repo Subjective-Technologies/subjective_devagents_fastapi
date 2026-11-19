@@ -1120,7 +1120,9 @@ class ApiAgent(ModelStrategy):
             return ModelResult("failed", error_code="authentication_required")
         tools = agent_tool_set(identity)
         coordination = request.coordination
-        scoping = getattr(coordination, "agent_role", None) == "coder_agent"
+        runtime_profile = getattr(coordination, "runtime_profile", None) or {}
+        stage = (runtime_profile.get("requirements") or {}).get("stage")
+        scoping = stage == "implementation" if stage else getattr(coordination, "agent_role", None) == "coder_agent"
         if coordination and scoping and identity.sandbox == "workspace-write":
             # Ordinary authorized edits acquire their own lease inside guard(). The model
             # does not spend a round calling Coordination acquire first.
@@ -1132,6 +1134,17 @@ class ApiAgent(ModelStrategy):
             if identity.sandbox == 'read-only' and (not identity.allowed_tools or 'Bash' in identity.allowed_tools):
                 # ChannelSession.guard classifies these commands; Write/Edit stay absent.
                 tools['Bash'] = AGENT_TOOLS['Bash']
+            if runtime_profile:
+                if not runtime_profile.get('fs_read', True):
+                    for name in ('Read', 'Grep', 'Glob'):
+                        tools.pop(name, None)
+                if not runtime_profile.get('fs_write', identity.sandbox == 'workspace-write'):
+                    tools.pop('Write', None)
+                    tools.pop('Edit', None)
+                if not runtime_profile.get('shell_exec', True) and not any(
+                    runtime_profile.get(key) for key in ('test_exec', 'build_exec', 'browser_exec')
+                ):
+                    tools.pop('Bash', None)
             original_cancelled = cancelled
             cancelled = lambda: original_cancelled() or coordination.revoked()
         emit("runtime", {
