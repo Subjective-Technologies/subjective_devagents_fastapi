@@ -24,6 +24,17 @@ def inherited_fds():
     return tuple(getattr(_local, 'fds', ()))
 
 
+def fence_key(workspace):
+    """One fence per checkout. The shared base keeps its historical name; each task folder
+    (TAGGY-3532) gets its own, so tasks in different folders never wait on each other."""
+    from .task_workspace import task_root
+    roots = task_root(workspace) if workspace else None
+    if roots is None:
+        return 'local-mutations'
+    import hashlib
+    return 'local-mutations-' + hashlib.sha256(str(roots[1]).encode()).hexdigest()[:16]
+
+
 def _start(pid):
     try:
         # comm can contain spaces and parentheses; fields after its final ')' are stable.
@@ -66,7 +77,7 @@ def mutation_fence(session):
     if session.fence_root:
         folder = Path(session.fence_root)
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = 'local-mutations'
+    key = fence_key(session.identity.workspace)
     metadata = folder / (key + '.json')
     descriptor = os.open(folder / (key + '.lock'), os.O_CREAT | os.O_RDWR, 0o600)
     try:

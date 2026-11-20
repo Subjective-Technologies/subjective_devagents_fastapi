@@ -97,10 +97,26 @@ def _execute_approved(service, job):
             if not pinned.is_relative_to(base) or not pinned.is_dir():
                 raise ModelError('WORKSPACE_CHANGED', 'Original task workspace is unavailable under the authorized root')
             workspace = str(pinned)
+        base_workspace = workspace
+        from . import task_workspace
+        if task_workspace.task_root(workspace):
+            # A task already pinned to its folder: resolve the account on the shared base.
+            base_workspace = str(task_workspace.task_root(workspace)[0])
         identity = service.backend.identity({'provider': profile['provider'], 'model': profile.get('model', ''),
-            'workspace': workspace}, execution_required=True)
+            'workspace': base_workspace}, execution_required=True)
         if identity.strategy != 'api_agent' or identity.ssh_host:
             raise ModelError('coordinated_runtime_required', 'Collaboration requires a local runtime with per-tool fencing')
+        if not job.get('workspace') and task_workspace.enabled():
+            # A new task gets its own folder; start() records it and later dispatches are pinned there.
+            workspace = str(task_workspace.create(base_workspace, task_workspace.slug(
+                binding, str(execution.get('prompt') or ''))))
+        if workspace != identity.workspace:
+            identifier = 'task-' + hashlib.sha256(f'{identity.id}\x1f{workspace}'.encode()).hexdigest()[:40]
+            identity = replace(identity, id=identifier, workspace=workspace)
+            try:
+                model.identities.register_runtime(identity)
+            except ValueError:
+                raise ModelError('invalid_runtime_identity', 'Task workspace identity is invalid') from None
         assignment = execution.get('runtime_assignment') or execution.get('assignment_brief') or execution['prompt']
         selected, requirements = select_runtime(
             profile, identity, assignment, stage=execution.get('authorized_stage'),

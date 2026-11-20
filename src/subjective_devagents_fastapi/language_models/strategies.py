@@ -777,6 +777,16 @@ def agent_system_prompt(identity) -> str:
     if identity.sandbox != "workspace-write":
         lines.append("This session is read-only: Bash, Write and Edit are unavailable.")
     elif not identity.ssh_host:
+        from ..task_workspace import branch_for, task_root
+        roots = task_root(identity.workspace)
+        if roots:
+            lines.append(
+                f"This task has its own folder: {identity.workspace}. Other tasks cannot see or change it. "
+                f"Work only here, never in {roots[0]} directly. A nested repository in this folder is "
+                f"created as a git worktree on branch {branch_for(roots[1])} the first time a tool names a "
+                "path in it. Install dependencies there if a build needs them (node_modules is linked "
+                "from the shared checkout when it exists). Commit on that branch; publishing merges it."
+            )
         from ..channel_coordination import lease_roots
         extra = [str(root) for root in lease_roots(identity)[1:]]
         if extra:
@@ -872,7 +882,11 @@ def _unified_diff(path: str, before: str, after: str) -> str:
 # since then, committed or not, becomes a file_diff like the ones Write and Edit emit.
 _SNAPSHOT_SCRIPT = r"""
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-{ printf '%s\n' "$top"; git -C "$top" submodule foreach --recursive --quiet 'printf "%s\n" "$toplevel/$sm_path"' 2>/dev/null; } |
+{ printf '%s\n' "$top"; git -C "$top" submodule foreach --recursive --quiet 'printf "%s\n" "$toplevel/$sm_path"' 2>/dev/null
+  case "$top" in */.worktrees/*)
+    # Task folder: its nested repositories are worktrees, not initialized submodules.
+    find "$top" -mindepth 2 -maxdepth 6 -name node_modules -prune -o -name .git -print 2>/dev/null | sed 's#/\.git$##';;
+  esac; } | awk '!seen[$0]++' |
 while IFS= read -r repo; do
   head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || continue
   printf 'R\t%s\t%s\n' "$repo" "$head"
@@ -1458,6 +1472,20 @@ class ApiAgent(ModelStrategy):
             return "Error: tool arguments were not valid JSON."
         if name not in tools:
             return f"Error: tool {name!r} is not permitted in this session."
+        if not fenced and not identity.ssh_host and name != "AskUser":
+            # Task folder (TAGGY-3532): a nested repository appears the first time a tool
+            # names a path in it (or a lease names it), before the guard looks for its Git top level.
+            from .. import task_workspace
+            if task_workspace.task_root(identity.workspace):
+                data = arguments.get("data") if isinstance(arguments.get("data"), dict) else {}
+                targets = ([str(data["repository"])] if name == "Coordination" and data.get("repository") else []) \
+                    if name == "Coordination" else task_workspace.tool_targets(identity.workspace, name, arguments)
+                try:
+                    for target in targets:
+                        for created in task_workspace.materialize(identity.workspace, target):
+                            emit("activity", {"text": f"Created task worktree {created}"})
+                except ModelError as error:
+                    return f"Error: {error.code}: {error}"
         from ..channel_coordination import shell_effect
         if coordination and identity.sandbox == 'workspace-write' and not fenced and (name in {"Write", "Edit"} or
                 (name == "Bash" and shell_effect(str(arguments.get("command", ""))) != "READ_ONLY")):
