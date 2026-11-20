@@ -48,7 +48,7 @@ def _directory(prefix, workdir):
     return folder
 
 
-def push_targets(command, workdir):
+def push_targets(command, workdir, *, strict=False):
     """[(repo_dir, remote, src, dst)] for each ``git push`` in a shell command."""
     targets = []
     for match in PUSH.finditer(command or ''):
@@ -57,6 +57,11 @@ def push_targets(command, workdir):
             tokens = shlex.split(match.group(2))
         except ValueError:
             raise ModelError('PUBLICATION_SCOPE_UNVERIFIED', 'git push arguments are not literal') from None
+        if strict and (len(tokens) != 2 or not re.fullmatch(r'[A-Za-z0-9_.-]+', tokens[0])
+                       or not re.fullmatch(r'[A-Za-z0-9_./-]+:refs/heads/[A-Za-z0-9_./-]+', tokens[1])
+                       or match.group(1) and re.search(r'\s-c\s', match.group(1))):
+            raise ModelError('PUBLICATION_SCOPE_UNVERIFIED',
+                             'Push a single explicit source to a named remote branch: git push origin HEAD:refs/heads/branch')
         positional, skip = [], False
         for token in tokens:
             if skip:
@@ -86,22 +91,52 @@ def push_targets(command, workdir):
     return targets
 
 
-def unpublished(folder, remote, src, dst):
-    """Commits (sha, subject) the push would publish, oldest first; None when it cannot tell."""
-    candidate = git(folder, 'rev-parse', '--verify', '-q', src + '^{commit}')
-    base = git(folder, 'rev-parse', '--verify', '-q', f'refs/remotes/{remote}/{dst}')
-    if not base:
-        # A new remote branch: compare with the remote's default branch.
-        base = git(folder, 'rev-parse', '--verify', '-q', f'refs/remotes/{remote}/HEAD')
-    if not candidate or not base:
+def unpublished(folder, remote, src, dst, *, runner=None):
+    """Commits the push would publish. The direct path uses the fenced Git runner."""
+    query = runner or git
+    candidate = query(folder, 'rev-parse', '--verify', '-q', src + '^{commit}')
+    if not candidate:
         return None
-    listing = git(folder, 'log', '--no-merges', '--reverse', f'--max-count={MAX_RANGE}', '--format=%H%x09%s',
-                  f'{base}..{candidate}')
+    if runner:
+        # Check the actual destination in the same identity that will push.
+        base = remote_head(folder, remote, dst, runner)
+        if base == '':
+            output = runner(folder, 'ls-remote', remote, 'HEAD') or ''
+            sha, _, ref = output.partition('\t')
+            base = sha if ref == 'HEAD' and re.fullmatch(r'[0-9a-f]{40,64}', sha) else None
+        if not base or query(folder, 'merge-base', '--is-ancestor', base, candidate) is None:
+            return None
+    else:
+        base = (git(folder, 'rev-parse', '--verify', '-q', f'refs/remotes/{remote}/{dst}')
+                or git(folder, 'rev-parse', '--verify', '-q', f'refs/remotes/{remote}/HEAD'))
+        if not base:
+            return None
+    flags = () if runner else ('--no-merges',)
+    limit = MAX_RANGE + 1 if runner else MAX_RANGE
+    listing = query(folder, 'log', *flags, '--reverse', f'--max-count={limit}', '--format=%H%x09%s',
+                    f'{base}..{candidate}')
     if listing is None:
         return None
     rows = [line.split('\t', 1) for line in listing.splitlines() if line.strip()]
+    if len(rows) > MAX_RANGE:
+        return None
     return {'candidate': candidate, 'base': base,
             'commits': [(row[0], row[1] if len(row) > 1 else '') for row in rows]}
+
+
+def remote_head(folder, remote, dst, runner):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', remote) or remote.startswith('-'):
+        return None
+    ref = 'refs/heads/' + dst
+    fetch_urls = (runner(folder, 'remote', 'get-url', '--all', remote) or '').splitlines()
+    push_urls = (runner(folder, 'remote', 'get-url', '--push', '--all', remote) or '').splitlines()
+    if len(fetch_urls) != 1 or fetch_urls != push_urls or not runner(folder, 'check-ref-format', '--normalize', ref):
+        return None
+    response = runner(folder, 'ls-remote', '--refs', remote, ref)
+    if response is None or not response:
+        return response
+    sha, _, observed_ref = response.partition('\t')
+    return sha if observed_ref == ref and re.fullmatch(r'[0-9a-f]{40,64}', sha) else None
 
 
 def foreign_commits(commits, state, assignment):

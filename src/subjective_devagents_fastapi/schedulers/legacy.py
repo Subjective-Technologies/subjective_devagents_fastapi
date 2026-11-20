@@ -20,9 +20,10 @@ class LegacyMultiAgent(CompatibilityScheduler):
     )
 
     def compatible(self, request: TaskRequest) -> bool:
-        return bool(request.agents)
+        return bool(request.published_role_request().agents)
 
     def start(self, request: TaskRequest) -> SchedulerDecision:
+        request = request.published_role_request()
         managers = request.dedicated_orchestrators or request.orchestrators
         targets = request.addressed or managers[:1] or request.agents[:1]
         return SchedulerDecision(Action.DISPATCH_AGENT, targets, manager=managers[0] if managers else None)

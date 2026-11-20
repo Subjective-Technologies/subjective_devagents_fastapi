@@ -113,6 +113,10 @@ def _execute_approved(service, job):
             base_workspace = str(task_workspace.task_root(workspace)[0])
         identity = service.backend.identity({'provider': profile['provider'], 'model': profile.get('model', ''),
             'workspace': base_workspace}, execution_required=True)
+        if scheduler and scheduler.execution_policy.direct_prompt and (
+            identity.provider != profile['provider'] or profile.get('model') and identity.model != profile['model']
+        ):
+            raise ModelError('SCHEDULER_AGENT_UNAVAILABLE', 'Configured provider or model is unavailable')
         if identity.strategy != 'api_agent' or identity.ssh_host:
             raise ModelError('coordinated_runtime_required', 'Collaboration requires a local runtime with per-tool fencing')
         if not job.get('workspace') and task_workspace.enabled():
@@ -127,12 +131,13 @@ def _execute_approved(service, job):
             except ValueError:
                 raise ModelError('invalid_runtime_identity', 'Task workspace identity is invalid') from None
         assignment = execution.get('runtime_assignment') or execution.get('assignment_brief') or execution['prompt']
-        if scheduler and not scheduler.execution_policy.parse_legacy_reply:
+        direct = bool(scheduler and scheduler.execution_policy.direct_prompt)
+        if direct:
             assignment = addressed_assignment(assignment, profile, binding['agent_id'])
         selected, requirements = select_runtime(
             profile, identity, assignment, stage=execution.get('authorized_stage'),
             capabilities=execution.get('required_runtime_capabilities'),
-            grants=execution.get('authorized_runtime_capabilities'))
+            grants=execution.get('authorized_runtime_capabilities'), direct=direct)
         if selected.sandbox != identity.sandbox:
             identifier = 'readonly-' + hashlib.sha256(identity.id.encode()).hexdigest()
             identity = replace(identity, id=identifier, sandbox='read-only')
@@ -166,21 +171,28 @@ def _execute_approved(service, job):
         export = loaded['export']
         channel.workflow_meta = {'workflow_source': loaded['source'], 'workflow_digest': loaded['digest'],
                                  'workflow_loaded_at': loaded['loaded_at']}
-        folder = agent_workflow.materialize(export, profile['company_id'], agent_workflow.workflow_root(service.app_home))
-        definition = agent_workflow.compose_definition(export, profile, folder)
-        from .deploy_methods import facts_block
-        instruction = execution['prompt']
-        if scheduler:
-            instruction += scheduler.execution_policy.prompt_suffix
-        prompt = agent_workflow.wrap_turn(definition, instruction + (
-            facts_block(execution['prompt']) if not identity.ssh_host else ''))
+        if direct:
+            channel.security_policy = agent_workflow.direct_security_policy(export)
+            agent_role = binding['agent_id']
+            prompt = execution['prompt']
+        else:
+            folder = agent_workflow.materialize(export, profile['company_id'], agent_workflow.workflow_root(service.app_home))
+            definition = agent_workflow.compose_definition(export, profile, folder)
+            from .deploy_methods import facts_block
+
+            instruction = execution['prompt']
+            if scheduler:
+                instruction += scheduler.execution_policy.prompt_suffix
+            prompt = agent_workflow.wrap_turn(definition, instruction + (
+                facts_block(execution['prompt']) if not identity.ssh_host else ''))
+            agent_role = agent_workflow.agent_id_for(profile['role_file'])
         if conversation_id is None:
             conversation_id = model.create(identity.id)['id']
             with model.store.connection() as db:
                 db.execute('INSERT INTO collaboration_dispatches VALUES(?,?)', (binding['dispatch_id'], conversation_id))
         # Callback identity is resolved from the approved job; the existing service token stays in process env.
         channel.fence_root = str(Path(model.store.path).parent / 'mutation-fences')
-        channel.defer_start(identity, export['version']['version'], agent_workflow.agent_id_for(profile['role_file']))
+        channel.defer_start(identity, export['version']['version'], agent_role)
         attachments = load_attachments(service, execution['attachment_ref'], claims['owner_id']) if execution.get('attachment_ref') else ()
         turn = model.submit(conversation_id, prompt, binding['dispatch_id'], timeout=1800, attachments=attachments, coordination=channel)
         return {'ok': True, 'turn_id': turn['id']}
@@ -193,12 +205,16 @@ def addressed_assignment(assignment, profile, agent_id):
                    key=lambda name: (-len(name), name))
     prefix = (r'^\s*(?:(?:hi|hey|hello)[\s,]+)?@(?:' + '|'.join(map(re.escape, names))
               + r')(?![\w-])[\s,:—–-]+')
-    instruction = re.sub(prefix, '', assignment, count=1, flags=re.IGNORECASE).strip()
+    instruction = re.sub(prefix, '', assignment, count=1, flags=re.IGNORECASE)
+    if instruction == assignment:
+        plain_prefix = r'^\s*(?:' + '|'.join(map(re.escape, names)) + r')\s*[,:]\s*'
+        instruction = re.sub(plain_prefix, '', assignment, count=1, flags=re.IGNORECASE)
+    instruction = instruction.strip()
     return re.sub(r'^(?:please\s+)?(?:can|could|would|will) you\s+', '', instruction,
                   count=1, flags=re.IGNORECASE)
 
 
-def select_runtime(profile, identity, assignment, *, stage=None, capabilities=None, grants=None):
+def select_runtime(profile, identity, assignment, *, stage=None, capabilities=None, grants=None, direct=False):
     """Match stage requirements against authorized host profiles before any model call."""
     from .runtime_profiles import available_profiles, requirements_for, select_profile
     sandbox = 'workspace-write' if profile.get('mode') == 'write' and identity.sandbox == 'workspace-write' else 'read-only'
@@ -214,6 +230,12 @@ def select_runtime(profile, identity, assignment, *, stage=None, capabilities=No
                             shell_exec=candidate.shell_exec and bash, test_exec=candidate.test_exec and bash,
                             build_exec=candidate.build_exec and bash, browser_exec=candidate.browser_exec and bash)
                     for candidate in profiles]
+    if direct and sandbox == 'workspace-write' and (grants is None or 'fs_write' in grants):
+        # Keep authorized tools available during investigation, even if the latest turn
+        # does not explicitly repeat the original request to edit the workspace.
+        writers = [candidate for candidate in profiles if candidate.sandbox == sandbox and candidate.fs_write]
+        if writers:
+            profiles = writers
     return select_profile(requirements, profiles, grants=grants), requirements
 
 

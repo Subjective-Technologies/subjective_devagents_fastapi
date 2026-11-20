@@ -10,9 +10,10 @@ class SingleOwner(CompatibilityScheduler):
     )
 
     def compatible(self, request: TaskRequest) -> bool:
-        return request.repository_available and bool(request.implementation_owners)
+        return request.repository_available and bool(request.published_role_request().implementation_owners)
 
     def start(self, request: TaskRequest) -> SchedulerDecision:
+        request = request.published_role_request()
         requested = request.addressed[:1]
         owner = requested if requested and requested[0] in request.implementation_owners else request.implementation_owners[:1]
         return SchedulerDecision(Action.START_PIPELINE, owner)

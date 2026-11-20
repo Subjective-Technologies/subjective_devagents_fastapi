@@ -25,6 +25,7 @@ class PlanRequest(BaseModel):
     implementation_owners: list[Identifier] = Field(default_factory=list, max_length=40)
     repository_available: bool = False
     active_agent: Identifier | None = None
+    unbound_agents: list[Identifier] = Field(default_factory=list, max_length=40)
     pinned: SchedulerPin | None = None
     preference: Identifier | None = None
 
@@ -55,6 +56,8 @@ def plan(body: PlanRequest, x_scheduler_token: str = Header(default='')):
         dedicated_orchestrators=tuple(a for a in body.dedicated_orchestrators if a in agents),
         implementation_owners=tuple(sorted(set(body.implementation_owners).intersection(agents))),
         repository_available=body.repository_available, active_agent=body.active_agent,
+        default_agent=os.environ.get("COLLABORATION_DEFAULT_DIRECT_AGENT"),
+        unbound_agents=tuple(agent for agent in body.unbound_agents if agent in agents),
     )
     try:
         scheduler = select(configured_registry(), request, pinned=body.pinned, preference=body.preference)

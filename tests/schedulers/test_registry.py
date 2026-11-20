@@ -125,6 +125,7 @@ def test_legacy_strategy_returns_manager_handoff_candidates():
 
 @pytest.mark.parametrize(('message', 'needs_write'), [
     ('@Claude, please edit value.txt', True),
+    ('Claude, fix the tests.', True),
     ('@Claude, can you fix the tests?', True),
     ('Hey @Claude, please edit value.txt', True),
     ('@Claude — could you explain the failure?', False),
@@ -135,3 +136,30 @@ def test_direct_assignment_preserves_write_intent_in_addressed_messages(message,
 
     instruction = addressed_assignment(message, {'display_name': 'Claude'}, 'ai_claude')
     assert ('fs_write' in requirements_for(instruction).runtime_capabilities()) is needs_write
+
+@pytest.mark.parametrize('addressed', [(), ('ai_one', 'ai_two')])
+def test_direct_scheduler_requests_explicit_selection_when_ambiguous(addressed):
+    with pytest.raises(SchedulerError) as failure:
+        SimpleV1().start(TaskRequest(('ai_one', 'ai_two'), addressed=addressed))
+    assert failure.value.code == 'SCHEDULER_AGENT_SELECTION_REQUIRED'
+
+
+def test_direct_scheduler_honors_explicit_configured_default(monkeypatch):
+    token = 'test-scheduler-service-token-not-a-secret'
+    monkeypatch.setenv('COORDINATION_SCHEDULER_TOKEN', token)
+    monkeypatch.setenv('COLLABORATION_DEFAULT_DIRECT_AGENT', 'ai_two')
+    monkeypatch.delenv('COLLABORATION_DISABLED_SCHEDULERS', raising=False)
+    request = PlanRequest(agents=['ai_one', 'ai_two'], preference='simple_v1')
+    assert plan(request, token)['decision']['agents'] == ('ai_two',)
+    request.addressed = ['ai_one']
+    assert plan(request, token)['decision']['agents'] == ('ai_one',)
+
+def test_roleless_agent_excludes_specialized_strategies():
+    registry = SchedulerRegistry()
+    registry.register(SimpleV1())
+    registry.register(LegacyMultiAgent(), default=True)
+    registry.register(SingleOwner())
+    request = TaskRequest(('ai_direct', 'ai_coder'), addressed=('ai_direct',),
+                          implementation_owners=('ai_coder',), repository_available=True,
+                          unbound_agents=('ai_direct',))
+    assert select(registry, request).metadata.id == 'simple_v1'

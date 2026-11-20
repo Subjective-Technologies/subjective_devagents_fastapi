@@ -217,6 +217,9 @@ class LanguageModel:
                     result = replace(result, text=ensure_runtime_attestation(result.text, self.turn_evidence(identifier)))
             except ModelError as error:
                 result = ModelResult("interrupted", error_code=error.code)
+        if getattr(coordination, "direct_execution", False):
+            report = coordination.direct_report(result.status, result.error_code)
+            result = replace(result, text=(result.text + "\n\n" if result.text else "") + report)
         try:
             answer = {'text': result.text, 'error_code': result.error_code, **work_trail(trail),
                       **({'checkpoint': result.checkpoint} if result.checkpoint else {})}

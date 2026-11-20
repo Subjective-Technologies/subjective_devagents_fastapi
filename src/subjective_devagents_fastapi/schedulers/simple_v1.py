@@ -3,12 +3,12 @@ from .models import Action, ExecutionOutcome, ExecutionPolicy, SchedulerDecision
 
 class SimpleV1:
     metadata = SchedulerMetadata(
-        'simple_v1', '1.0.0', 'Simple',
-        'One agent works directly on the task with its existing permissions.',
+        'simple_v1', '1.0.0', 'Direct LLM',
+        'One LLM executes the request directly with authorized computer tools. No handoffs or specialized role required.',
     )
     execution_policy = ExecutionPolicy(
         guard_coder_scoping=False, auto_acquire_write=True, fixed_deadline=True,
-        publish_task_workspace=False, parse_legacy_reply=False,
+        publish_task_workspace=False, parse_legacy_reply=False, direct_prompt=True,
     )
 
     def compatible(self, request: TaskRequest) -> bool:
@@ -17,9 +17,17 @@ class SimpleV1:
     def start(self, request: TaskRequest) -> SchedulerDecision:
         if request.active_agent and request.active_agent not in request.agents:
             raise SchedulerError('SCHEDULER_AGENT_UNAVAILABLE', 'The original task agent is unavailable')
-        agents = ((request.active_agent,) if request.active_agent else
-                  request.addressed[:1] or request.agents[:1])
-        return SchedulerDecision(Action.DISPATCH_AGENT, agents)
+        if request.active_agent:
+            return SchedulerDecision(Action.DISPATCH_AGENT, (request.active_agent,))
+        addressed = tuple(agent for agent in request.addressed if agent in request.agents)
+        if len(addressed) == 1:
+            return SchedulerDecision(Action.DISPATCH_AGENT, addressed)
+        if not request.addressed:
+            if len(request.agents) == 1:
+                return SchedulerDecision(Action.DISPATCH_AGENT, request.agents)
+            if request.default_agent in request.agents:
+                return SchedulerDecision(Action.DISPATCH_AGENT, (request.default_agent,))
+        raise SchedulerError('SCHEDULER_AGENT_SELECTION_REQUIRED', 'Address one available AI user to start this task')
 
     def on_outcome(self, result: ExecutionOutcome) -> SchedulerDecision:
         if result.decision_id:

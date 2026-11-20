@@ -420,6 +420,11 @@ class ChannelSession:
         self.tool_capabilities = set()
         self.delegation = None
         self.scheduler = None
+        self.security_policy = ''
+        self.direct_checks = []
+        self.direct_commits = []
+        self.direct_pushes = []
+        self._direct_push_targets = []
         self.scheduler_assignment = None
         self.pending_user_decision = None
         self.completion_store = None
@@ -604,6 +609,8 @@ class ChannelSession:
                                                 'directory_id': f'{stat.st_dev}:{stat.st_ino}'}}
         started = self.call('start', workflow_version=version, runtime=identity.id, agent_role=agent_role or self.actor,
                             heartbeat_interval=self.heartbeat_interval, **workspace,
+                            **({'runtime_model': {'provider': identity.provider, 'model': identity.model}}
+                               if self.direct_execution else {}),
                             **(getattr(self, 'workflow_meta', None) or {}),
                             **({'runtime_profile': self.runtime_profile} if self.runtime_profile else {}))
         self.start_acknowledged = True
@@ -694,6 +701,58 @@ class ChannelSession:
         # The state is supplied separately on every turn; never rely on transcript replay.
         return ('\nCHANNEL RUNTIME CONTEXT (authoritative journal for this task; reported facts retain provenance):\n'
                 + self.compact_state(state))
+
+    @property
+    def direct_execution(self):
+        return bool(self.scheduler and self.scheduler.execution_policy.direct_prompt)
+
+    def direct_context(self):
+        from .language_models.task_context import render_checkpoint
+
+        state = self.call('snapshot')['state']
+        revision = state.get('task_revision')
+        parts = [self.security_policy]
+        checkpoint = self.previous_checkpoint
+        if checkpoint:
+            parts.append("Previous turn checkpoint:\n" + render_checkpoint(checkpoint, 3000))
+        for decision in list((state.get('decisions') or {}).values())[-20:]:
+            if (decision.get('task_revision') == revision and decision.get('asked_by') == self.actor
+                    and decision.get('status') == 'RESOLVED'):
+                parts.append(f"User decision {decision['id']} ({decision['category']}): {decision['question']}\n"
+                             f"Answer: {decision['answer']}")
+        return '\n\n'.join(part for part in parts if part)
+
+    def record_direct_check(self, command, ok):
+        from .runtime_profiles import is_verification_command
+
+        simple_test = (command.lstrip().startswith(('test ', '[ ')) and '\n' not in command
+                       and len(list(_segments(command))) == 1)
+        if is_verification_command(command) or simple_test:
+            self.direct_checks.append(ok)
+
+    def report_direct_blocker(self, data):
+        from .language_models.contracts import ModelResult
+
+        reason = str(data.get('reason') or '').strip() if isinstance(data, dict) else ''
+        if not reason or len(reason) > 2000:
+            raise ModelError('invalid_blocker', 'Give a concrete blocker under 2000 characters')
+        identifier = 'blocker-' + self.binding['dispatch_id']
+        self.tool('blocker', {'id': identifier, 'reason': reason})
+        return ModelResult('blocked', reason)
+
+    def direct_report(self, status, error_code=None):
+        implementation = 'waiting for input' if self.pending_user_decision else {
+            'completed': 'completed', 'blocked': 'blocked', 'cancelled': 'cancelled',
+        }.get(status, 'failed')
+        if error_code == 'service_restarted':
+            implementation = 'interrupted'
+        tests = ('failed checks observed' if False in self.direct_checks else
+                 'passed' if self.direct_checks else 'no test result observed')
+        commits = ', '.join(sha[:12] for sha in self.direct_commits[-5:]) or 'no commit observed'
+        pushes = ', '.join(f'{target} at {sha[:12]}' for target, sha in self.direct_pushes[-5:]) or 'no verified push observed'
+        failure = f'\nReason: {error_code[:160]}' if error_code else ''
+        return (f"Execution record (runtime)\nExecution: {implementation}{failure}\nTests: {tests}\n"
+                f"Commit: {commits}\nPush: {pushes}\nDeployment: no verified deployment recorded")
 
     def recoverable_leases(self, same_agent=False):
         state = self._state or {}
@@ -823,7 +882,8 @@ class ChannelSession:
                 from .publication_scope import COMMIT_MAKERS, PUSH
                 if not profile.get('git_write', True) and (COMMIT_MAKERS.search(command) or PUSH.search(command)):
                     raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'This dispatch has no git_write')
-            self.check_publication(command)
+            if not self.direct_execution:
+                self.check_publication(command)
             if self.identity:
                 from .deploy_methods import refuse_local_deploy
                 folder = self._command_dir(command)
@@ -853,13 +913,14 @@ class ChannelSession:
             target = str((Path(self.identity.workspace) / arguments.get('file_path', '')).resolve())
         try:
             checked = self._covering_check(target)
-        except ModelError:
-            raise
+        except ModelError as error:
+            # Direct tasks can acquire another scope in their private checkout. The
+            # journal checks every scope and the mutation fence remains held.
+            folder = self._task_folder() if self.direct_execution else None
+            if error.code != 'LEASE_SCOPE_MISMATCH' or not folder or not Path(target).is_relative_to(folder):
+                raise
+            checked = None
         if checked is None and self.auto_acquire:
-            # No lease yet. A routine prerequisite, not an extra model round: this authorized
-            # workspace-write Coder acquires the narrowest lease for the target, once.
-            # A held lease that does not cover the target is LEASE_SCOPE_MISMATCH above,
-            # not a silent widen. A conflict is its own outcome.
             self._acquire_for(name, target)
             checked = self._covering_check(target)
         if checked is None:
@@ -971,27 +1032,42 @@ class ChannelSession:
         except ModelError:
             return None
 
-    def check_publication(self, command):
+    def check_publication(self, command, *, runner=None):
         """Refuse a push that would publish commits of another task (PUBLICATION_SCOPE_CONFLICT)."""
         from . import publication_scope as scope
+        query = runner or scope.git
         if scope.COMMIT_MAKERS.search(command or ''):
             # Remember HEAD so the commits this command creates are attributed to this task.
             folder = self._command_dir(command)
             if folder:
                 self._heads_before = {**getattr(self, '_heads_before', {}),
-                                      folder: (scope.git(folder, 'rev-parse', 'HEAD'), time.time())}
+                                      folder: (query(folder, 'rev-parse', 'HEAD'), time.time())}
         if not scope.PUSH.search(command or '') or not self.identity:
             return
+        if self.direct_execution and (not runner or not (self.runtime_profile or {}).get('network_access')):
+            raise ModelError('BLOCKED_EXECUTION_CAPABILITY', 'Pushing to a Git remote requires authorized network access')
         folder = self._command_dir(command)
         if not folder:
             raise ModelError('PUBLICATION_SCOPE_UNVERIFIED', 'git push needs a literal working directory')
         state = None
-        for repo, remote, src, dst in scope.push_targets(command, folder):
-            pending = scope.unpublished(repo, remote, src, dst)
+        candidates = []
+        targets = scope.push_targets(command, folder, strict=self.direct_execution)
+        if self.direct_execution and not targets:
+            raise ModelError('PUBLICATION_SCOPE_UNVERIFIED', 'Push one named remote branch explicitly')
+        for repo, remote, src, dst in targets:
+            if runner:
+                checked = self._covering_check(str(repo.resolve()))
+                if checked is None:
+                    raise ModelError('WRITE_LEASE_REQUIRED', 'The push repository needs a covering write lease')
+            pending = scope.unpublished(repo, remote, src, dst, runner=runner)
+            if self.direct_execution:
+                if pending is None:
+                    raise ModelError('PUBLICATION_SCOPE_UNVERIFIED', 'Fetch the remote before pushing a verified task revision')
+                candidates.append((repo, remote, dst, pending['candidate']))
             if not pending or not pending['commits']:
                 continue
             state = state or self.call('snapshot')['state']
-            foreign = scope.foreign_commits(pending['commits'], state, self.assignment)
+            foreign = scope.foreign_commits(pending['commits'], state, '' if self.direct_execution else self.assignment)
             if not foreign:
                 continue
             try:
@@ -1001,30 +1077,41 @@ class ChannelSession:
                 pass    # the refusal below does not depend on recording it
             log.warning('Publication scope conflict channel=%s dispatch=%s target=%s/%s foreign=%d',
                         self.binding['channel_id'], self.binding['dispatch_id'], remote, dst, len(foreign))
+            if self.direct_execution:
+                raise ModelError('PUBLICATION_SCOPE_CONFLICT', 'Push only commits owned by this task from a clean branch')
             raise ModelError('PUBLICATION_SCOPE_CONFLICT', scope.conflict_message(repo, foreign, remote, dst))
+        self._direct_push_targets = candidates
 
-    def after_bash(self, command):
+    def after_bash(self, command, *, runner=None):
         """Attribute commits a successful command created to this dispatch's task revision."""
         from . import publication_scope as scope
+        query = runner or scope.git
+        if runner and scope.PUSH.search(command or ''):
+            for repo, remote, dst, expected in self._direct_push_targets:
+                if scope.remote_head(repo, remote, dst, runner) == expected:
+                    self.direct_pushes.append((f'{remote}/{dst}', expected))
+            self._direct_push_targets = []
         if not scope.COMMIT_MAKERS.search(command or ''):
             return
         folder = self._command_dir(command)
         if not folder:
             return
         before, started = getattr(self, '_heads_before', {}).pop(folder, (None, None))
-        head = scope.git(folder, 'rev-parse', 'HEAD')
+        head = query(folder, 'rev-parse', 'HEAD')
         if not head or head == before or started is None:
             return
         # Only commits this command wrote: a pull/merge also brings in other people's commits,
         # which keep their older committer time and are never attributed to this task.
-        listing = scope.git(folder, 'log', '--no-merges', '--max-count=20', '--format=%H %ct',
+        listing = query(folder, 'log', '--no-merges', '--max-count=20', '--format=%H %ct',
                             f'{before}..{head}' if before else '-1')
         created = [line.split()[0] for line in (listing or '').splitlines()
                    if len(line.split()) == 2 and int(line.split()[1]) >= int(started) - 5]
-        repository = scope.git(folder, 'rev-parse', '--show-toplevel') or folder
+        repository = query(folder, 'rev-parse', '--show-toplevel') or folder
         for sha in created[:20]:
             try:
                 self.call('commit', sha=sha, repository=repository)
+                if self.direct_execution:
+                    self.direct_commits.append(sha)
             except ModelError as error:
                 log.warning('Commit ownership not recorded sha=%s code=%s', sha[:12], error.code)
                 return
@@ -1074,18 +1161,25 @@ class ChannelSession:
             self.tool_capabilities.add((capability, ok))
 
     def ask(self, arguments):
-        if any(l['instance_id'] == self.binding['instance_id'] and l['mode'] == 'write' and l['status'] in {'active', 'revoking'} for l in self.call('snapshot')['state']['leases'].values()):
+        if not self.direct_execution and any(l['instance_id'] == self.binding['instance_id'] and l['mode'] == 'write' and l['status'] in {'active', 'revoking'} for l in self.call('snapshot')['state']['leases'].values()):
             raise ModelError('RELEASE_WRITE_LEASE_BEFORE_DECISION', 'Reconcile worktrees and release writes before waiting for user')
         question = str(arguments.get('question', '')).strip()
         if not question:
             raise ModelError('invalid_question', 'Question is required')
         if is_status_chatter(question):
             return question
-        category = arguments.get('category', 'TECHNICAL_INTERNAL_BLOCKER')
+        category = arguments.get('category', 'EXTERNAL_USER_ONLY_INFORMATION'
+                                 if self.direct_execution else 'TECHNICAL_INTERNAL_BLOCKER')
         identifier = arguments.get('decision_id')
         if category in {'SECURITY_AUTHORIZATION', 'DESTRUCTIVE_ACTION_AUTHORIZATION'} and not identifier:
             raise ModelError('decision_id_required', 'Authorization questions require explicit stable IDs')
-        identifier = identifier or 'question-' + hashlib.sha256(' '.join(question.lower().split()).encode()).hexdigest()[:24]
+        key = ' '.join(question.lower().split())
+        if self.direct_execution:
+            revision = self.call('snapshot')['state'].get('task_revision')
+            scoped = f"{self.binding['workflow_id']}:{revision}:{self.actor}:{category}:{identifier or key}"
+            identifier = 'question-' + hashlib.sha256(scoped.encode()).hexdigest()[:24]
+        elif not identifier:
+            identifier = 'question-' + hashlib.sha256(key.encode()).hexdigest()[:24]
         result = self.call('decision', id=identifier, question=question, category=category,
             scope=arguments.get('scope'), discovery_id=arguments.get('discovery_id'),
             blocking_tasks=arguments.get('blocking_tasks', []))
@@ -1096,6 +1190,10 @@ class ChannelSession:
         return f'[COORDINATION] Pending decision: {item["id"]}' if item['status'] == 'PENDING' else f'Decision {item["id"]}: {item.get("answer", item["status"])}'
 
     def canonical_reply(self, reply):
+        if self.direct_execution:
+            from .agent_workflow import _HEADER
+
+            return _HEADER.sub('', reply, count=1).lstrip()
         from .agent_workflow import _HEADER, ensure_header
         observed = _HEADER.match(reply)
         expected = f"[WF:{self.version}][agent:{self.agent_role}]"

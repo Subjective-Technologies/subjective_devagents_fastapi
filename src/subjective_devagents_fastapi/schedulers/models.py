@@ -1,5 +1,5 @@
 """Versioned scheduler inputs and actions. No transport or execution dependencies."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 
@@ -32,6 +32,17 @@ class TaskRequest:
     implementation_owners: tuple[str, ...] = ()
     repository_available: bool = False
     active_agent: str | None = None
+    default_agent: str | None = None
+    unbound_agents: tuple[str, ...] = ()
+
+    def published_role_request(self) -> "TaskRequest":
+        bound = tuple(agent for agent in self.agents if agent not in self.unbound_agents)
+        if any(agent not in bound for agent in self.addressed):
+            bound = ()
+        return replace(self, agents=bound,
+                       orchestrators=tuple(a for a in self.orchestrators if a in bound),
+                       dedicated_orchestrators=tuple(a for a in self.dedicated_orchestrators if a in bound),
+                       implementation_owners=tuple(a for a in self.implementation_owners if a in bound))
 
 
 class Action(str, Enum):
@@ -82,6 +93,7 @@ class ExecutionPolicy:
     publish_task_workspace: bool = True
     parse_legacy_reply: bool = True
     prompt_suffix: str = ''
+    direct_prompt: bool = False
 
 
 class SchedulerError(ValueError):

@@ -766,7 +766,7 @@ def _read_signature(call: dict) -> str | None:
     return None
 
 
-def agent_system_prompt(identity) -> str:
+def agent_system_prompt(identity, *, direct=False, tools=None) -> str:
     lines = [
         "You are a coding assistant with tool access to one real workspace. Use tools to inspect or "
         "change it instead of guessing. When several independent steps are needed (reading or searching "
@@ -775,7 +775,7 @@ def agent_system_prompt(identity) -> str:
         f"Workspace root: {identity.workspace}",
     ]
     if identity.sandbox != "workspace-write":
-        lines.append("This session is read-only: Bash, Write and Edit are unavailable.")
+        lines.append("This session is read-only." if direct else "This session is read-only: Bash, Write and Edit are unavailable.")
     elif not identity.ssh_host:
         from ..task_workspace import branch_for, task_root
         roots = task_root(identity.workspace)
@@ -785,9 +785,11 @@ def agent_system_prompt(identity) -> str:
                 f"Work only here, never in {roots[0]} directly. A nested repository in this folder is "
                 f"created as a git worktree on branch {branch_for(roots[1])} the first time a tool names a "
                 "path in it. Install dependencies there if a build needs them (node_modules is linked "
-                "from the shared checkout when it exists). Commit on that branch. When the turn ends, the runtime "
-                "rebases committed work onto origin main and pushes it to main; uncommitted changes are not published."
+                "from the shared checkout when it exists)."
             )
+            if not direct:
+                lines.append("Commit on that branch. When the turn ends, the runtime rebases committed work "
+                             "onto origin main and pushes it to main; uncommitted changes are not published.")
         from ..channel_coordination import lease_roots
         extra = [str(root) for root in lease_roots(identity)[1:]]
         if extra:
@@ -795,7 +797,14 @@ def agent_system_prompt(identity) -> str:
                 "Company folder: " + extra[0] + ". A write lease may cover it directly; edit company "
                 "files there in place and never copy it under the workspace root to work around a lease."
             )
-    if identity.allowed_tools:
+    if direct:
+        lines.append("Available tools for this turn: " + ", ".join(sorted(tools or ())))
+        lines.append("Work on the user's task directly. Respect workspace and tool permissions. "
+                     "Commit, push, or deploy only when requested and authorized. The runtime never publishes "
+                     "this workspace automatically. Describe changes and give observed check results. "
+                     "A push may trigger CI, so verify the live artifact separately before reporting deployment. "
+                     "Use AskUser for a concrete question. Report any blocker plainly.")
+    elif identity.allowed_tools:
         lines.append("Only these tools are available: " + ", ".join(sorted(identity.allowed_tools)))
     lines.append(
         "If you are genuinely uncertain about a decision only the user can make, or need "
@@ -1139,6 +1148,7 @@ class ApiAgent(ModelStrategy):
         stage = (runtime_profile.get("requirements") or {}).get("stage")
         scoping = stage == "implementation" if stage else getattr(coordination, "agent_role", None) == "coder_agent"
         policy = getattr(getattr(coordination, "scheduler", None), "execution_policy", None)
+        direct = bool(policy and policy.direct_prompt)
         if policy and not policy.guard_coder_scoping:
             scoping = False
         if coordination and (scoping or (policy and policy.auto_acquire_write)) and identity.sandbox == "workspace-write":
@@ -1149,6 +1159,13 @@ class ApiAgent(ModelStrategy):
             from ..channel_coordination import CONTROL_TOOL, shell_effect
             from ..runtime_profiles import is_verification_command
             tools["Coordination"] = CONTROL_TOOL
+            if direct:
+                tools["Coordination"] = {**CONTROL_TOOL, "function": {
+                    **CONTROL_TOOL["function"],
+                    "description": ("Inspect this task with snapshot, manage an authorized lease with "
+                                    "acquire or release, or stop at a concrete blocker with blocker "
+                                    "(data.reason). Never submit credentials."),
+                }}
             if identity.sandbox == 'read-only' and (not identity.allowed_tools or 'Bash' in identity.allowed_tools):
                 # ChannelSession.guard classifies these commands; Write/Edit stay absent.
                 tools['Bash'] = AGENT_TOOLS['Bash']
@@ -1172,9 +1189,9 @@ class ApiAgent(ModelStrategy):
             "sandbox": identity.sandbox,
             "effective_tools": sorted(tools),
         })
-        messages = [{"role": "system", "content": agent_system_prompt(identity)}]
+        messages = [{"role": "system", "content": agent_system_prompt(identity, direct=direct, tools=tools)}]
         if coordination:
-            messages[0]["content"] += "\n" + coordination.context()
+            messages[0]["content"] += "\n" + (coordination.direct_context() if direct else coordination.context())
         if scoping:
             messages[0]["content"] += (
                 "\nCoder rule: a company reading list is not the assignment. "
@@ -1291,7 +1308,7 @@ class ApiAgent(ModelStrategy):
                 progress[f"checkpointed_{level}"] = True
                 self._checkpoint(progress, request, "context_" + level)
                 tools_since_checkpoint = 0
-            if coordination and level == "handoff":
+            if coordination and not direct and level == "handoff":
                 # Hand off before the provider limit: the successor starts from the checkpoint,
                 # never from this transcript.
                 emit("context_compaction", {"handoff": True, "estimated_input_tokens": tokens})
@@ -1414,6 +1431,8 @@ class ApiAgent(ModelStrategy):
                     emit("tool_blocked", {"event": "TOOL_BLOCKED_COORDINATION", "tool_call_id": str(call.get("id") or ""),
                                           "name": name, "error_code": result_text[7:].split(":", 1)[0]})
                 if isinstance(result_text, ModelResult):
+                    if direct and result_text.status == "blocked":
+                        self._checkpoint(progress, request, "user_input" if coordination.pending_user_decision else "blocked")
                     if scoping and result_text.status == "timed_out" and deadline <= time.monotonic():
                         return scoping_limit()
                     return result_text
@@ -1502,16 +1521,47 @@ class ApiAgent(ModelStrategy):
                     return ApiAgent._dispatch(call, tools, identity, transport, cancelled, timeout, emit, edited, coordination, True)
             except ModelError as error:
                 return coordination_refusal(error, name, arguments)
+        git_runner = None
+        if name == 'Bash' and getattr(coordination, 'direct_execution', False):
+            git_deadline = time.monotonic() + timeout
+
+            def git_runner(folder, *args):
+                # The publication probe runs with the same OS identity, environment,
+                # deadline and mutation fence as the Bash tool it accompanies.
+                remaining = git_deadline - time.monotonic()
+                if remaining <= 0 or cancelled():
+                    return None
+                try:
+                    text = _run_bounded(("git", "-C", str(folder), *args), "", identity, transport,
+                                        cancelled, min(10, remaining))
+                except ToolAbort:
+                    return None
+                if text.startswith("Error:") or "[exit code " in text or "[truncated]" in text:
+                    return None
+                return "" if text == "(no output)" else text.strip()
         if coordination:
             activity = getattr(coordination, 'activity', None)
             if activity:
                 activity(name)
             try:
                 if name == "Coordination":
-                    return coordination.tool(arguments.get("operation"), arguments.get("data", {}))
+                    operation = arguments.get("operation")
+                    data = arguments.get("data", {})
+                    if getattr(coordination, 'direct_execution', False):
+                        if operation not in {'snapshot', 'acquire', 'release', 'blocker', 'privilege', 'worktree'}:
+                            return "Error: This operation is unavailable for direct execution."
+                        if operation == 'blocker':
+                            return coordination.report_direct_blocker(data)
+                    return coordination.tool(operation, data)
                 if name == "AskUser":
-                    return ModelResult("completed", coordination.ask(arguments))
+                    text = coordination.ask(arguments)
+                    if getattr(coordination, 'direct_execution', False):
+                        return (ModelResult("blocked", text) if coordination.pending_user_decision
+                                else text)
+                    return ModelResult("completed", text)
                 coordination.guard(name, arguments)
+                if git_runner:
+                    coordination.check_publication(str(arguments.get("command", "")), runner=git_runner)
             except ModelError as error:
                 if error.code == 'LEASE_CONFLICT' and name in {'Write', 'Edit', 'Bash'}:
                     # A healthy writer of another task owns the target. Retrying cannot help and
@@ -1554,10 +1604,16 @@ class ApiAgent(ModelStrategy):
             })
             return abort.result
         ok = not result.startswith("Error:") and "[exit code " not in result
+        if name == "Bash" and getattr(coordination, 'direct_execution', False):
+            coordination.record_direct_check(str(arguments.get("command", "")), ok)
         if coordination and ok:
             coordination.observed(name, True)
             if name == "Bash" and getattr(coordination, "after_bash", None):
-                coordination.after_bash(str(arguments.get("command", "")))
+                command = str(arguments.get("command", ""))
+                if git_runner:
+                    coordination.after_bash(command, runner=git_runner)
+                else:
+                    coordination.after_bash(command)
         emit("tool_result", {
             "tool_call_id": call_id,
             "name": name,

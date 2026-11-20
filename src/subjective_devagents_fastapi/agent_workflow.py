@@ -337,6 +337,31 @@ def compose_definition(export: dict, agent: dict, workflow_dir: Path) -> str:
     return "\n".join(parts).strip()
 
 
+_POLICY_HEADING = re.compile(
+    r"^#{1,6}\s+(?:(?:mandatory|company|runtime)\s+)*(?:security|safety|permissions|credential|data protection|access control)\b",
+    re.IGNORECASE,
+)
+
+
+def direct_security_policy(export: dict) -> str:
+    """Include published security policy without importing the orchestration contract."""
+    fragments = []
+    for item in export["files"]:
+        if item.get("path") in {"SECURITY.md", "policies/security.md"}:
+            fragments.append(str(item.get("content") or "").strip())
+        elif item.get("path") == "AGENTS.md":
+            level = None
+            for line in str(item.get("content") or "").splitlines():
+                heading = re.match(r"^(#{1,6})\s+", line)
+                if heading and level is not None and len(heading[1]) <= level:
+                    level = None
+                if _POLICY_HEADING.match(line):
+                    level = len(heading[1])
+                if level is not None:
+                    fragments.append(line)
+    return "\n".join(fragments).strip()
+
+
 def definition_hash(definition: str) -> str:
     return hashlib.sha256(definition.encode("utf-8")).hexdigest()
 
