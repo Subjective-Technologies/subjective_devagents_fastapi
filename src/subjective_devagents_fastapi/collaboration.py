@@ -67,6 +67,15 @@ def _execute_approved(service, job):
     profile = execution['agents'][binding['agent_id']]
     if profile.get('company_id') != os.environ.get('COORDINATION_COMPANY_ID'):
         raise ModelError('runtime_scope_mismatch', 'Runtime company differs from installation')
+    from .schedulers import configured_registry
+    from .schedulers.models import Assignment, SchedulerError, SchedulerPin
+    pin = execution.get('scheduler')
+    scheduler = None
+    if pin:
+        try:
+            scheduler = configured_registry().lookup(SchedulerPin(**pin))
+        except SchedulerError as error:
+            raise ModelError(error.code, str(error)) from None
     model = service.backend.model
     with _admission:
         with model.store.connection() as db:
@@ -118,6 +127,8 @@ def _execute_approved(service, job):
             except ValueError:
                 raise ModelError('invalid_runtime_identity', 'Task workspace identity is invalid') from None
         assignment = execution.get('runtime_assignment') or execution.get('assignment_brief') or execution['prompt']
+        if scheduler and not scheduler.execution_policy.parse_legacy_reply:
+            assignment = addressed_assignment(assignment, profile, binding['agent_id'])
         selected, requirements = select_runtime(
             profile, identity, assignment, stage=execution.get('authorized_stage'),
             capabilities=execution.get('required_runtime_capabilities'),
@@ -134,6 +145,13 @@ def _execute_approved(service, job):
         channel.delegation = {k: claims[k] for k in ('channel_id', 'dispatch_id', 'instance_id', 'workflow_id', 'agent_id', 'owner_id')}
         channel.verification = selected.sandbox == 'read-only' and (selected.test_exec or selected.build_exec)
         channel.assignment = execution['prompt'][-6000:]
+        channel.scheduler = scheduler
+        if scheduler:
+            channel.scheduler_assignment = Assignment(
+                binding['agent_id'], execution.get('manager_agent_id'),
+                tuple((agent, tuple(str(name) for name in (entry.get('display_name'), entry.get('handle'), agent) if name))
+                      for agent, entry in execution['agents'].items()),
+            )
         channel.runtime_profile = {**selected.as_dict(), 'node_versions': list(selected.node_versions),
                                    'python_versions': list(selected.python_versions),
                                    'requirements': requirements.summary()}
@@ -151,7 +169,10 @@ def _execute_approved(service, job):
         folder = agent_workflow.materialize(export, profile['company_id'], agent_workflow.workflow_root(service.app_home))
         definition = agent_workflow.compose_definition(export, profile, folder)
         from .deploy_methods import facts_block
-        prompt = agent_workflow.wrap_turn(definition, execution['prompt'] + (
+        instruction = execution['prompt']
+        if scheduler:
+            instruction += scheduler.execution_policy.prompt_suffix
+        prompt = agent_workflow.wrap_turn(definition, instruction + (
             facts_block(execution['prompt']) if not identity.ssh_host else ''))
         if conversation_id is None:
             conversation_id = model.create(identity.id)['id']
@@ -163,6 +184,15 @@ def _execute_approved(service, job):
         attachments = load_attachments(service, execution['attachment_ref'], claims['owner_id']) if execution.get('attachment_ref') else ()
         turn = model.submit(conversation_id, prompt, binding['dispatch_id'], timeout=1800, attachments=attachments, coordination=channel)
         return {'ok': True, 'turn_id': turn['id']}
+
+
+def addressed_assignment(assignment, profile, agent_id):
+    """Resolve runtime capability intent from the selected agent's human instruction."""
+    names = sorted({str(value).lstrip('@') for value in
+                    (profile.get('display_name'), profile.get('handle'), agent_id) if value},
+                   key=lambda name: (-len(name), name))
+    prefix = r'^\s*@(?:' + '|'.join(map(re.escape, names)) + r')(?![\w-])[\s,:]+'
+    return re.sub(prefix, '', assignment, count=1, flags=re.IGNORECASE).strip()
 
 
 def select_runtime(profile, identity, assignment, *, stage=None, capabilities=None, grants=None):

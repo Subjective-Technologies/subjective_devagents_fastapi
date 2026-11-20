@@ -1138,7 +1138,10 @@ class ApiAgent(ModelStrategy):
         runtime_profile = getattr(coordination, "runtime_profile", None) or {}
         stage = (runtime_profile.get("requirements") or {}).get("stage")
         scoping = stage == "implementation" if stage else getattr(coordination, "agent_role", None) == "coder_agent"
-        if coordination and scoping and identity.sandbox == "workspace-write":
+        policy = getattr(getattr(coordination, "scheduler", None), "execution_policy", None)
+        if policy and not policy.guard_coder_scoping:
+            scoping = False
+        if coordination and (scoping or (policy and policy.auto_acquire_write)) and identity.sandbox == "workspace-write":
             # Ordinary authorized edits acquire their own lease inside guard(). The model
             # does not spend a round calling Coordination acquire first.
             coordination.auto_acquire = True
@@ -1330,13 +1333,16 @@ class ApiAgent(ModelStrategy):
             message, finish_reason, usage = outcome
             emit("model_usage", {"id": usage_id, "status": "completed", **usage})
             # Read-only exploration does not extend Coder's initial window.
-            if coordination and not scoping:
+            if coordination and not scoping and not (policy and policy.fixed_deadline):
                 deadline = time.monotonic() + request.timeout
             text = message.get("content") or ""
             if scoping and isinstance(text, str) and text.strip():
                 scoping_stats["planning_turns"] += 1
             from ..channel_coordination import concrete_user_decision
-            user_decision = bool(coordination and isinstance(text, str) and "NEEDS INPUT:" in text and concrete_user_decision(text))
+            user_decision = bool(
+                coordination and (not policy or policy.parse_legacy_reply)
+                and isinstance(text, str) and "NEEDS INPUT:" in text and concrete_user_decision(text)
+            )
             if isinstance(text, str) and text.strip() and not user_decision:
                 emit("message", {"text": text})
             calls = message.get("tool_calls") or []
@@ -1438,7 +1444,7 @@ class ApiAgent(ModelStrategy):
                                 updated = workspace_snapshot(identity, transport, cancelled, min(5.0, remaining))
                                 if _snapshot_wrote(snapshot, updated or {}):
                                     scoping = False
-                    if not scoping:
+                    if not scoping and not (policy and policy.fixed_deadline):
                         deadline = time.monotonic() + request.timeout
                     if milestone or tools_since_checkpoint >= budget.checkpoint_every:
                         self._checkpoint(progress, request, "milestone" if milestone else "periodic")

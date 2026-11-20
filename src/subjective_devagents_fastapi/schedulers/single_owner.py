@@ -3,6 +3,7 @@ from .models import Action, SchedulerDecision, SchedulerMetadata, TaskRequest
 
 
 class SingleOwner(CompatibilityScheduler):
+    scoping_action = Action.BLOCK_IMPLEMENTATION_SCOPE
     metadata = SchedulerMetadata(
         'single_owner', '1.0.0', 'Single owner',
         'One implementation owner with controller-led verification and delivery.',

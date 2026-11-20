@@ -39,10 +39,14 @@ class Action(str, Enum):
     START_PIPELINE = 'START_PIPELINE'
     COMPLETE_TASK = 'COMPLETE_TASK'
     FAIL_TASK = 'FAIL_TASK'
+    RESUME_EXECUTION = 'RESUME_EXECUTION'
     BLOCK_TASK = 'BLOCK_TASK'
     REQUEST_USER_INPUT = 'REQUEST_USER_INPUT'
     CANCEL_EXECUTION = 'CANCEL_EXECUTION'
     APPLY_COMPATIBILITY_RESULT = 'APPLY_COMPATIBILITY_RESULT'
+    ROUTE_LEGACY_RESULT = 'ROUTE_LEGACY_RESULT'
+    REQUEST_RESCOPE = 'REQUEST_RESCOPE'
+    BLOCK_IMPLEMENTATION_SCOPE = 'BLOCK_IMPLEMENTATION_SCOPE'
 
 
 @dataclass(frozen=True)
@@ -51,12 +55,23 @@ class SchedulerDecision:
     agents: tuple[str, ...] = ()
     decision_id: str | None = None
     manager: str | None = None
+    mentioned_agents: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Assignment:
+    agent_id: str
+    manager: str | None
+    roster: tuple[tuple[str, tuple[str, ...]], ...]
 
 
 @dataclass(frozen=True)
 class ExecutionOutcome:
     status: str
     decision_id: str | None = None
+    error_code: str | None = None
+    assignment: Assignment | None = None
+    reply: str = ''
 
 
 @dataclass(frozen=True)
@@ -66,6 +81,7 @@ class ExecutionPolicy:
     fixed_deadline: bool = False
     publish_task_workspace: bool = True
     parse_legacy_reply: bool = True
+    prompt_suffix: str = ''
 
 
 class SchedulerError(ValueError):

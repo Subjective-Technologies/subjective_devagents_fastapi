@@ -1,6 +1,6 @@
 from typing import Protocol
 
-from .models import ExecutionOutcome, ExecutionPolicy, SchedulerDecision, SchedulerMetadata, TaskRequest
+from .models import Action, ExecutionOutcome, ExecutionPolicy, SchedulerDecision, SchedulerMetadata, TaskRequest
 
 
 class Scheduler(Protocol):
@@ -18,8 +18,10 @@ class CompatibilityScheduler:
     """Bridge existing journal transitions during rollout."""
 
     execution_policy = ExecutionPolicy()
+    scoping_action: Action
 
     def on_outcome(self, result: ExecutionOutcome) -> SchedulerDecision:
-        from .models import Action
-
-        return SchedulerDecision(Action.APPLY_COMPATIBILITY_RESULT)
+        action = self.scoping_action if (
+            result.status != 'completed' and result.error_code in {'coder_scoping_limit', 'CODER_SCOPING_LIMIT', 'SCOPING_LIMIT'}
+        ) else Action.APPLY_COMPATIBILITY_RESULT
+        return SchedulerDecision(action)

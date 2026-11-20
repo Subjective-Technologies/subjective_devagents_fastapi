@@ -39,6 +39,7 @@ from .chat_core import ChatCore
 from .llm_service import tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
 from .language_models.api import router as language_model_router
+from .schedulers.api import router as scheduler_router
 
 # Bumped by hand when shipping web UI layout/composer fixes. Also stamped at serve time
 # with the live git SHA so View Source proves which build the browser loaded.
@@ -345,6 +346,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="Subjective DevAgents", lifespan=lifespan)
 app.include_router(language_model_router)
+app.include_router(scheduler_router)
 
 def _serve_ui() -> bool:
     """False on the Hetzner API host. Set SUBJECTIVE_DEVAGENTS_SERVE_UI=1 to ship HTML too."""
@@ -363,6 +365,19 @@ async def require_api_token(request: Request, call_next):
     unauthenticated request must not reach a handler that reads conversations or starts a
     turn. Static UI files stay public: they are an empty shell without the API.
     """
+    if request.url.path in {'/api/collaboration/schedulers/plan', '/api/collaboration/schedulers/catalog'}:
+        from .schedulers.api import authorized
+        if not authorized(request.headers.get('X-Scheduler-Token', '')):
+            return JSONResponse(status_code=401, content={'error': 'scheduler_auth_required'})
+        if request.method != 'POST':
+            return JSONResponse(status_code=405, content={'error': 'method_not_allowed'})
+        content = bytearray()
+        async for chunk in request.stream():
+            content.extend(chunk)
+            if len(content) > 24000:
+                return JSONResponse(status_code=413, content={'error': 'scheduler_request_too_large'})
+        request._body = bytes(content)
+        return await call_next(request)
     if request.url.path == '/api/collaboration/execute' and request.method == 'POST':
         length = request.headers.get('Content-Length', '')
         if not length.isdigit() or int(length) > 2048:

@@ -103,3 +103,21 @@ def test_plan_routes_manager_by_authorized_skill_and_preserves_explicit_targets(
     result = plan(request, token)
     assert result['decision']['agents'] == ('ai_worker',)
     assert result['decision']['manager'] == 'ai_planner'
+
+
+def test_legacy_strategy_returns_manager_handoff_candidates():
+    from subjective_devagents_fastapi.schedulers.models import Assignment
+
+    scheduler = LegacyMultiAgent()
+    roster = (('ai_planner', ('Manager',)), ('ai_worker', ('Coder',)), ('ai_other', ('Other',)))
+    manager = scheduler.on_outcome(ExecutionOutcome(
+        'completed', assignment=Assignment('ai_planner', 'ai_planner', roster),
+        reply='@Coder fix the test. @OtherAgent is outside the roster.',
+    ))
+    worker = scheduler.on_outcome(ExecutionOutcome(
+        'completed', assignment=Assignment('ai_worker', 'ai_planner', roster), reply='@Other please continue',
+    ))
+    assert manager.action is Action.ROUTE_LEGACY_RESULT
+    assert manager.agents == ('ai_worker',)
+    assert worker.agents == ('ai_planner',)
+    assert worker.mentioned_agents == ('ai_other',)

@@ -419,6 +419,9 @@ class ChannelSession:
         self._state = None
         self.tool_capabilities = set()
         self.delegation = None
+        self.scheduler = None
+        self.scheduler_assignment = None
+        self.pending_user_decision = None
         self.completion_store = None
         self.fence_root = None
         self.pending_start = None
@@ -1088,6 +1091,7 @@ class ChannelSession:
             blocking_tasks=arguments.get('blocking_tasks', []))
         item = result['decision']
         self.blocked = item['status'] == 'PENDING'
+        self.pending_user_decision = item['id'] if self.blocked else None
         # UI renders the one canonical question. Repeated calls expose only reference ID.
         return f'[COORDINATION] Pending decision: {item["id"]}' if item['status'] == 'PENDING' else f'Decision {item["id"]}: {item.get("answer", item["status"])}'
 
@@ -1099,7 +1103,7 @@ class ChannelSession:
             self.call('gate', id='reply-header-' + self.binding['instance_id'],
                 kind='WORKFLOW_VERSION_DIAGNOSTIC', result='failed', metadata={
                     'source': 'provider_reply', 'observed': observed.group(0).strip()[:256], 'authoritative': expected})
-        if 'BLOCKED_EXECUTION_CAPABILITY' in reply:
+        if (not self.scheduler or self.scheduler.execution_policy.parse_legacy_reply) and 'BLOCKED_EXECUTION_CAPABILITY' in reply:
             self.blocked = True
         return ensure_header(reply, self.version, self.agent_role)
 
@@ -1111,6 +1115,17 @@ class ChannelSession:
                                      or error_code in {'model_request_timed_out', 'service_restarted', 'tool_timed_out'})
                                     and 'uncertain' not in str(error_code),
                 'failed_before_start': not self.start_acknowledged}
+        if self.scheduler:
+            from dataclasses import asdict
+            from .schedulers.models import ExecutionOutcome
+
+            observed = ('cancelled' if status == 'cancelled' and not self.blocked
+                        and error_code != 'service_restarted' else outcome)
+            reply = result.get('text') if self.scheduler.execution_policy.parse_legacy_reply and result else ''
+            decision = self.scheduler.on_outcome(ExecutionOutcome(
+                observed, self.pending_user_decision, error_code, self.scheduler_assignment, reply or '',
+            ))
+            data['scheduler_decision'] = asdict(decision)
         if self._usage_pending:
             data['usage_receipts'] = list(self._usage_pending.values())[-600:]
         if result is not None:
@@ -1127,6 +1142,8 @@ class ChannelSession:
     def publish_task_folder(self, text):
         """TAGGY-3532 merge-on-publish: a write turn's committed work goes straight to main."""
         from . import task_workspace
+        if self.scheduler and not self.scheduler.execution_policy.publish_task_workspace:
+            return text
         folder = self._task_folder()
         if not folder or not task_workspace.enabled():
             return text
@@ -1144,6 +1161,8 @@ class ChannelSession:
     def _retire_if_done(self, finished):
         """Delete the task folder once the task is DONE and everything in it is on main."""
         from . import task_workspace
+        if self.scheduler and not self.scheduler.execution_policy.publish_task_workspace:
+            return
         folder = self._task_folder()
         task = ((finished or {}).get('state') or {}).get('task') or {}
         if not folder or task.get('status') != 'DONE':

@@ -24,6 +24,8 @@ class SimpleV1:
     def on_outcome(self, result: ExecutionOutcome) -> SchedulerDecision:
         if result.decision_id:
             return SchedulerDecision(Action.REQUEST_USER_INPUT, decision_id=result.decision_id)
+        if result.error_code == 'service_restarted':
+            return SchedulerDecision(Action.RESUME_EXECUTION)
         action = {
             'completed': Action.COMPLETE_TASK, 'blocked': Action.BLOCK_TASK,
             'cancelled': Action.CANCEL_EXECUTION,
