@@ -121,3 +121,17 @@ def test_legacy_strategy_returns_manager_handoff_candidates():
     assert manager.agents == ('ai_worker',)
     assert worker.agents == ('ai_planner',)
     assert worker.mentioned_agents == ('ai_other',)
+
+
+@pytest.mark.parametrize(('message', 'needs_write'), [
+    ('@Claude, please edit value.txt', True),
+    ('@Claude, can you fix the tests?', True),
+    ('Hey @Claude, please edit value.txt', True),
+    ('@Claude — could you explain the failure?', False),
+])
+def test_direct_assignment_preserves_write_intent_in_addressed_messages(message, needs_write):
+    from subjective_devagents_fastapi.collaboration import addressed_assignment
+    from subjective_devagents_fastapi.runtime_profiles import requirements_for
+
+    instruction = addressed_assignment(message, {'display_name': 'Claude'}, 'ai_claude')
+    assert ('fs_write' in requirements_for(instruction).runtime_capabilities()) is needs_write

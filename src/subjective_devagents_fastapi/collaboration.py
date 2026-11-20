@@ -191,8 +191,11 @@ def addressed_assignment(assignment, profile, agent_id):
     names = sorted({str(value).lstrip('@') for value in
                     (profile.get('display_name'), profile.get('handle'), agent_id) if value},
                    key=lambda name: (-len(name), name))
-    prefix = r'^\s*@(?:' + '|'.join(map(re.escape, names)) + r')(?![\w-])[\s,:]+'
-    return re.sub(prefix, '', assignment, count=1, flags=re.IGNORECASE).strip()
+    prefix = (r'^\s*(?:(?:hi|hey|hello)[\s,]+)?@(?:' + '|'.join(map(re.escape, names))
+              + r')(?![\w-])[\s,:—–-]+')
+    instruction = re.sub(prefix, '', assignment, count=1, flags=re.IGNORECASE).strip()
+    return re.sub(r'^(?:please\s+)?(?:can|could|would|will) you\s+', '', instruction,
+                  count=1, flags=re.IGNORECASE)
 
 
 def select_runtime(profile, identity, assignment, *, stage=None, capabilities=None, grants=None):
