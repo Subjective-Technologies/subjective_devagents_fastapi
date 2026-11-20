@@ -207,6 +207,8 @@ class LanguageModel:
             result = ModelResult("interrupted", result.text, result.session_id, result.error_code or result.status)
         if coordination and result.status == "completed":
             try:
+                if getattr(coordination, "publish_task_folder", None):
+                    result = replace(result, text=coordination.publish_task_folder(result.text))
                 result = replace(result, text=coordination.canonical_reply(result.text))
                 # Backend-owned [RT:] line from this turn's recorded tool events. Tool counts
                 # are progress, not functional acceptance. A model cannot forge this line.

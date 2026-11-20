@@ -1117,6 +1117,43 @@ class ChannelSession:
             data['result'] = result
         return {'binding': self.binding, 'actor': self.actor, 'delegation': self.delegation, 'data': data}
 
+    def _task_folder(self):
+        from . import task_workspace
+        identity = self.identity
+        if not identity or identity.ssh_host or identity.sandbox != 'workspace-write':
+            return None
+        return identity.workspace if task_workspace.task_root(identity.workspace) else None
+
+    def publish_task_folder(self, text):
+        """TAGGY-3532 merge-on-publish: a write turn's committed work goes straight to main."""
+        from . import task_workspace
+        folder = self._task_folder()
+        if not folder or not task_workspace.enabled():
+            return text
+        try:
+            outcome = task_workspace.publish(folder)
+        except Exception as error:   # never lose the turn's reply over publication
+            log.exception('Task folder publication failed folder=%s', folder)
+            outcome = {'pushed': [], 'problems': [f'{folder}: {error}']}
+        lines = [f"- pushed {item['commits']} commit(s) of {item['repository']} to {item['target']} at {item['sha'][:12]}"
+                 for item in outcome['pushed']] + [f'- NOT published: {problem}' for problem in outcome['problems']]
+        for item in outcome['pushed']:
+            log.info('Task folder published repo=%s sha=%s', item['repository'], item['sha'])
+        return text + ('\n\nTask folder publication (runtime):\n' + '\n'.join(lines) if lines else '')
+
+    def _retire_if_done(self, finished):
+        """Delete the task folder once the task is DONE and everything in it is on main."""
+        from . import task_workspace
+        folder = self._task_folder()
+        task = ((finished or {}).get('state') or {}).get('task') or {}
+        if not folder or task.get('status') != 'DONE':
+            return
+        try:
+            outcome = task_workspace.retire(folder)
+            log.info('Task folder retire folder=%s removed=%s problems=%s', folder, outcome['removed'], outcome['problems'])
+        except Exception:
+            log.exception('Task folder retire failed folder=%s', folder)
+
     def finish(self, status, error_code=None, result=None):
         if self.closed:
             return
@@ -1125,7 +1162,8 @@ class ChannelSession:
             with self.completion_store.connection() as db:
                 db.execute('INSERT OR REPLACE INTO coordination_completions VALUES(?,?)',
                            (self.binding['dispatch_id'], json.dumps(payload)))
-        self.call('finish', **payload['data'])
+        finished = self.call('finish', **payload['data'])
+        self._retire_if_done(finished)
         if self.delegation and self.completion_store:
             with self.completion_store.connection() as db:
                 db.execute('DELETE FROM coordination_completions WHERE dispatch_id=? AND payload=?',

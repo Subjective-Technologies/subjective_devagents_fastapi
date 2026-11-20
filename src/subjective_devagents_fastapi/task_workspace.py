@@ -54,7 +54,8 @@ def _git(cwd, *args, timeout=120):
     result = subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(cwd), *args], capture_output=True,
                             text=True, timeout=timeout,
                             env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': os.environ.get('HOME', '/tmp'),
-                                 'GIT_TERMINAL_PROMPT': '0'})
+                                 'GIT_TERMINAL_PROMPT': '0',
+                                 **{k: os.environ[k] for k in ('SSH_AUTH_SOCK', 'GIT_SSH_COMMAND') if os.environ.get(k)}})
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
@@ -75,8 +76,15 @@ def _add_worktree(repository: Path, location: Path, branch: str):
     if location.exists() and any(location.iterdir()):
         raise ModelError('task_workspace_failed', f'{location} exists and is not empty; cannot place a worktree there')
     code, _, _ = _git(repository, 'rev-parse', '--verify', '--quiet', f'refs/heads/{branch}', timeout=10)
+    # A new task branch starts from the published main line, so local commits other tasks left
+    # unpushed in the shared checkout never ride along when this branch is pushed to main.
+    start = 'HEAD'
+    if code != 0:
+        found, upstream, _ = _git(repository, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', 'origin/HEAD', timeout=10)
+        if found == 0 and upstream.startswith('origin/'):
+            start = upstream
     args = ('worktree', 'add', str(location), branch) if code == 0 else \
-        ('worktree', 'add', '-b', branch, str(location), 'HEAD')
+        ('worktree', 'add', '--no-track', '-b', branch, str(location), start)
     with _repo_lock(repository):
         code, _, error = _git(repository, *args, timeout=600)
     if code:
@@ -136,6 +144,16 @@ def materialize(workspace: str | Path, target: str | Path) -> list[str]:
             source, link = base / nested / name, location / name
             if source.is_dir() and not link.exists() and _git(location, 'check-ignore', '-q', name + '/', timeout=10)[0] == 0:
                 link.symlink_to(source)
+                # `node_modules/` (trailing slash) does not match a symlink; exclude the link
+                # itself so it never shows as an untracked change or blocks publication.
+                code, exclude, _ = _git(location, 'rev-parse', '--path-format=absolute', '--git-path',
+                                        'info/exclude', timeout=10)
+                if code == 0 and exclude:
+                    exclude = Path(exclude)
+                    lines = exclude.read_text().splitlines() if exclude.exists() else []
+                    if f'/{name}' not in lines:
+                        exclude.parent.mkdir(parents=True, exist_ok=True)
+                        exclude.write_text('\n'.join(lines + [f'/{name}']) + '\n')
         created.append(str(location))
     return created
 
@@ -162,6 +180,55 @@ def tool_targets(workspace: str, name: str, arguments: dict) -> list[str]:
     return [t for t in targets if t == folder or t.startswith(folder + '/')]
 
 
+def _trees(folder: Path) -> list[Path]:
+    """Every worktree in a task folder, innermost first."""
+    return sorted((p.parent for p in folder.rglob('.git') if 'node_modules' not in p.parts),
+                  key=lambda p: -len(p.parts))
+
+
+def _mainline(tree: Path) -> str:
+    code, upstream, _ = _git(tree, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', 'origin/HEAD', timeout=10)
+    return upstream if code == 0 and upstream.startswith('origin/') else 'origin/main'
+
+
+def publish(folder: str | Path) -> dict:
+    """Merge-on-publish: put each worktree's task-branch commits straight onto origin's main line.
+
+    Per worktree: fetch, rebase the task branch onto origin/main, push HEAD:main (fast-forward
+    only, never forced). A conflict aborts the rebase and is reported, never resolved by choosing
+    a side. Uncommitted changes are reported and left alone."""
+    roots = task_root(folder)
+    if roots is None:
+        raise ModelError('task_workspace_failed', 'Not a task folder')
+    _, folder = roots
+    pushed, problems = [], []
+    for tree in _trees(folder):
+        code, status, _ = _git(tree, 'status', '--porcelain', '--ignore-submodules=all', timeout=60)
+        if code or status:
+            problems.append(f'{tree}: uncommitted changes, not published')
+            continue
+        code, _, error = _git(tree, 'fetch', '-q', 'origin', timeout=300)
+        if code:
+            problems.append(f'{tree}: fetch failed: {error[-200:]}')
+            continue
+        mainline = _mainline(tree)
+        code, ahead, _ = _git(tree, 'rev-list', '--count', f'{mainline}..HEAD', timeout=30)
+        if code or ahead in {'', '0'}:
+            continue
+        code, _, error = _git(tree, 'rebase', '-q', mainline, timeout=300)
+        if code:
+            _git(tree, 'rebase', '--abort', timeout=60)
+            problems.append(f'{tree}: conflicts with {mainline}, not published: {error[-300:]}')
+            continue
+        code, _, error = _git(tree, 'push', '-q', 'origin', 'HEAD:' + mainline.split('/', 1)[1], timeout=300)
+        if code:
+            problems.append(f'{tree}: push to {mainline} failed: {error[-300:]}')
+            continue
+        pushed.append({'repository': str(tree), 'sha': _git(tree, 'rev-parse', 'HEAD', timeout=10)[1],
+                       'target': mainline, 'commits': int(ahead)})
+    return {'pushed': pushed, 'problems': problems}
+
+
 def retire(folder: str | Path, *, force: bool = False) -> dict:
     """Remove a finished task folder. Refuses while any worktree has uncommitted changes
     or commits on its task branch that the repository's main line does not contain."""
@@ -170,8 +237,7 @@ def retire(folder: str | Path, *, force: bool = False) -> dict:
         raise ModelError('task_workspace_failed', 'Not a task folder')
     base, folder = roots
     branch = branch_for(folder)
-    trees = sorted((p.parent for p in folder.rglob('.git') if 'node_modules' not in p.parts),
-                   key=lambda p: -len(p.parts))
+    trees = _trees(folder)
     problems = []
     for tree in trees:
         # Nested worktrees are checked on their own, so the parent ignores its gitlinks.
@@ -179,8 +245,7 @@ def retire(folder: str | Path, *, force: bool = False) -> dict:
         if code or status:
             problems.append(f'{tree}: uncommitted changes')
             continue
-        code, upstream, _ = _git(tree, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', 'origin/HEAD', timeout=10)
-        mainline = upstream if code == 0 and upstream else 'origin/main'
+        mainline = _mainline(tree)
         code, ahead, _ = _git(tree, 'rev-list', '--count', f'{mainline}..{branch}', timeout=30)
         if code or ahead not in {'', '0'}:
             problems.append(f'{tree}: {ahead or "?"} commit(s) on {branch} not in {mainline}')
@@ -193,5 +258,9 @@ def retire(folder: str | Path, *, force: bool = False) -> dict:
                 link.unlink()
         # Run from the repository that owns the worktree, never from inside the tree itself.
         owner = base / tree.relative_to(folder) if tree != folder else base
-        _git(owner, 'worktree', 'remove', *(['--force'] if force else []), str(tree), timeout=120)
+        code, _, _ = _git(owner, 'worktree', 'remove', *(['--force'] if force else []), str(tree), timeout=120)
+        if code == 0 and not problems:
+            # Verified above: every commit on the branch is already on origin's main line.
+            # A forced removal keeps the branch so unpublished commits stay recoverable.
+            _git(owner, 'branch', '-D', branch, timeout=30)
     return {'removed': not folder.exists(), 'problems': problems}

@@ -785,7 +785,8 @@ def agent_system_prompt(identity) -> str:
                 f"Work only here, never in {roots[0]} directly. A nested repository in this folder is "
                 f"created as a git worktree on branch {branch_for(roots[1])} the first time a tool names a "
                 "path in it. Install dependencies there if a build needs them (node_modules is linked "
-                "from the shared checkout when it exists). Commit on that branch; publishing merges it."
+                "from the shared checkout when it exists). Commit on that branch. When the turn ends, the runtime "
+                "rebases committed work onto origin main and pushes it to main; uncommitted changes are not published."
             )
         from ..channel_coordination import lease_roots
         extra = [str(root) for root in lease_roots(identity)[1:]]

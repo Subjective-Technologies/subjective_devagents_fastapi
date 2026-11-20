@@ -102,3 +102,81 @@ def test_retire_refuses_unmerged_work_then_removes(base):
     assert result['removed'] and not folder.exists()
     assert (base / 'services' / 'svc' / 'node_modules').is_dir()
     assert (base / 'services' / 'svc' / 'app.py').read_text() == 'print(1)\n'
+
+
+def with_remote(repo, tmp_path, name):
+    remote = tmp_path / f'{name}.git'
+    subprocess.run(['git', 'init', '-q', '--bare', '-b', 'main', str(remote)], check=True)
+    git(repo, 'remote', 'add', 'origin', str(remote))
+    git(repo, 'push', '-q', '-u', 'origin', 'main')
+    git(repo, 'remote', 'set-head', 'origin', 'main')
+    return remote
+
+
+def other_clone(remote, tmp_path):
+    other = tmp_path / 'other'
+    subprocess.run(['git', 'clone', '-q', str(remote), str(other)], check=True)
+    git(other, 'config', 'user.email', 'o@example.com')
+    git(other, 'config', 'user.name', 'o')
+    return other
+
+
+def test_publish_pushes_task_commits_straight_to_main_then_retire_cleans_up(base, tmp_path):
+    svc = base / 'services' / 'svc'
+    remote = with_remote(svc, tmp_path, 'svc')
+    with_remote(base, tmp_path, 'parent')
+    folder = task_workspace.create(base, 'taggy-6-abc')
+    task_workspace.materialize(folder, 'services/svc/app.py')
+    tree = folder / 'services' / 'svc'
+    (tree / 'app.py').write_text('print(6)\n')
+    git(tree, 'commit', '-qam', 'TAGGY-6 change')
+    # Someone else pushed meanwhile: the task branch is rebased on top, never forced.
+    other = other_clone(remote, tmp_path)
+    (other / 'other.txt').write_text('x\n')
+    git(other, 'add', '.')
+    git(other, 'commit', '-qm', 'other')
+    git(other, 'push', '-q', 'origin', 'main')
+
+    result = task_workspace.publish(folder)
+    assert result['problems'] == []
+    assert [item['repository'] for item in result['pushed']] == [str(tree)]
+    assert git(remote, 'rev-parse', 'main') == result['pushed'][0]['sha']
+    assert git(remote, 'show', 'main:app.py') == 'print(6)' and git(remote, 'show', 'main:other.txt') == 'x'
+
+    assert task_workspace.retire(folder) == {'removed': True, 'problems': []}
+    assert 'task/taggy-6-abc' not in git(svc, 'branch', '--list')
+
+
+def test_publish_reports_conflicts_and_uncommitted_work_without_pushing(base, tmp_path):
+    svc = base / 'services' / 'svc'
+    remote = with_remote(svc, tmp_path, 'svc')
+    folder = task_workspace.create(base, 'taggy-7-abc')
+    task_workspace.materialize(folder, 'services/svc/app.py')
+    tree = folder / 'services' / 'svc'
+    (tree / 'app.py').write_text('print(7)\n')
+    git(tree, 'commit', '-qam', 'TAGGY-7 change')
+    other = other_clone(remote, tmp_path)
+    (other / 'app.py').write_text('print(99)\n')
+    git(other, 'commit', '-qam', 'same line')
+    git(other, 'push', '-q', 'origin', 'main')
+    before = git(remote, 'rev-parse', 'main')
+    (folder / 'README.md').write_text('dirty\n')
+
+    result = task_workspace.publish(folder)
+    assert result['pushed'] == []
+    assert any('conflicts' in p and p.startswith(str(tree) + ':') for p in result['problems'])
+    assert any('uncommitted' in p and p.startswith(str(folder) + ':') for p in result['problems'])
+    assert git(remote, 'rev-parse', 'main') == before
+    assert git(tree, 'status', '--porcelain') == '' and (tree / 'app.py').read_text() == 'print(7)\n'
+    assert not task_workspace.retire(folder)['removed']
+
+
+def test_new_task_branch_starts_from_published_main(base, tmp_path):
+    svc = base / 'services' / 'svc'
+    with_remote(svc, tmp_path, 'svc')
+    (svc / 'local.txt').write_text('unpushed\n')
+    git(svc, 'add', '.')
+    git(svc, 'commit', '-qm', 'another task, unpushed')
+    folder = task_workspace.create(base, 'taggy-8-abc')
+    task_workspace.materialize(folder, 'services/svc')
+    assert not (folder / 'services' / 'svc' / 'local.txt').exists()
