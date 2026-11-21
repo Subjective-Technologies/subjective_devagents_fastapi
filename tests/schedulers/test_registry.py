@@ -150,6 +150,19 @@ def test_direct_scheduler_honors_explicit_configured_default(monkeypatch):
     request.addressed = ['ai_one']
     assert plan(request)['decision']['agents'] == ('ai_one',)
 
+
+def test_direct_scheduler_selects_only_write_authorized_agent_for_edit_task():
+    request = TaskRequest(('ai_readonly', 'ai_direct'), write_capable_agents=('ai_direct',),
+                          write_required=True)
+    assert SimpleV1().start(request).agents == ('ai_direct',)
+
+
+def test_direct_scheduler_refuses_explicit_readonly_agent_for_edit_task():
+    request = TaskRequest(('ai_readonly', 'ai_direct'), addressed=('ai_readonly',),
+                          write_capable_agents=('ai_direct',), write_required=True)
+    with pytest.raises(SchedulerError, match='lacks authorized workspace write access'):
+        SimpleV1().start(request)
+
 def test_roleless_agent_excludes_specialized_strategies():
     registry = SchedulerRegistry()
     registry.register(SimpleV1())

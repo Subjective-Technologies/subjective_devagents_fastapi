@@ -15,18 +15,30 @@ class SimpleV1:
         return bool(request.agents)
 
     def start(self, request: TaskRequest) -> SchedulerDecision:
-        if request.active_agent and request.active_agent not in request.agents:
-            raise SchedulerError('SCHEDULER_AGENT_UNAVAILABLE', 'The original task agent is unavailable')
+        eligible = request.agents
+        if request.write_required:
+            allowed = set(request.write_capable_agents)
+            eligible = tuple(agent for agent in request.agents if agent in allowed)
+        if request.active_agent and request.active_agent not in eligible:
+            message = ('The original task agent lacks authorized workspace write access'
+                       if request.write_required else 'The original task agent is unavailable')
+            raise SchedulerError('SCHEDULER_AGENT_UNAVAILABLE', message)
         if request.active_agent:
             return SchedulerDecision(Action.DISPATCH_AGENT, (request.active_agent,))
-        addressed = tuple(agent for agent in request.addressed if agent in request.agents)
-        if len(addressed) == 1:
+        addressed = tuple(agent for agent in request.addressed if agent in eligible)
+        if len(request.addressed) == 1 and len(addressed) == 1:
             return SchedulerDecision(Action.DISPATCH_AGENT, addressed)
+        if request.write_required and len(request.addressed) == 1 and not addressed:
+            raise SchedulerError('SCHEDULER_AGENT_UNAVAILABLE',
+                                 'The addressed AI user lacks authorized workspace write access')
         if not request.addressed:
-            if len(request.agents) == 1:
-                return SchedulerDecision(Action.DISPATCH_AGENT, request.agents)
-            if request.default_agent in request.agents:
+            if len(eligible) == 1:
+                return SchedulerDecision(Action.DISPATCH_AGENT, eligible)
+            if request.default_agent in eligible:
                 return SchedulerDecision(Action.DISPATCH_AGENT, (request.default_agent,))
+        if request.write_required and not eligible:
+            raise SchedulerError('SCHEDULER_AGENT_UNAVAILABLE',
+                                 'No available AI user has authorized workspace write access')
         raise SchedulerError('SCHEDULER_AGENT_SELECTION_REQUIRED', 'Address one available AI user to start this task')
 
     def on_outcome(self, result: ExecutionOutcome) -> SchedulerDecision:

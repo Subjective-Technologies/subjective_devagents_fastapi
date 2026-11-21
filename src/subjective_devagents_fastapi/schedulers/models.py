@@ -30,6 +30,8 @@ class TaskRequest:
     orchestrators: tuple[str, ...] = ()
     dedicated_orchestrators: tuple[str, ...] = ()
     implementation_owners: tuple[str, ...] = ()
+    write_capable_agents: tuple[str, ...] = ()
+    write_required: bool = False
     repository_available: bool = False
     active_agent: str | None = None
     default_agent: str | None = None

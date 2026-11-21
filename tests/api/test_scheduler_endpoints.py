@@ -44,6 +44,23 @@ def test_scheduler_plan_honors_preference_and_refuses_missing_pin(owner_client, 
     assert refused.json()["error"] == "SCHEDULER_UNAVAILABLE"
 
 
+def test_scheduler_plan_selects_write_authorized_direct_agent(owner_client, scheduler_headers):
+    path = '/api/collaboration/schedulers/plan'
+    response = owner_client.post(path, headers=scheduler_headers, json={
+        'agents': ['ai_readonly', 'ai_direct'], 'preference': 'simple_v1',
+        'write_required': True, 'write_capable_agents': ['ai_direct'],
+    })
+    assert response.status_code == 200
+    assert response.json()['decision']['agents'] == ['ai_direct']
+
+    refused = owner_client.post(path, headers=scheduler_headers, json={
+        'agents': ['ai_readonly', 'ai_direct'], 'addressed': ['ai_readonly'],
+        'preference': 'simple_v1', 'write_required': True, 'write_capable_agents': ['ai_direct'],
+    })
+    assert refused.status_code == 409
+    assert refused.json()['error'] == 'SCHEDULER_AGENT_UNAVAILABLE'
+
+
 def test_scheduler_plan_rejects_oversized_body(owner_client, scheduler_headers):
     response = owner_client.post(
         "/api/collaboration/schedulers/plan",
