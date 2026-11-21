@@ -51,3 +51,30 @@ def test_scheduler_plan_rejects_oversized_body(owner_client, scheduler_headers):
         content=b"x" * 24001,
     )
     assert response.status_code == 413
+
+def test_catalog_and_plan_use_existing_company_login(owner_client, monkeypatch):
+    from subjective_devagents_fastapi import agent_workflow
+
+    monkeypatch.delenv("COORDINATION_SCHEDULER_TOKEN", raising=False)
+    monkeypatch.setenv("COORDINATION_COMPANY_ID", "fixture-company")
+    monkeypatch.delenv("COLLABORATION_DISABLED_SCHEDULERS", raising=False)
+    calls = []
+
+    def fetch_export(company, authorization, *, opener):
+        calls.append(company)
+        if authorization != "Bearer member-fixture":
+            raise agent_workflow.WorkflowUnavailable("Caller lacks company workflow access")
+        return {"version": {"version": "20261114000000"}, "files": []}
+
+    monkeypatch.setattr(agent_workflow, "fetch_export", fetch_export)
+    path = "/api/collaboration/schedulers"
+    rejected = owner_client.post(path + "/catalog", headers={"Authorization": "Bearer other-company-fixture"})
+    assert rejected.status_code == 401
+    headers = {"Authorization": "Bearer member-fixture"}
+    catalog = owner_client.post(path + "/catalog", headers=headers).json()["schedulers"]
+    assert any(row["id"] == "simple_v1" and row["display_name"] == "Direct LLM" for row in catalog)
+    response = owner_client.post(path + "/plan", headers=headers,
+                                 json={"agents": ["ai_worker"], "preference": "simple_v1"})
+    assert response.status_code == 200
+    assert response.json()["decision"]["agents"] == ["ai_worker"]
+    assert calls == ["fixture-company"] * 3

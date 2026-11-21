@@ -1,10 +1,11 @@
-"""Installation-authenticated planning for the Chat journal."""
+"""Planning for Chat using existing company authorization."""
 from dataclasses import asdict
 import hmac
 import os
 from typing import Annotated
+from urllib.request import HTTPRedirectHandler, build_opener
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StringConstraints
 
@@ -30,15 +31,34 @@ class PlanRequest(BaseModel):
     preference: Identifier | None = None
 
 
-def authorized(token: str) -> bool:
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        return None
+
+
+_workflow_opener = build_opener(_NoRedirect())
+
+
+def authorized(token: str, authorization: str = '') -> bool:
+    # Installed service tokens keep working during rollout and background recovery.
     expected = os.environ.get('COORDINATION_SCHEDULER_TOKEN', '')
-    return len(expected) >= 32 and hmac.compare_digest(expected.encode(), token.encode())
+    if len(expected) >= 32 and hmac.compare_digest(expected.encode(), token.encode()):
+        return True
+    company = os.environ.get('COORDINATION_COMPANY_ID', '')
+    if not company or len(authorization) > 16384 or not authorization.lower().startswith('bearer '):
+        return False
+    from ..agent_workflow import WorkflowUnavailable, fetch_export
+
+    try:
+        # WorkTwins verifies the existing login and access to this runtime's company.
+        fetch_export(company, authorization, opener=_workflow_opener.open)
+    except WorkflowUnavailable:
+        return False
+    return True
 
 
 @router.post('/catalog')
-def catalog(repository_available: bool = False, x_scheduler_token: str = Header(default='')):
-    if not authorized(x_scheduler_token):
-        raise HTTPException(401, 'Scheduler service authentication is required')
+def catalog(repository_available: bool = False):
     request = TaskRequest(('available',), implementation_owners=('available',),
                           repository_available=repository_available)
     entries = configured_registry().candidates(request)
@@ -46,9 +66,7 @@ def catalog(repository_available: bool = False, x_scheduler_token: str = Header(
 
 
 @router.post('/plan')
-def plan(body: PlanRequest, x_scheduler_token: str = Header(default='')):
-    if not authorized(x_scheduler_token):
-        raise HTTPException(401, 'Scheduler service authentication is required')
+def plan(body: PlanRequest):
     agents = tuple(dict.fromkeys(body.agents))
     request = TaskRequest(
         agents, tuple(agent for agent in dict.fromkeys(body.addressed) if agent in agents),

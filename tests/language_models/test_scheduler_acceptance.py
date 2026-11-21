@@ -43,7 +43,6 @@ def test_two_channels_use_same_executor_and_distinct_worktrees(tmp_path, monkeyp
     env = {
         'COORDINATION_RUNTIME_URL': 'https://fixture.invalid',
         'COORDINATION_COMPANY_ID': 'company_test',
-        'COORDINATION_SCHEDULER_TOKEN': 'fixture-scheduler-token-32-characters',
         'COLLABORATION_DEFAULT_SCHEDULER': 'legacy_multi_agent',
         'COLLABORATION_DISABLED_SCHEDULERS': '',
         'SUBJECTIVE_DEVAGENTS_TASK_WORKTREES': '1',
@@ -86,8 +85,8 @@ def test_two_channels_use_same_executor_and_distinct_worktrees(tmp_path, monkeyp
         {'path': 'agents/roles/coder_agent.md', 'content': 'Implement and test.'},
     ]}
     monkeypatch.setattr(agent_workflow, 'fetch_export_as_service', lambda *_args, **_kwargs: export)
-    monkeypatch.setattr(scheduler_transport, '_request', lambda _route, body:
-                        json.loads(json.dumps(plan(PlanRequest(**body), env['COORDINATION_SCHEDULER_TOKEN']))))
+    monkeypatch.setattr(scheduler_transport, '_request', lambda _route, body, *, authorization:
+                        json.loads(json.dumps(plan(PlanRequest(**body)))))
 
     def callback(session, operation, **data):
         try:
@@ -233,7 +232,7 @@ def test_two_channels_use_same_executor_and_distinct_worktrees(tmp_path, monkeyp
                 request['assignment'] = request['execution']['prompt'] = assignment
             requests[channel] = request
             state = journal._load(channel)
-            chosen = scheduler_transport.plan(state, request)
+            chosen = scheduler_transport.plan(state, request, authorization='Bearer fixture')
             journal.mutate(channel, 'owner', {**request, '_scheduler_plan': chosen}, human=True)
         asyncio.run(queue.tick())
         for _ in range(1800 if live else 200):
@@ -293,7 +292,7 @@ def test_two_channels_use_same_executor_and_distinct_worktrees(tmp_path, monkeyp
                                    manager=True, human=True)
                     request = {**requests[channel], 'assignment': 'Keep the edit.', 'submission_id': 'answer',
                                'addressed_agents': ['ai_manager']}
-                    plan_result = scheduler_transport.plan(journal._load(channel), request)
+                    plan_result = scheduler_transport.plan(journal._load(channel), request, authorization='Bearer fixture')
                     assert plan_result['targets'] == ['ai_coder']
                     pending = journal.mutate(channel, 'owner', {**request, '_scheduler_plan': plan_result}, human=True)
                     assert pending['code'] == 'SCHEDULER_INPUT_PENDING'

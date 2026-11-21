@@ -92,15 +92,13 @@ def test_simple_consumes_typed_outcome_and_keeps_original_agent():
 
 
 def test_plan_routes_manager_by_authorized_skill_and_preserves_explicit_targets(monkeypatch):
-    token = 'test-scheduler-service-token-not-a-secret'
-    monkeypatch.setenv('COORDINATION_SCHEDULER_TOKEN', token)
     monkeypatch.setenv('COLLABORATION_DEFAULT_SCHEDULER', 'legacy_multi_agent')
     monkeypatch.delenv('COLLABORATION_DISABLED_SCHEDULERS', raising=False)
     request = PlanRequest(agents=['ai_worker', 'ai_planner'], orchestrators=['ai_planner'])
-    result = plan(request, token)
+    result = plan(request)
     assert result['decision']['agents'] == ('ai_planner',)
     request.addressed = ['ai_worker']
-    result = plan(request, token)
+    result = plan(request)
     assert result['decision']['agents'] == ('ai_worker',)
     assert result['decision']['manager'] == 'ai_planner'
 
@@ -145,14 +143,12 @@ def test_direct_scheduler_requests_explicit_selection_when_ambiguous(addressed):
 
 
 def test_direct_scheduler_honors_explicit_configured_default(monkeypatch):
-    token = 'test-scheduler-service-token-not-a-secret'
-    monkeypatch.setenv('COORDINATION_SCHEDULER_TOKEN', token)
     monkeypatch.setenv('COLLABORATION_DEFAULT_DIRECT_AGENT', 'ai_two')
     monkeypatch.delenv('COLLABORATION_DISABLED_SCHEDULERS', raising=False)
     request = PlanRequest(agents=['ai_one', 'ai_two'], preference='simple_v1')
-    assert plan(request, token)['decision']['agents'] == ('ai_two',)
+    assert plan(request)['decision']['agents'] == ('ai_two',)
     request.addressed = ['ai_one']
-    assert plan(request, token)['decision']['agents'] == ('ai_one',)
+    assert plan(request)['decision']['agents'] == ('ai_one',)
 
 def test_roleless_agent_excludes_specialized_strategies():
     registry = SchedulerRegistry()

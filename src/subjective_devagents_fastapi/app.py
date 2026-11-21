@@ -367,8 +367,6 @@ async def require_api_token(request: Request, call_next):
     """
     if request.url.path in {'/api/collaboration/schedulers/plan', '/api/collaboration/schedulers/catalog'}:
         from .schedulers.api import authorized
-        if not authorized(request.headers.get('X-Scheduler-Token', '')):
-            return JSONResponse(status_code=401, content={'error': 'scheduler_auth_required'})
         if request.method != 'POST':
             return JSONResponse(status_code=405, content={'error': 'method_not_allowed'})
         content = bytearray()
@@ -376,6 +374,9 @@ async def require_api_token(request: Request, call_next):
             content.extend(chunk)
             if len(content) > 24000:
                 return JSONResponse(status_code=413, content={'error': 'scheduler_request_too_large'})
+        if not await asyncio.to_thread(authorized, request.headers.get('X-Scheduler-Token', ''),
+                                       request.headers.get('Authorization', '')):
+            return JSONResponse(status_code=401, content={'error': 'scheduler_auth_required'})
         request._body = bytes(content)
         return await call_next(request)
     if request.url.path == '/api/collaboration/execute' and request.method == 'POST':
