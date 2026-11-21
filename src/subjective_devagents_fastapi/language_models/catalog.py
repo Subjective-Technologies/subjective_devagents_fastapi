@@ -56,11 +56,18 @@ def _load_proxy_models(url: str, key: str) -> dict[str, list[str]]:
             name = row.get("id")
             if not isinstance(name, str) or not MODEL_ID.fullmatch(name) or MEDIA.search(name):
                 continue
+            owner = str(row.get("owned_by") or "").strip().casefold()
             for provider, owners in OWNERS.items():
-                native = row.get("owned_by") in owners
+                native = owner in owners
+                # CLIProxy's OpenAI-compatible API-key routes can expose DeepSeek
+                # models with the generic `openai` owner. Keep them selectable under
+                # DeepSeek by their explicit model namespace; do not reassign them to
+                # another provider or accept unrelated OpenAI models as DeepSeek.
+                if name.casefold().startswith("deepseek-"):
+                    native = provider == "deepseek"
                 # Antigravity exposes both Gemini and Claude. Include only its Claude
                 # family here, retaining the exact gateway ID for inference routing.
-                routed_claude = (provider == "claude" and row.get("owned_by") == "antigravity"
+                routed_claude = (provider == "claude" and owner == "antigravity"
                                  and name.startswith("claude-"))
                 if native or routed_claude:
                     grouped[provider].add(name)

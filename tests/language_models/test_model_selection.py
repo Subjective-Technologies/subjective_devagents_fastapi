@@ -35,13 +35,18 @@ def test_discovery_groups_by_family_and_owner_and_excludes_media(monkeypatch):
         {'id': 'gpt-test', 'owned_by': 'openai'}, {'id': 'claude-test', 'owned_by': 'anthropic'},
         {'id': 'gpt-image-2', 'owned_by': 'openai'}, {'id': 'claude-other', 'owned_by': 'antigravity'},
         {'id': 'gemini-test', 'owned_by': 'antigravity'},
-        {'id': 'gpt-test', 'owned_by': 'openai'}, {'id': 'grok-test', 'owned_by': 'xai'}]})
+        {'id': 'gpt-test', 'owned_by': 'openai'}, {'id': 'grok-test', 'owned_by': 'xai'},
+        {'id': 'deepseek-chat', 'owned_by': 'openai'},
+        {'id': 'gpt-unrelated', 'owned_by': 'openai'}]})
     client = Mock()
     client.__enter__ = Mock(return_value=client)
     client.__exit__ = Mock(return_value=False)
     client.get.return_value = response
     monkeypatch.setattr(catalog.httpx, 'Client', lambda **kwargs: client)
-    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': [], 'deepseek': [], 'antigravity': ['claude-other', 'gemini-test']}
+    assert catalog.proxy_models() == {'codex': ['gpt-test', 'gpt-unrelated'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': [], 'deepseek': ['deepseek-chat'], 'antigravity': ['claude-other', 'gemini-test']}
+    catalog.validate_model('deepseek', 'deepseek-chat')
+    with pytest.raises(ModelError, match='not available'):
+        catalog.validate_model('deepseek', 'gpt-unrelated')
     catalog.validate_model('claude', 'claude-other')
     with pytest.raises(ModelError, match='not available'):
         catalog.validate_model('claude', 'gemini-test')
