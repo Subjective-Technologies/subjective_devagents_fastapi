@@ -25,9 +25,10 @@ PROXY_MODEL_ENV = {"claude": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CLAUDE",
                    "codex": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_CODEX",
                    "grok": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_GROK",
                    "kimi": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI",
+                   "deepseek": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_DEEPSEEK",
                    "antigravity": "SUBJECTIVE_DEVAGENTS_LLM_MODEL_ANTIGRAVITY"}
 # Providers with no CLI of their own: they run only as api_agent identities behind the proxy.
-PROXY_ONLY_PROVIDERS = frozenset({"kimi", "antigravity"})
+PROXY_ONLY_PROVIDERS = frozenset({"kimi", "deepseek", "antigravity"})
 
 
 def proxy_default_model(provider: str, models: dict | None = None) -> str:

@@ -39,6 +39,7 @@ PROVIDER_ICONS = {
     "xai": "../assets/providers/grok.svg",
     "kimi": "../assets/providers/kimi.svg",
     "moonshot": "../assets/providers/kimi.svg",
+    "deepseek": "../assets/providers/deepseek.svg",
     "chatgpt": "../assets/providers/chatgpt.svg",
     "chat-gpt": "../assets/providers/chatgpt.svg",
     "openai": "../assets/providers/chatgpt.svg",
@@ -59,6 +60,7 @@ PROVIDER_LABELS = {
     "xai": "Grok",
     "kimi": "Kimi",
     "moonshot": "Kimi",
+    "deepseek": "DeepSeek",
     "chatgpt": "ChatGPT",
     "chat-gpt": "ChatGPT",
     "openai": "ChatGPT",
@@ -78,6 +80,7 @@ WRITABLE_PROVIDERS = {
     # Moonshot's Kimi has no CLI: it runs as the backend's own tool loop (ApiAgent) through
     # the LLM proxy, with SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI naming the model.
     "kimi": {"bundle": "kimi", "label": "Kimi"},
+    "deepseek": {"bundle": "deepseek", "label": "DeepSeek"},
     # Not an LLM CLI: the other end is a shell on another machine, and a turn's text is
     # run there as a command. The conversation's workspace names the target, written
     # `user@host:/path` — see datasources.ssh_connection_from_workspace.

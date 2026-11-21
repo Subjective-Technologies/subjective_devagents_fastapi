@@ -41,7 +41,7 @@ def test_discovery_groups_by_family_and_owner_and_excludes_media(monkeypatch):
     client.__exit__ = Mock(return_value=False)
     client.get.return_value = response
     monkeypatch.setattr(catalog.httpx, 'Client', lambda **kwargs: client)
-    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': [], 'antigravity': ['claude-other', 'gemini-test']}
+    assert catalog.proxy_models() == {'codex': ['gpt-test'], 'claude': ['claude-other', 'claude-test'], 'grok': ['grok-test'], 'kimi': [], 'deepseek': [], 'antigravity': ['claude-other', 'gemini-test']}
     catalog.validate_model('claude', 'claude-other')
     with pytest.raises(ModelError, match='not available'):
         catalog.validate_model('claude', 'gemini-test')
@@ -51,6 +51,24 @@ def test_wrong_provider_and_unknown_model_rejected(proxy):
     for model in ['claude-test', 'gpt-missing', '../bad']:
         with pytest.raises(ModelError):
             catalog.validate_model('codex', model)
+
+
+def test_deepseek_model_is_validated_and_runs_through_proxy(monkeypatch, tmp_path):
+    monkeypatch.delenv('SUBJECTIVE_LANGUAGE_MODELS_CONFIG', raising=False)
+    monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://127.0.0.1:8317/v1')
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, 'test-only-key')
+    monkeypatch.setattr(catalog, 'proxy_models', lambda: {'deepseek': ['deepseek-chat']})
+    monkeypatch.setenv(legacy.PROXY_MODEL_ENV['deepseek'], 'deepseek-chat')
+    service = LlmService(root=str(tmp_path), app_home=str(tmp_path / 'home'))
+    try:
+        conversation = service.create_conversation('deepseek', model='deepseek-chat')
+        identity = service.backend.identity(conversation, execution_required=True)
+        assert identity.provider == 'deepseek'
+        assert identity.model == 'deepseek-chat'
+        assert identity.strategy == 'api_agent'
+        assert 'api_agent:deepseek' in service.backend.model.strategies
+    finally:
+        service.backend.close()
 
 
 def test_model_handoff_preserves_history_and_survives_reload(proxy, tmp_path, monkeypatch):

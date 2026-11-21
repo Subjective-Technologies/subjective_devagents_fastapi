@@ -74,7 +74,8 @@ class LanguageModel:
             # so it stays on cli: above.
             "api_agent:codex": ApiAgent(), "api_agent:claude": ApiAgent(), "api_agent:grok": ApiAgent(),
             # Kimi has no CLI at all: the proxy is its only way in.
-            "api_agent:kimi": ApiAgent(), "api_agent:antigravity": ApiAgent(),
+            "api_agent:kimi": ApiAgent(), "api_agent:deepseek": ApiAgent(),
+            "api_agent:antigravity": ApiAgent(),
         }
         # Turns are I/O bound (model HTTP, tool subprocesses). Four shared workers let
         # four long turns starve every later dispatch until its start watchdog fired.

@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse, Response
 from . import auth, shell_exec, ssh_terminal
 from .deployment import source_fingerprint
 from .chat_core import ChatCore
-from .llm_service import tail_conversation_for_client
+from .llm_service import provider_label, tail_conversation_for_client
 from .system_users import is_valid_username, list_system_users
 from .language_models.api import router as language_model_router
 from .schedulers.api import router as scheduler_router
@@ -1140,6 +1140,12 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
             })
         except Exception as error:  # noqa: BLE001
             default_log("error", "LLM send background crash", {"target": target, "message": str(error)})
+            from .language_models.contracts import ModelError
+            details = (f" ({error.code}): {error}" if isinstance(error, ModelError) else "")
+            instance.broadcast("system", {
+                "target": target,
+                "text": f"{provider_label(conversation.get('provider'))} agent stopped before replying{details}. Runtime error recorded; retry or contact an administrator.",
+            })
         finally:
             if channel and not channel.closed and not (channel.delegation and channel.completion_store):
                 # Once the worker owns a durable receipt, cleanup must not replace

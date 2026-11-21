@@ -243,6 +243,28 @@ def test_f3_a_proxy_timeout_on_a_long_call_is_reported_as_pending_not_failed(cli
     }), ok=True)["conversation"]["busy"] is False
 
 
+def test_background_runtime_crash_is_reported_to_chat(client, chats, spy_send):
+    sent, outcome = spy_send
+
+    def crash(*_args, **_kwargs):
+        raise RuntimeError("provider transport failed")
+
+    outcome["result"] = crash
+    conversation = chats(provider="claude", name="runtime-crash")
+    with client.websocket_connect("/ws") as socket:
+        for expected in OPENING_FRAMES:
+            socket.receive_json()
+        accepted = envelope(client.post("/api/llm/send-message", json={
+            "target": conversation["target"], "text": "Run task",
+        }), ok=True)
+        assert accepted["pending"] is True
+        event = drain_until(socket, "system")
+        assert event["target"] == conversation["target"]
+        assert "agent stopped before replying" in event["text"]
+        assert "provider transport failed" not in event["text"]
+    wait_for(lambda: sent, what="the background turn running")
+
+
 def test_f4_a_failure_on_a_short_read_is_an_error_not_an_empty_success(client, monkeypatch):
     """`GET /api/llm/conversations` is a short read: a crash must not look like "no chats"."""
     from subjective_devagents_fastapi.app import state
