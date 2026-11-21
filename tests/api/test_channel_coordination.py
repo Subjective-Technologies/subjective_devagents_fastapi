@@ -8,6 +8,7 @@ def test_channel_binding_claim_worker_context_and_no_omission_bypass(client, mon
     from subjective_devagents_fastapi.app import core
     from subjective_devagents_fastapi.language_models import legacy
     monkeypatch.setenv(legacy.PROXY_URL_ENV,'http://unused/v1')
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV,'fixture-key')   # send admission checks it
     monkeypatch.setenv(legacy.PROXY_MODEL_ENV['codex'],'fixture-model')
     state={'enabled':True,'workflow_id':'workflow','workflow_version':None,'task_family':'TASK','task_revision':'1','revision':1,
            **{key:{} for key in ('facts','leases','decisions','capabilities','reviews','gates','worktrees','discoveries')}}
@@ -50,6 +51,7 @@ def test_busy_refused_before_dispatch_start_and_role_header_expected(client, mon
     from subjective_devagents_fastapi.app import core
     from subjective_devagents_fastapi.language_models import legacy
     monkeypatch.setenv(legacy.PROXY_URL_ENV,'http://unused/v1')
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV,'fixture-key')   # send admission checks it
     monkeypatch.setenv(legacy.PROXY_MODEL_ENV['codex'],'fixture-model')
     state={'enabled':True,'workflow_id':'workflow','workflow_version':None,'task_family':'TASK','task_revision':'1','revision':1,
            **{key:{} for key in ('facts','leases','decisions','capabilities','reviews','gates','worktrees','discoveries')}}
@@ -123,6 +125,7 @@ def test_browser_admitted_workflow_turn_uses_channel_assigned_version(client, mo
     from subjective_devagents_fastapi import agent_workflow
     from subjective_devagents_fastapi.language_models import legacy
     monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://unused/v1')
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, 'fixture-key')   # send admission checks it
     monkeypatch.setenv(legacy.PROXY_MODEL_ENV['codex'], 'fixture-model')
     service = core().llm_service
     state = {'enabled':True,'workflow_id':'workflow','workflow_version':'20261114000000', 'task_family':'TASK','task_revision':'1','revision':1,
@@ -153,6 +156,7 @@ def test_api_cleanup_preserves_workers_durable_failure_receipt(client, monkeypat
     from subjective_devagents_fastapi.app import core
     from subjective_devagents_fastapi.language_models import legacy
     monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://unused/v1')
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, 'fixture-key')   # send admission checks it
     monkeypatch.setenv(legacy.PROXY_MODEL_ENV['codex'], 'fixture-model')
     service = core().llm_service
     state = {'enabled':True,'workflow_id':'workflow','workflow_version':None,'task_family':'TASK','task_revision':'1','revision':1,

@@ -447,6 +447,7 @@ def test_kimi_runs_only_through_the_proxy(monkeypatch, tmp_path):
     from subjective_devagents_fastapi.language_models.contracts import ModelError
 
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_LLM_PROXY_URL", "http://127.0.0.1:8317/v1")
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, "fixture-key")   # part of "configured" too
     monkeypatch.setenv("SUBJECTIVE_DEVAGENTS_LLM_MODEL_KIMI", "kimi-k2.8-code")
     found = proxy_identity("kimi", "alice", "/tmp/ws", "/home/alice")
     assert found is not None and found.provider == "kimi" and found.strategy == "api_agent"

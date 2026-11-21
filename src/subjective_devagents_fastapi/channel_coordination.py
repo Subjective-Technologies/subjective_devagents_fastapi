@@ -439,13 +439,22 @@ class ChannelSession:
         self.assignment = ''
         self._last_touch = 0.0
         self._usage_pending = {}
+        # True once this runtime is stopping (LanguageModel.close sets it). Shutdown is the
+        # one case where an unreachable journal is not a verdict on the task: retries end,
+        # a lease loss is reported as service_restarted, and finish() persists locally.
+        self.stopping = lambda: False
 
     def __repr__(self):
         return f'ChannelSession(channel={self.binding["channel_id"]!r}, instance={self.binding["instance_id"]!r})'
 
     def call(self, op, **data):
-        """One journal operation; transient outages are retried with bounded backoff."""
-        delays = () if op in _NO_RETRY else CALL_BACKOFF
+        """One journal operation; transient outages are retried with bounded backoff.
+
+        While the runtime is stopping there is no retry at all: CALL_BACKOFF (1,2,4,8) on a
+        finish spent the unit's whole 30 s stop timeout and the process was SIGKILLed before
+        it could record the outcome.
+        """
+        delays = () if op in _NO_RETRY or self._is_stopping() else CALL_BACKOFF
         for attempt in range(len(delays) + 1):
             try:
                 return self._call_once(op, **data)
@@ -455,6 +464,12 @@ class ChannelSession:
                 log.warning('Coordination unavailable; retrying op=%s attempt=%d channel=%s',
                             op, attempt + 1, self.binding['channel_id'])
                 time.sleep(delays[attempt])
+
+    def _is_stopping(self):
+        try:
+            return bool(self.stopping())
+        except Exception:  # noqa: BLE001 - a broken predicate must not stop coordination
+            return False
 
     def _call_once(self, op, **data):
         body = {**data, 'op': op, 'actor_id': self.actor,
@@ -1131,6 +1146,15 @@ class ChannelSession:
             return False
         except ModelError as error:
             if error.code == 'coordination_unavailable':
+                if self._is_stopping():
+                    # This process is going away, so the journal cannot be reached from here
+                    # any more. The turn stops, but as an interrupted one whose successor
+                    # resumes it — not as a lease the channel took away. UNREACHABLE_GRACE
+                    # is untouched for a healthy process.
+                    self.revocation = 'service_restarted'
+                    log.info('Coordination stopped with the runtime channel=%s lease=%s',
+                             self.binding['channel_id'], self.lease_id)
+                    return True
                 # One failed request is not a revocation. Writes stay fenced by guard();
                 # only a journal that stays unreachable stops the turn.
                 self._unreachable_since = self._unreachable_since or self.last_check
@@ -1279,7 +1303,19 @@ class ChannelSession:
             with self.completion_store.connection() as db:
                 db.execute('INSERT OR REPLACE INTO coordination_completions VALUES(?,?)',
                            (self.binding['dispatch_id'], json.dumps(payload)))
-        finished = self.call('finish', **payload['data'])
+        try:
+            finished = self.call('finish', **payload['data'])
+        except ModelError as error:
+            if not (self._is_stopping() and self.delegation and self.completion_store):
+                raise
+            # One attempt, then leave the durable receipt for the next process to replay
+            # (collaboration recovery reads coordination_completions). Retrying here is what
+            # kept the worker alive until systemd SIGKILLed it.
+            log.warning('Completion persisted locally for replay channel=%s dispatch=%s code=%s',
+                        self.binding['channel_id'], self.binding['dispatch_id'], error.code)
+            self.closed = True
+            self._authorization = ''
+            return
         self._retire_if_done(finished)
         if self.delegation and self.completion_store:
             with self.completion_store.connection() as db:

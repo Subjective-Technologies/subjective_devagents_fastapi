@@ -46,9 +46,47 @@ def proxy_default_model(provider: str, models: dict | None = None) -> str:
 
 
 def proxy_configured(provider: str) -> bool:
-    """Whether the inference proxy has a configured or discoverable model."""
+    """Whether the inference proxy is usable for this provider: URL, API key and a model.
+
+    The key belongs in this answer. Without it a DeepSeek chat was offered as "loaded",
+    accepted a send with HTTP 200, and only then failed the turn with
+    authentication_required.
+    """
     model_env = PROXY_MODEL_ENV.get(provider)
-    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip() and proxy_default_model(provider))
+    return bool(model_env and os.environ.get(PROXY_URL_ENV, "").strip()
+                and os.environ.get(PROXY_KEY_ENV, "").strip() and proxy_default_model(provider))
+
+
+def proxy_credentials(identity: Identity) -> None:
+    """Refuse a proxy identity the inference proxy cannot answer for, before a turn starts.
+
+    Two things were taken on trust. The API key env was never checked where the identity is
+    built, so a missing key only surfaced inside the worker. And an operator-pinned model id
+    is routing metadata, not evidence that CLIProxy holds an upstream credential for that
+    provider: `catalog._load_proxy_models` deliberately keeps a pinned alias selectable, so a
+    provider the proxy cannot serve at all still produced a sendable identity.
+
+    An unreachable catalog proves nothing and is not grounds to refuse; the turn reports it.
+    """
+    if identity.api_key_env != PROXY_KEY_ENV:
+        return
+    if not os.environ.get(PROXY_KEY_ENV, "").strip():
+        raise ModelError("authentication_required",
+                         f"The inference proxy has no API key: set {PROXY_KEY_ENV} for this service.")
+    from .catalog import proxy_models
+    try:
+        available = proxy_models()
+    except ModelError:
+        return
+    if not available.get(identity.provider):
+        raise ModelError("authentication_required",
+                         f"The inference proxy exposes no {identity.provider} model: its upstream "
+                         f"{identity.provider} credential is missing.")
+    if identity.model not in available[identity.provider]:
+        raise ModelError("model_unavailable",
+                         f"The inference proxy does not serve {identity.model} for {identity.provider}.")
+
+
 EXECUTION_STRATEGIES = frozenset({"cli", "api_agent"})
 
 
@@ -159,6 +197,21 @@ class LegacyLanguageModel:
                             sandbox="workspace-write")
         self.model.identities.register_legacy(identity)
         return identity
+
+    def preflight(self, conversation: dict, execution_required: bool = False) -> None:
+        """Credential admission for one send, before the turn (and its prompt) exists.
+
+        Only credential refusals are raised here. Anything else this resolution can say
+        (configuration_required, identity_changed, a missing CLI) stays the business of the
+        send itself, which reports it with its own context.
+        """
+        try:
+            identity = self.identity(conversation, execution_required=execution_required)
+        except ModelError as error:
+            if error.code in {"authentication_required", "model_unavailable"}:
+                raise
+            return
+        proxy_credentials(identity)
 
     @staticmethod
     def history(source: dict) -> tuple[Message, ...]:

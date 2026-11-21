@@ -1028,6 +1028,19 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
     conversation = await asyncio.to_thread(instance.llm_service.find_conversation, target)
     if not conversation:
         return {"ok": False, "status": "not_found", "error": "Conversation was not found."}
+    # Credentials decide here, not inside the turn. A DeepSeek send used to be accepted with
+    # HTTP 200 and fail ~13 s later with authentication_required; the caller now gets one
+    # explicit refusal, and the session chooser still opens on an auth failure.
+    refusal = await asyncio.to_thread(instance.llm_service.preflight_send, target)
+    if refusal is not None:
+        if instance.llm_service.is_auth_failure(refusal):
+            sessions = instance.llm_service.list_provider_sessions(conversation["provider"])
+            instance.broadcast("llm-choose-session", {
+                "target": target, "provider": conversation["provider"], "text": text,
+                "currentUser": sessions.get("currentUser"), "sessions": sessions.get("users") or [],
+            })
+        status = 401 if refusal["status"] == "authentication_required" else 409
+        return JSONResponse(status_code=status, content=refusal)
     # From here on a Stop is honoured even before the turn starts (see cancel_message).
     instance.llm_service.accept_send(target)
     # A workflow-backed AI user: build its definition here from the company's
@@ -1129,13 +1142,22 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
     })
 
     async def run_send() -> None:
+        # Why the dispatch ended, for the cleanup completion below when the worker never
+        # owned a durable receipt of its own.
+        interruption: list[str | None] = [None]
         try:
             result = await asyncio.to_thread(instance.send_llm_message, target, text, files)
+            if result.get("continued"):
+                interruption[0] = str(result.get("status") or "")
             if not result.get("ok"):
                 # The definition did not reach the model; send it again next turn.
                 (instance.llm_service.agent_turns.get(target) or {}).pop("definition", None)
-            default_log("info" if result.get("ok") else "error", "LLM send background finished", {
+            # A Stop, a service restart and a context handoff are not failures: the same
+            # rule the chat layer applies (ChatCore.llm_turn_not_failed).
+            delivered = bool(result.get("ok")) or instance.llm_turn_not_failed(result)
+            default_log("info" if delivered else "error", "LLM send background finished", {
                 "target": target, "ok": bool(result.get("ok")),
+                "stopped": bool(result.get("stopped")), "continued": bool(result.get("continued")),
                 "status": result.get("status") or "", "error": result.get("error") or "",
             })
         except Exception as error:  # noqa: BLE001
@@ -1151,7 +1173,10 @@ async def api_llm_send_message(request: Request, body: dict = Body(default={})) 
                 # Once the worker owns a durable receipt, cleanup must not replace
                 # its result/error with a generic second failed completion.
                 try:
-                    await asyncio.to_thread(channel.finish, "failed")
+                    # A dispatch the service interrupted must not be reported as a failed
+                    # task: the scheduler resumes service_restarted / context_handoff and
+                    # FAIL_TASK here would end it.
+                    await asyncio.to_thread(channel.finish, "failed", interruption[0])
                 except Exception:
                     default_log("error", "Channel dispatch requires reconciliation", {"target": target})
             (instance.llm_service.agent_turns.get(target) or {}).pop("coordination", None)
@@ -1172,7 +1197,9 @@ async def api_datasources() -> dict:
     report = datasources.available()
     model = core().llm_service.backend.model
     model_path = str(Path(__file__).with_name("language_models") / "strategies.py")
-    from .language_models.legacy import PROXY_MODEL_ENV, PROXY_ONLY_PROVIDERS, PROXY_URL_ENV, proxy_configured
+    from .language_models.legacy import (
+        PROXY_KEY_ENV, PROXY_MODEL_ENV, PROXY_ONLY_PROVIDERS, PROXY_URL_ENV, proxy_configured,
+    )
 
     for key in WRITABLE_PROVIDERS:
         entry = report.setdefault(key, {"package": f"language-model:{key}", "found": True})
@@ -1183,7 +1210,8 @@ async def api_datasources() -> dict:
             # No plugin or CLI: it runs through the LLM proxy once that is configured.
             loaded = proxy_configured(key)
             strategies = ["api_agent"] if loaded else []
-            error = "" if loaded else f"runs only through the LLM proxy: set {PROXY_URL_ENV} and {PROXY_MODEL_ENV[key]}"
+            error = ("" if loaded else "runs only through the LLM proxy: set "
+                     f"{PROXY_URL_ENV}, {PROXY_KEY_ENV} and {PROXY_MODEL_ENV[key]}")
         entry.update({
             "found": True,
             "loaded": loaded,

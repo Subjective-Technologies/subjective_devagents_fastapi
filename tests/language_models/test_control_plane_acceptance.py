@@ -467,3 +467,75 @@ def test_scoping_limit_acceptance_xmi_editor(system, monkeypatch):
 def ChannelCoordination_binding(state, item):
     from subjective_chat_api.coordination import ChannelCoordination
     return ChannelCoordination.binding(state, item)
+
+
+def test_context_handoff_under_simple_v1_resumes_instead_of_failing_the_task(system):
+    """Production chat llm:grok:local:acfcd13c (2026-11-21 16:42:35 -0300).
+
+    A pinned scheduler reports its outcome through `scheduler_decision`, and that path mapped
+    every non-completed status to FAIL_TASK: the handoff ended the task with
+    `Grok error (failed): context_handoff` in the UI, with no `SUCCESSOR_AFTER_CONTEXT_LIMIT`
+    line and no successor turn. The handoff has to continue the same logical task here too.
+    """
+    s = system
+    s.execution.update(scheduler={'id': 'simple_v1', 'version': '1.0.0'}, structured_outcomes=True)
+    prompts, done = [], threading.Event()
+
+    class Budgeted(ModelStrategy):
+        def run(self, request, emit, cancelled):
+            prompts.append(request.prompt)
+            if len(prompts) == 1:
+                return ModelResult('failed', 'CONTINUATION_SUMMARY (...)', error_code='context_handoff', checkpoint={
+                    'schema': 2, 'reason': 'context_handoff', 'phase': 'TESTING', 'work_completed': ['added .xmi'],
+                    'files_changed': ['src/files.ts'], 'tests_passed': [], 'tests_failed': [],
+                    'repositories': [str(s.repo)], 'next_action': 'run the build'})
+            done.set()
+            return ModelResult('completed', 'Built it.')
+    s.model.strategies['api_agent:codex'] = Budgeted()
+    s.journal.mutate(s.channel, 'owner', {'op': 'dispatch', 'agent_id': 'ai_coder', 'assignment': 'Add .xmi import',
+                                          'execution': s.execution}, human=True)
+    tick(s)
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(x['status'] == 'DISPATCHED' and x['successor_of'] for x in dispatches(s)):
+        time.sleep(0.05)
+    tick(s)
+    assert done.wait(5), 'the handoff produced no successor dispatch'
+    s.model.close()
+
+    snapshot = s.journal.snapshot(s.channel)
+    kinds = [event['kind'] for event in snapshot['events']]
+    assert 'SUCCESSOR_AFTER_CONTEXT_LIMIT' in kinds
+    rows = dispatches(s)
+    assert [x['failure_code'] for x in rows if x['failure_code']] == ['CONTEXT_HANDOFF']
+    assert any(x['successor_of'] for x in rows)
+    # The task is not failed, and the successor was briefed from the checkpoint.
+    assert snapshot['task']['status'] != 'DONE' or snapshot['task'].get('scheduler_outcome') != 'failed'
+    first, second = prompts[0], prompts[1]
+    assert 'run the build' in second and 'TESTING' in second
+    assert len(second) < len(first) + 4000
+
+
+def test_a_context_handoff_is_not_reported_to_the_user_as_a_failed_send(tmp_path):
+    """The chat layer kept the prompt and said nothing about an error."""
+    from subjective_devagents_fastapi.chat_core import ChatCore
+
+    events = []
+    logged = []
+    core = ChatCore(root=str(tmp_path / 'root'), app_home=str(tmp_path / 'home'),
+                    log=lambda level, message, details=None: logged.append((level, message)),
+                    emit=events.append)
+    chat = core.llm_service.create_conversation('grok', 'context budget')
+    core.llm_service.backend.send = lambda conversation, source, request, register, clear, progress: {
+        'success': False, 'status': 'failed', 'error': 'context_handoff',
+        'response': '', 'session_id': '', 'turn_id': 'turn-1',
+    }
+
+    response = core.answer_llm_message(chat['target'], 'Add .xmi import', 'tester', False)
+
+    assert response.get('error') != 'context_handoff', 'the runtime code must not be the user-visible error'
+    assert response.get('continued') is True and response['status'] == 'context_handoff'
+    assert not [row for row in logged if row[0] == 'error'], logged
+    lines = [str(event.get('text') or '') for event in events if event.get('type') == 'system']
+    assert lines and not any('error (' in line for line in lines)
+    stored = core.llm_service.find_conversation(chat['target'], include_messages=True)
+    assert [message['text'] for message in stored['messages']] == ['Add .xmi import']

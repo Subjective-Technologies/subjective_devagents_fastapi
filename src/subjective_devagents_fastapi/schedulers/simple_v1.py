@@ -41,10 +41,16 @@ class SimpleV1:
                                  'No available AI user has authorized workspace write access')
         raise SchedulerError('SCHEDULER_AGENT_SELECTION_REQUIRED', 'Address one available AI user to start this task')
 
+    # The turn ended without an answer, but the request did not fail and the same logical
+    # task continues in a successor dispatch. The journal's failure policy decides how
+    # (SERVICE_RESTARTED retries the dispatch, CONTEXT_HANDOFF briefs the successor from the
+    # checkpoint); either way the task must not be failed and the prompt must not be lost.
+    RESUMABLE = ('service_restarted', 'context_handoff')
+
     def on_outcome(self, result: ExecutionOutcome) -> SchedulerDecision:
         if result.decision_id:
             return SchedulerDecision(Action.REQUEST_USER_INPUT, decision_id=result.decision_id)
-        if result.error_code == 'service_restarted':
+        if result.error_code in self.RESUMABLE:
             return SchedulerDecision(Action.RESUME_EXECUTION)
         action = {
             'completed': Action.COMPLETE_TASK, 'blocked': Action.BLOCK_TASK,

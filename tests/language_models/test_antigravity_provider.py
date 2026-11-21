@@ -13,6 +13,8 @@ from subjective_devagents_fastapi.d1_sync import map_provider
 
 def test_antigravity_binding_uses_discovered_default_and_selected_model(monkeypatch):
     monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://proxy/v1')
+    # The proxy key is part of "configured": without it the provider cannot answer a send.
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, 'fixture-key')
     monkeypatch.delenv(legacy.PROXY_MODEL_ENV['antigravity'], raising=False)
     monkeypatch.setattr(catalog, 'proxy_models', lambda: {'antigravity': ['claude-proxy', 'gemini-proxy']})
     account = pwd.getpwuid(os.geteuid())
@@ -29,6 +31,7 @@ def test_antigravity_binding_uses_discovered_default_and_selected_model(monkeypa
 
 def test_antigravity_default_override_and_unavailable_catalog(monkeypatch):
     monkeypatch.setenv(legacy.PROXY_URL_ENV, 'http://proxy/v1')
+    monkeypatch.setenv(legacy.PROXY_KEY_ENV, 'fixture-key')
     monkeypatch.setenv(legacy.PROXY_MODEL_ENV['antigravity'], 'operator-default')
     assert legacy.proxy_default_model('antigravity', {}) == 'operator-default'
     monkeypatch.delenv(legacy.PROXY_MODEL_ENV['antigravity'])
