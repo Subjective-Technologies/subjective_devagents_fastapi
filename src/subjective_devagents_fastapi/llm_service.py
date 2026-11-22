@@ -101,9 +101,15 @@ HEARTBEAT_INTERVAL_SECONDS = 8.0
 # logged at error, and the UI must not show "<label> error (...)" for either of these.
 #   service_restarted - this service stopped mid-turn (SIGTERM, deploy, drain)
 #   context_handoff   - the worker reached its context budget, checkpointed and handed off
+# The chat renders these prefixed with the agent's name, so each one has to read as a
+# progress note from that agent and not as its final answer: the first wording ("handed the
+# task to a successor") was reported as an error by an operator watching a Grok turn that
+# was in fact continuing normally.
 CONTINUED_TURN_CODES = {
-    "service_restarted": "The service restarted during this turn; the task continues in a new attempt.",
-    "context_handoff": "The agent reached its context budget and handed the task to a successor.",
+    "service_restarted": "Interrupted by a service restart. This task continues automatically "
+                         "in a new attempt - nothing to resend.",
+    "context_handoff": "Context budget reached. This task continues automatically in a new "
+                       "attempt, briefed from its checkpoint - nothing to resend.",
 }
 CURSOR_INJECT_POLL_MS = int(os.environ.get("CURSOR_INJECT_POLL_MS") or 2000)
 CURSOR_INJECT_POLL_MAX_MS = int(os.environ.get("CURSOR_INJECT_POLL_MAX_MS") or AGENT_TURN_TIMEOUT_SECONDS * 1000)
