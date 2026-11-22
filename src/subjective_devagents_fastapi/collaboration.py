@@ -214,6 +214,36 @@ def addressed_assignment(assignment, profile, agent_id):
                   count=1, flags=re.IGNORECASE)
 
 
+def widen(requirements, wanted, profiles, grants):
+    """Ask for more capability, but only what the agent is granted and a profile offers.
+
+    select_profile deliberately returns the least-privileged compatible profile, so a
+    requirement the contract did not mention is a capability the dispatch will not have —
+    the agent finds out when guard() refuses its first vitest or git push. Widening is
+    bounded on both sides, so it can never turn a runnable dispatch into
+    BLOCKED_NO_COMPATIBLE_RUNTIME: a capability the agent is not granted, or that no host
+    profile offers, is left alone and still refused with its usual reason.
+    """
+    from .runtime_profiles import CAPABILITY_ALIASES, RUNTIME_CAPABILITIES
+
+    permitted = None if grants is None else {CAPABILITY_ALIASES.get(name, name) for name in grants}
+    held = requirements.runtime_capabilities()
+    flags = {'fs_write': 'write', 'test_exec': 'test_exec', 'build_exec': 'build_exec',
+             'browser_exec': 'browser_exec'}
+    for name in sorted({CAPABILITY_ALIASES.get(name, name) for name in wanted}):
+        if name not in RUNTIME_CAPABILITIES or name in held:
+            continue
+        if permitted is not None and name not in permitted:
+            continue
+        if not any(getattr(candidate, name, False) for candidate in profiles):
+            continue
+        if name in flags:
+            setattr(requirements, flags[name], True)
+        else:
+            requirements.capabilities = requirements.capabilities | {name}
+    return requirements
+
+
 def select_runtime(profile, identity, assignment, *, stage=None, capabilities=None, grants=None, direct=False):
     """Match stage requirements against authorized host profiles before any model call."""
     from .runtime_profiles import available_profiles, requirements_for, select_profile
@@ -230,6 +260,21 @@ def select_runtime(profile, identity, assignment, *, stage=None, capabilities=No
                             shell_exec=candidate.shell_exec and bash, test_exec=candidate.test_exec and bash,
                             build_exec=candidate.build_exec and bash, browser_exec=candidate.browser_exec and bash)
                     for candidate in profiles]
+    if capabilities is not None:
+        # A stage contract is a floor, not a ceiling: "run the tests, then push" is a
+        # publication dispatch, whose contract is git_write alone, so the tests it was
+        # asked for had no runtime to run in.
+        asked = requirements_for(assignment, None if identity.ssh_host else identity.workspace)
+        requirements = widen(requirements, asked.runtime_capabilities(), profiles, grants)
+        requirements.node_majors |= asked.node_majors
+        for major, source in asked.node_sources.items():
+            requirements.node_sources.setdefault(major, source)
+    if direct:
+        # One agent does every part of the task under a direct scheduler, and re-deriving
+        # least privilege from each message cost it the tools the task still needs: a
+        # "go ahead" after a plan left it read-only, with no test execution and no
+        # git_write. Its authorization is the agent's grants, not the latest sentence.
+        requirements = widen(requirements, grants or (), profiles, grants)
     if direct and sandbox == 'workspace-write' and (grants is None or 'fs_write' in grants):
         # Keep authorized tools available during investigation, even if the latest turn
         # does not explicitly repeat the original request to edit the workspace.
