@@ -1,4 +1,6 @@
-"""The company's UML model on this server: /<company>/<company>/architecture/<company>.xmi.
+"""The company's UML model on this server: /<company>/<company>/architecture/<company>.xmi,
+or, when the folder holds dated versions, the latest
+/<company>/<company>/architecture/YYYY_MM_DD_HH_MM_SS-<company>.xmi.
 
 DevAgents runs on the company's own server, so the file its business analyst and
 architect agents write (workflow WORKFLOW_V2_PATHS: vm_root = /${company_name}/${company_name},
@@ -9,11 +11,13 @@ company: the file is always this server's, so the route cannot be pointed at
 another file.
 
 Subjective UML reads the model with ``read_company_xmi`` and saves edits with
-``write_company_xmi``. A save names the version it edited (``base_sha256``), so an
-edit made on a stale copy cannot silently overwrite what the agents wrote since.
+``write_company_xmi``. A save writes a new dated version and names the version it
+edited (``base_sha256``), so an edit made on a stale copy is refused rather than
+hiding what the agents wrote since.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import os
 import re
@@ -49,10 +53,59 @@ def company_root(company_name: str) -> Path | None:
 
 
 def xmi_path(company_name: str) -> Path | None:
+    """The model's plain name: /<company>/<company>/architecture/<company>.xmi."""
     base = company_root(company_name)
     if base is None:
         return None
     return base / "architecture" / f"{base.name}.xmi"
+
+
+def version_name_pattern(slug: str) -> re.Pattern[str]:
+    """YYYY_MM_DD_HH_MM_SS-<company>.xmi: one saved version of the model."""
+    return re.compile(r"(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})-" + re.escape(slug) + r"\.xmi")
+
+
+def latest_version_name(names, slug: str) -> str:
+    """The newest YYYY_MM_DD_HH_MM_SS-<slug>.xmi among ``names``, or "".
+
+    The timestamp is fixed-width, so the newest version sorts last.
+    """
+    pattern = version_name_pattern(slug)
+    versions = sorted(name for name in names if pattern.fullmatch(name))
+    return versions[-1] if versions else ""
+
+
+def current_xmi_path(company_name: str) -> Path | None:
+    """The file the editor opens: the latest YYYY_MM_DD_HH_MM_SS-<company>.xmi in the
+    company's architecture folder, else <company>.xmi. Only names this module builds
+    are considered, so a caller still cannot point the route at another file."""
+    path = xmi_path(company_name)
+    if path is None:
+        return None
+    try:
+        names = [entry.name for entry in os.scandir(path.parent) if entry.is_file()]
+    except OSError:
+        return path
+    latest = latest_version_name(names, path.parent.parent.name)
+    return path.parent / latest if latest else path
+
+
+_STAMP_FORMAT = "%Y_%m_%d_%H_%M_%S"
+
+
+def next_version_name(names, slug: str, now: float | None = None) -> str:
+    """A new YYYY_MM_DD_HH_MM_SS-<slug>.xmi (UTC) that sorts after every version in
+    ``names``, so the save is what the editor opens next even when the clock is
+    behind a version already in the folder."""
+    seconds = int(time.time() if now is None else now)
+    latest = latest_version_name(names, slug)
+    if latest:
+        try:
+            latest_seconds = int(calendar.timegm(time.strptime(latest[:19], _STAMP_FORMAT)))
+        except ValueError:
+            latest_seconds = seconds - 1
+        seconds = max(seconds, latest_seconds + 1)
+    return f"{time.strftime(_STAMP_FORMAT, time.gmtime(seconds))}-{slug}.xmi"
 
 
 def _iso(seconds: float) -> str:
@@ -62,7 +115,7 @@ def _iso(seconds: float) -> str:
 def _target(requested_company: str) -> tuple[int, dict] | tuple[str, Path]:
     """(company, path) for this server, or (status, body) refusing the call."""
     company = auth.expected_company_name()
-    path = xmi_path(company)
+    path = current_xmi_path(company)
     if path is None:
         return 503, {"ok": False, "error": "company_not_configured"}
     requested = (requested_company or "").strip()
@@ -142,15 +195,19 @@ def _current_sha(path: Path) -> str | None:
 
 
 def write_company_xmi(xmi_text, base_sha256=None, requested_company: str = "") -> tuple[int, dict]:
-    """Save the model. (status, body).
+    """Save the model as a new version. (status, body).
+
+    Each save writes a new /<company>/<company>/architecture/YYYY_MM_DD_HH_MM_SS-<company>.xmi
+    (UTC, later than every version already there), which becomes the file the
+    editor opens. Existing versions and <company>.xmi are never changed.
 
     ``base_sha256`` is the ``sha256`` the editor loaded: the save is refused with 409
-    when the file has changed since. ``""`` means "I loaded no file": refused when
-    one exists. ``None`` overwrites whatever is there.
+    when the latest version has changed since. ``""`` means "I loaded no file":
+    refused when one exists. ``None`` saves regardless.
 
-    The write is atomic (a temporary file in the same folder, then a rename), so a
-    reader never sees half a model. The file's mode is kept. The change is not
-    committed; the company's agents version the clone.
+    The new file appears complete (a temporary file in the same folder, then a
+    link), so a reader never sees half a model. It takes the loaded file's mode.
+    The change is not committed; the company's agents version the clone.
     """
     target = _target(requested_company)
     if isinstance(target[0], int):
@@ -181,33 +238,39 @@ def write_company_xmi(xmi_text, base_sha256=None, requested_company: str = "") -
             return 500, {"ok": False, "error": "read_failed", "path": shown}
         if base_sha256 is not None and (current or "") != base_sha256:
             return 409, {"ok": False, "error": "conflict", "path": shown, "sha256": current or ""}
+        folder = path.parent
         try:
             mode = path.stat().st_mode & 0o7777 if current is not None else 0o664
-            path.parent.mkdir(exist_ok=True)
-            handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            folder.mkdir(exist_ok=True)
+            names = [entry.name for entry in os.scandir(folder)]
+            saved_path = folder / next_version_name(names, clone.name)
+            handle, temporary = tempfile.mkstemp(dir=folder, prefix=f".{saved_path.name}.", suffix=".tmp")
             try:
                 with os.fdopen(handle, "wb") as stream:
                     stream.write(raw)
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.chmod(temporary, mode)
-                os.replace(temporary, path)
-            except BaseException:
+                # A hard link never replaces a file: an existing version is left untouched.
+                os.link(temporary, saved_path)
+            finally:
                 try:
                     os.unlink(temporary)
                 except OSError:
                     pass
-                raise
+        except FileExistsError:
+            return 409, {"ok": False, "error": "conflict", "path": shown, "sha256": current or ""}
         except PermissionError:
             return 403, {"ok": False, "error": "permission_denied", "path": shown}
         except OSError:
             return 500, {"ok": False, "error": "write_failed", "path": shown}
-        info = path.stat()
+        info = saved_path.stat()
     return 200, {
         "ok": True,
         "saved": True,
         "company": company,
-        "path": shown,
+        "path": str(saved_path),
+        "previous_path": shown if current is not None else "",
         "size": len(raw),
         "modified_at": _iso(info.st_mtime),
         "sha256": hashlib.sha256(raw).hexdigest(),

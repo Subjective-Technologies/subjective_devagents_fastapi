@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -126,16 +127,18 @@ def test_l2_save_creates_the_model_and_a_reload_sees_it(monkeypatch, tmp_path):
         loaded = client.get("/api/architecture/xmi").json()
     assert saved.status_code == 200, saved.text
     body = saved.json()
-    target = clone / "architecture" / "cardnexia.xmi"
+    files = list((clone / "architecture").iterdir())
+    assert len(files) == 1, "temporary file left behind"
+    target = files[0]
+    assert re.fullmatch(r"\d{4}(_\d{2}){5}-cardnexia\.xmi", target.name)
     assert body["ok"] is True and body["saved"] is True and body["path"] == str(target)
-    assert body["previous_sha256"] == "" and body["size"] == len(MODEL)
+    assert body["previous_sha256"] == "" and body["previous_path"] == "" and body["size"] == len(MODEL)
     assert target.read_text(encoding="utf-8") == MODEL
     assert oct(target.stat().st_mode & 0o777) == oct(0o664)
-    assert loaded["xmi_text"] == MODEL and loaded["sha256"] == body["sha256"]
-    assert not [p for p in target.parent.iterdir() if p.name != "cardnexia.xmi"], "temporary file left behind"
+    assert loaded["xmi_text"] == MODEL and loaded["sha256"] == body["sha256"] and loaded["path"] == str(target)
 
 
-def test_l2_save_on_the_loaded_version_replaces_it_and_keeps_the_mode(monkeypatch, tmp_path):
+def test_l2_save_on_the_loaded_version_adds_a_version_and_keeps_the_mode(monkeypatch, tmp_path):
     target = _clone(tmp_path) / "architecture" / "cardnexia.xmi"
     target.parent.mkdir()
     target.write_text("<XMI>old</XMI>", encoding="utf-8")
@@ -143,9 +146,12 @@ def test_l2_save_on_the_loaded_version_replaces_it_and_keeps_the_mode(monkeypatc
     with _client(monkeypatch, tmp_path, SUBJECTIVE_DEVAGENTS_COMPANY_NAME="CardNexia") as client:
         base = client.get("/api/architecture/xmi").json()["sha256"]
         saved = client.put("/api/architecture/xmi", json={"xmi_text": MODEL, "base_sha256": base})
-    assert saved.status_code == 200 and saved.json()["previous_sha256"] == base
-    assert target.read_text(encoding="utf-8") == MODEL
-    assert oct(target.stat().st_mode & 0o777) == oct(0o640)
+    body = saved.json()
+    assert saved.status_code == 200 and body["previous_sha256"] == base and body["previous_path"] == str(target)
+    assert target.read_text(encoding="utf-8") == "<XMI>old</XMI>", "the loaded file is never changed"
+    new = target.parent / os.path.basename(body["path"])
+    assert new != target and new.read_text(encoding="utf-8") == MODEL
+    assert oct(new.stat().st_mode & 0o777) == oct(0o640)
 
 
 def test_l2_a_stale_save_is_a_conflict_and_changes_nothing(monkeypatch, tmp_path):
@@ -162,13 +168,15 @@ def test_l2_a_stale_save_is_a_conflict_and_changes_nothing(monkeypatch, tmp_path
     assert target.read_text(encoding="utf-8") == "<XMI>agents wrote this</XMI>"
 
 
-def test_l2_without_a_base_the_save_overwrites(monkeypatch, tmp_path):
+def test_l2_without_a_base_the_save_is_not_checked(monkeypatch, tmp_path):
     target = _clone(tmp_path) / "architecture" / "cardnexia.xmi"
     target.parent.mkdir()
     target.write_text("<XMI>old</XMI>", encoding="utf-8")
     with _client(monkeypatch, tmp_path, SUBJECTIVE_DEVAGENTS_COMPANY_NAME="CardNexia") as client:
         saved = client.put("/api/architecture/xmi", json={"xmi_text": MODEL})
-    assert saved.status_code == 200 and target.read_text(encoding="utf-8") == MODEL
+        loaded = client.get("/api/architecture/xmi").json()
+    assert saved.status_code == 200 and loaded["xmi_text"] == MODEL
+    assert target.read_text(encoding="utf-8") == "<XMI>old</XMI>"
 
 
 @pytest.mark.parametrize("text,error", [
@@ -246,3 +254,77 @@ def test_l2_save_is_behind_the_gate(monkeypatch, tmp_path):
         response = client.put("/api/architecture/xmi", json={"xmi_text": MODEL})
     assert response.status_code == 401
     assert not (clone / "architecture").exists()
+
+
+def test_l3_the_latest_dated_version_opens(monkeypatch, tmp_path):
+    folder = _clone(tmp_path) / "architecture"
+    folder.mkdir()
+    (folder / "cardnexia.xmi").write_text("<XMI>plain</XMI>", encoding="utf-8")
+    (folder / "2026_11_01_09_00_00-cardnexia.xmi").write_text("<XMI>old</XMI>", encoding="utf-8")
+    (folder / "2026_11_20_18_30_05-cardnexia.xmi").write_text("<XMI>newest</XMI>", encoding="utf-8")
+    (folder / "2026_11_05_10_00_00-cardnexia.xmi").write_text("<XMI>middle</XMI>", encoding="utf-8")
+    # Not this company's versions, or not a version name at all: ignored.
+    (folder / "2099_01_01_00_00_00-othercorp.xmi").write_text("<XMI>other</XMI>", encoding="utf-8")
+    (folder / "2099_01_01_00_00_00-cardnexia.xmi.bak").write_text("<XMI>bak</XMI>", encoding="utf-8")
+    (folder / "2099_01_01-cardnexia.xmi").write_text("<XMI>short</XMI>", encoding="utf-8")
+    (folder / "2099_12_31_00_00_00-cardnexia.xmi").mkdir()
+    with _client(monkeypatch, tmp_path, SUBJECTIVE_DEVAGENTS_COMPANY_NAME="CardNexia") as client:
+        body = client.get("/api/architecture/xmi").json()
+    assert body["found"] is True and body["xmi_text"] == "<XMI>newest</XMI>"
+    assert body["path"] == str(folder / "2026_11_20_18_30_05-cardnexia.xmi")
+
+
+def test_l3_without_versions_the_plain_file_opens(monkeypatch, tmp_path):
+    folder = _clone(tmp_path) / "architecture"
+    folder.mkdir()
+    (folder / "cardnexia.xmi").write_text("<XMI>plain</XMI>", encoding="utf-8")
+    (folder / "notes-cardnexia.xmi").write_text("<XMI>no</XMI>", encoding="utf-8")
+    with _client(monkeypatch, tmp_path, SUBJECTIVE_DEVAGENTS_COMPANY_NAME="CardNexia") as client:
+        body = client.get("/api/architecture/xmi").json()
+    assert body["xmi_text"] == "<XMI>plain</XMI>" and body["path"] == str(folder / "cardnexia.xmi")
+
+
+def test_l3_a_save_writes_a_new_latest_version(monkeypatch, tmp_path):
+    folder = _clone(tmp_path) / "architecture"
+    folder.mkdir()
+    (folder / "cardnexia.xmi").write_text("<XMI>plain</XMI>", encoding="utf-8")
+    # Dated in the future: the save must still sort after it, or the editor would not open it.
+    latest = folder / "2099_11_20_18_30_05-cardnexia.xmi"
+    latest.write_text("<XMI>newest</XMI>", encoding="utf-8")
+    with _client(monkeypatch, tmp_path, SUBJECTIVE_DEVAGENTS_COMPANY_NAME="CardNexia") as client:
+        loaded = client.get("/api/architecture/xmi").json()
+        saved = client.put("/api/architecture/xmi", json={"xmi_text": MODEL, "base_sha256": loaded["sha256"]})
+        reloaded = client.get("/api/architecture/xmi").json()
+        stale = client.put("/api/architecture/xmi", json={"xmi_text": MODEL, "base_sha256": loaded["sha256"]})
+    body = saved.json()
+    assert saved.status_code == 200 and body["previous_path"] == str(latest)
+    assert body["path"] == str(folder / "2099_11_20_18_30_06-cardnexia.xmi")
+    assert reloaded["path"] == body["path"] and reloaded["xmi_text"] == MODEL
+    assert latest.read_text(encoding="utf-8") == "<XMI>newest</XMI>"
+    assert (folder / "cardnexia.xmi").read_text(encoding="utf-8") == "<XMI>plain</XMI>"
+    assert stale.status_code == 409 and stale.json()["sha256"] == body["sha256"]
+
+
+@pytest.mark.parametrize("names,now,expected", [
+    ([], 1_800_000_000, "2027_01_15_08_00_00-acme.xmi"),
+    (["2020_01_01_00_00_00-acme.xmi"], 1_800_000_000, "2027_01_15_08_00_00-acme.xmi"),
+    (["2027_01_15_08_00_00-acme.xmi"], 1_800_000_000, "2027_01_15_08_00_01-acme.xmi"),
+    (["2099_12_31_23_59_59-acme.xmi", "2099_12_31_23_59_59-other.xmi"], 1_800_000_000, "2100_01_01_00_00_00-acme.xmi"),
+])
+def test_l3_next_version_name(names, now, expected):
+    from subjective_devagents_fastapi.architecture_file import next_version_name
+
+    assert next_version_name(names, "acme", now) == expected
+
+
+@pytest.mark.parametrize("names,expected", [
+    ([], ""),
+    (["acme.xmi"], ""),
+    (["2026_01_02_03_04_05-acme.xmi", "2025_12_31_23_59_59-acme.xmi"], "2026_01_02_03_04_05-acme.xmi"),
+    (["2026_01_02_03_04_05-acme-corp.xmi"], ""),
+    (["x2026_01_02_03_04_05-acme.xmi"], ""),
+])
+def test_l3_latest_version_name(names, expected):
+    from subjective_devagents_fastapi.architecture_file import latest_version_name
+
+    assert latest_version_name(names, "acme") == expected
