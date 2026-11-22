@@ -942,9 +942,7 @@ async def api_workflow_file(path: str = Query(default=""), company: str = Query(
 
 @app.get("/api/architecture/xmi")
 async def api_architecture_xmi(company: str = Query(default="")):
-    """This company's UML model as text: the latest
-    /<company>/<company>/architecture/YYYY_MM_DD_HH_MM_SS-<company>.xmi, else
-    /<company>/<company>/architecture/<company>.xmi.
+    """This company's UML model, /<company>/<company>/architecture/<company>.xmi, as text.
 
     The company is this server's; the caller cannot choose the file. ``company``,
     when given, must name this server's company (404 company_mismatch otherwise).
@@ -963,12 +961,11 @@ ARCHITECTURE_XMI_MAX_BODY = 2 * 16 * 1024 * 1024 + 4096
 
 @app.put("/api/architecture/xmi")
 async def api_save_architecture_xmi(request: Request, company: str = Query(default="")):
-    """Save this company's UML model from Subjective UML as a new version,
-    /<company>/<company>/architecture/YYYY_MM_DD_HH_MM_SS-<company>.xmi (UTC).
+    """Save this company's UML model from Subjective UML.
 
     Body: ``{"xmi_text": "...", "base_sha256": "<sha256 from the load>", "company": "..."}``.
-    ``base_sha256`` "" means the editor loaded no file; leaving it out saves
-    regardless of the latest version. 409 conflict when the file changed since the load, with the
+    ``base_sha256`` "" means the editor loaded no file; leaving it out overwrites
+    whatever is there. 409 conflict when the file changed since the load, with the
     current ``sha256``. The XML must be well-formed and declare no entities.
     """
     from . import architecture_file
