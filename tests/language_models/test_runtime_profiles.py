@@ -262,3 +262,72 @@ def test_verified_browser_and_write_permissions_are_independent(tmp_path, monkey
         select_runtime(agent, identity, '', stage='functional_verification', capabilities=needs, grants=needs[:-1])
     with pytest.raises(ModelError, match='no write access'):
         select_runtime(agent, identity, '', stage='implementation', capabilities=['fs_write'], grants=['fs_write'])
+
+
+# --- a follow-up message must not downgrade the dispatch -------------------------------
+#
+# Reported 2026-11-21 under the Direct LLM scheduler: the user answered "go ahead" to a
+# plan, and the dispatch that ran came back
+#   "This dispatch is read-only with no test_exec and no git write capability:
+#    vitest and git commands are rejected with BLOCKED_EXECUTION_CAPABILITY."
+# Capability intent was re-derived from that one message. "go ahead" names no task kind,
+# so nothing was required, and select_profile correctly returned the least-privileged
+# profile for a dispatch that was asked for nothing.
+
+GRANTS = ['fs_read', 'fs_write', 'shell_exec', 'git_read', 'git_write', 'test_exec', 'build_exec']
+
+
+def runtime_identity(tmp_path, sandbox='workspace-write'):
+    return Identity('runtime', 'claude', model='t', strategy='api_agent', workspace=str(tmp_path),
+                    home=str(tmp_path), sandbox=sandbox, api_base_url='http://unused', api_key_env='K')
+
+
+def test_a_direct_dispatch_keeps_its_granted_tools_when_the_message_says_nothing(tmp_path, toolchains):
+    from subjective_devagents_fastapi.collaboration import select_runtime
+
+    identity = runtime_identity(tmp_path)
+    agent = {'mode': 'write', 'role_file': 'agents/roles/coder_agent.md'}
+    weak, _ = select_runtime(agent, identity, 'go ahead', grants=GRANTS)
+    assert not weak.test_exec and not weak.git_write, 'precondition: nothing is asked for'
+
+    chosen, requirements = select_runtime(agent, identity, 'go ahead', grants=GRANTS, direct=True)
+    assert chosen.test_exec and chosen.git_write and chosen.fs_write
+    assert {'test_exec', 'git_write'} <= requirements.runtime_capabilities()
+
+
+def test_widening_never_exceeds_the_agents_grants(tmp_path, toolchains):
+    """Authorization still decides: a read-only agent stays read-only, with no hard block."""
+    from subjective_devagents_fastapi.collaboration import select_runtime
+
+    identity = runtime_identity(tmp_path, sandbox='read-only')
+    agent = {'mode': 'read', 'role_file': 'agents/roles/integration_agent.md'}
+    chosen, requirements = select_runtime(agent, identity, 'go ahead', grants=['fs_read', 'test_exec'],
+                                          direct=True)
+    assert chosen.sandbox == 'read-only' and not chosen.git_write and not chosen.fs_write
+    assert 'git_write' not in requirements.runtime_capabilities()
+    assert chosen.test_exec, 'a granted capability the host offers is still available'
+
+
+def test_a_publication_contract_can_run_the_tests_it_was_asked_for(tmp_path, toolchains):
+    """STAGE_REQUIREMENTS['publication'] is git_write alone, so "run the tests, then push"
+    selected a runtime that could push but not test."""
+    from subjective_devagents_fastapi.collaboration import select_runtime
+
+    identity = runtime_identity(tmp_path)
+    agent = {'mode': 'write', 'role_file': 'agents/roles/git_agent.md'}
+    chosen, requirements = select_runtime(agent, identity, 'Run the tests, then push the branch',
+                                          stage='publication', capabilities=['git_write'], grants=GRANTS)
+    assert chosen.git_write and chosen.test_exec
+    assert 'test_exec' in requirements.runtime_capabilities()
+
+
+def test_an_ungranted_capability_is_left_alone_rather_than_blocking_the_dispatch(tmp_path, toolchains):
+    from subjective_devagents_fastapi.collaboration import select_runtime
+
+    identity = runtime_identity(tmp_path)
+    agent = {'mode': 'write', 'role_file': 'agents/roles/git_agent.md'}
+    chosen, requirements = select_runtime(agent, identity, 'Run the tests, then push the branch',
+                                          stage='publication', capabilities=['git_write'],
+                                          grants=['fs_read', 'fs_write', 'git_read', 'git_write', 'shell_exec'])
+    assert chosen.git_write and not chosen.test_exec
+    assert 'test_exec' not in requirements.runtime_capabilities()

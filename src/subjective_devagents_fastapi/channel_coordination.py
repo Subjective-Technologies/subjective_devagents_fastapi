@@ -24,7 +24,21 @@ _READ_COMMANDS = {
     'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'whoami', 'date', 'true', 'false', 'echo', 'printf',
     'which', 'type', 'file', 'stat', 'test', 'rg', 'grep', 'find', 'du', 'df', 'uname', 'id',
     'nl',
+    # Pure stdout filters and inspectors. Each writes a file only by redirect, which
+    # _writes_by_redirect already classifies as WRITE. Left UNKNOWN, they made ordinary
+    # investigation ask for a write lease it did not need (2026-11-22, three Bash calls
+    # refused WRITE_LEASE_REQUIRED / LEASE_SCOPE_MISMATCH inside a turn that completed).
+    'awk', 'cut', 'tr', 'uniq', 'comm', 'join', 'paste', 'fold', 'column', 'tac', 'rev', 'expr',
+    'diff', 'cmp', 'basename', 'dirname', 'realpath', 'readlink', 'seq', 'jq', 'xxd', 'od',
+    'strings', 'tree', 'ps', 'hostname', 'base64', 'sha1sum', 'sha256sum', 'md5sum', 'cksum',
 }
+# curl flags that write a local file, and ones that send a body (a remote mutation).
+_CURL_WRITES = {'-o', '--output', '-O', '--remote-name', '--remote-name-all', '--create-dirs',
+                '--output-dir', '-D', '--dump-header', '--trace', '--trace-ascii', '-c',
+                '--cookie-jar', '-J', '--remote-header-name', '--etag-save', '--xattr',
+                '-T', '--upload-file', '-K', '--config'}
+_CURL_SENDS = {'-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--json',
+               '-F', '--form', '--form-string'}
 _ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # env/npm flags that consume the next argv. Leaving them in the positional list
 # would classify the directory (or the variable name) as the command.
@@ -34,7 +48,9 @@ _WRITE_COMMANDS = {
     'rm', 'mv', 'cp', 'mkdir', 'rmdir', 'touch', 'chmod', 'chown', 'tee', 'truncate', 'dd', 'install',
     'ln', 'unlink',
 }
-_GIT_READ = {'status', 'diff', 'log', 'show', 'rev-parse', 'branch', 'remote', 'ls-files', 'describe', 'blame', 'shortlog'}
+_GIT_READ = {'status', 'diff', 'log', 'show', 'rev-parse', 'branch', 'remote', 'ls-files', 'describe', 'blame', 'shortlog',
+             'cat-file', 'ls-tree', 'rev-list', 'grep', 'for-each-ref', 'show-ref', 'merge-base', 'name-rev',
+             'symbolic-ref', 'diff-tree', 'count-objects', 'whatchanged', 'version'}
 _GIT_WRITE = {'checkout', 'switch', 'commit', 'push', 'reset', 'clean', 'rebase', 'merge', 'cherry-pick', 'am', 'apply', 'stash', 'add', 'rm', 'mv', 'restore'}
 _STATUS_LINE = re.compile(
     r"^\s*(?:what(?:'s| is) the status(?: of this)?|status|continue|retry|try again|"
@@ -267,6 +283,34 @@ def bash_workdir(command, workspace):
     return str(current)
 
 
+def _curl_effect(args):
+    """curl reads unless it writes a local file, uploads, or sends a mutating request.
+
+    `curl -s http://127.0.0.1:8317/v1/models` inspects a service; it is not a workspace
+    mutation and must not need a write lease. Anything that could put bytes on disk or
+    change remote state stays WRITE/UNKNOWN.
+    """
+    index = 0
+    while index < len(args):
+        token = args[index]
+        head = token.split('=', 1)[0]
+        if head in _CURL_WRITES:
+            return 'WRITE'
+        if head in _CURL_SENDS:
+            return 'UNKNOWN'
+        if re.fullmatch(r'-[A-Za-z]{2,}', token) and set(token[1:]) & set('oODTJKc'):
+            return 'WRITE'          # bundled short flags, e.g. -sO
+        if head in {'-X', '--request'}:
+            method = (token.split('=', 1)[1] if '=' in token
+                      else (args[index + 1] if index + 1 < len(args) else ''))
+            if method.upper() not in {'GET', 'HEAD'}:
+                return 'UNKNOWN'
+            index += 1 if '=' in token else 2
+            continue
+        index += 1
+    return 'READ_ONLY'
+
+
 def _segment_effect(part):
     if _writes_by_redirect(part):
         return 'WRITE'
@@ -319,6 +363,10 @@ def _segment_effect(part):
         return 'READ_ONLY'
     if base == 'sed':
         return 'WRITE' if '-i' in tokens or any(token.startswith('--in-place') for token in tokens) else 'READ_ONLY'
+    if base == 'curl':
+        return _curl_effect(tokens[1:])
+    if base == 'sort':
+        return 'WRITE' if any(token.split('=', 1)[0] in {'-o', '--output'} for token in tokens[1:]) else 'READ_ONLY'
     if base in _WRITE_COMMANDS:
         return 'WRITE'
     if base in _READ_COMMANDS:
@@ -365,6 +413,9 @@ def _seconds(name, default):
 UNREACHABLE_GRACE = _seconds('COORDINATION_UNREACHABLE_GRACE', 240)
 # Bounded exponential backoff for one coordination request (seconds between tries).
 CALL_BACKOFF = tuple(float(x) for x in os.environ.get('COORDINATION_CALL_BACKOFF', '1,2,4,8').split(',') if x.strip())
+# One coordination request's HTTP deadline. A cold journal (container start plus Litestream
+# restore) can take longer than a warm one, and the retry above covers the rest.
+CALL_TIMEOUT = _seconds('COORDINATION_CALL_TIMEOUT', 12)
 # Liveness pings tolerate outages through UNREACHABLE_GRACE instead of blocking a tool loop.
 _NO_RETRY = {'touch', 'heartbeat'}
 # Bytes of journal state a worker sees (system prompt and snapshot tool), whatever the channel's age.
@@ -380,7 +431,8 @@ CONTROL_TOOL = {'type': 'function', 'function': {
         'specialists_consulted); capability (capability,status,target,source); review '
         '(id,repository,sha,artifact_fact_id,test_revision,verdict); gate (id,kind,result,metadata); '
         'worktree (path,lease_id,base_sha,branch,state,dirty,pushed). '
-        'Before Write/Edit acquire a covering write lease. Read-only shell (pwd, ls, git status, cat, npm test, '
+        'Before Write/Edit acquire a covering write lease. Read-only shell (pwd, ls, git status, git log, '
+        'cat, grep, sed -n, wc, sort, awk, jq, diff, curl without -o/-O/-d, npm test, '
         'npm ls, node --version, npx vitest run) needs no write lease. A leading cd or VAR=value/env prefix '
         'does not itself write. npm run build and other mutating or unknown shell need a write lease covering '
         'the command directory (leading cd or --prefix), not the whole workspace and not the filesystem root. '
@@ -388,6 +440,27 @@ CONTROL_TOOL = {'type': 'function', 'function': {
         'Never submit credentials. Security decisions require explicit IDs; agents cannot resolve them.'),
     'parameters': {'type': 'object', 'properties': {'operation': {'type': 'string'},
         'data': {'type': 'object'}}, 'required': ['operation', 'data']}}}
+
+
+def unavailable(message, *, status=None, reason='unknown', code='coordination_unavailable'):
+    """A coordination failure that records its HTTP status and a stable, safe reason.
+
+    `_call_once` used to collapse a 503, a read timeout, a redirect and a non-JSON body
+    into one bare `coordination_unavailable`, so the journal showed no status code and no
+    reason and a recovered blip was unattributable. Nothing from the response itself is
+    carried here: only the status line and a fixed vocabulary.
+    """
+    error = ModelError(code, message)
+    error.transport = {'status': status, 'reason': reason}
+    return error
+
+
+def transport_status(error):
+    return getattr(error, 'transport', {}).get('status')
+
+
+def transport_reason(error):
+    return getattr(error, 'transport', {}).get('reason') or 'unknown'
 
 
 class ChannelSession:
@@ -439,22 +512,59 @@ class ChannelSession:
         self.assignment = ''
         self._last_touch = 0.0
         self._usage_pending = {}
+        # True once this runtime is stopping (LanguageModel.close sets it). Shutdown is the
+        # one case where an unreachable journal is not a verdict on the task: retries end,
+        # a lease loss is reported as service_restarted, and finish() persists locally.
+        self.stopping = lambda: False
 
     def __repr__(self):
         return f'ChannelSession(channel={self.binding["channel_id"]!r}, instance={self.binding["instance_id"]!r})'
 
     def call(self, op, **data):
-        """One journal operation; transient outages are retried with bounded backoff."""
-        delays = () if op in _NO_RETRY else CALL_BACKOFF
+        """One journal operation; transient outages are retried with bounded backoff.
+
+        While the runtime is stopping there is no retry at all: CALL_BACKOFF (1,2,4,8) on a
+        finish spent the unit's whole 30 s stop timeout and the process was SIGKILLed before
+        it could record the outcome.
+        """
+        delays = () if op in _NO_RETRY or self._is_stopping() else CALL_BACKOFF
         for attempt in range(len(delays) + 1):
             try:
-                return self._call_once(op, **data)
+                result = self._call_once(op, **data)
             except ModelError as error:
-                if error.code != 'coordination_unavailable' or attempt >= len(delays):
+                if error.code != 'coordination_unavailable':
                     raise
-                log.warning('Coordination unavailable; retrying op=%s attempt=%d channel=%s',
-                            op, attempt + 1, self.binding['channel_id'])
+                if transport_reason(error) == 'callback_url_unset':
+                    # Configuration, not an outage: backing off 1+2+4+8 s cannot make an
+                    # unset environment variable appear.
+                    log.error('Coordination callback URL is not configured; op=%s channel=%s',
+                              op, self.binding['channel_id'])
+                    raise
+                # Every failed attempt says what actually happened. Without the status and a
+                # stable reason the journal only showed "Coordination unavailable", so a
+                # recovered blip could not be told from a real outage (2026-11-22,
+                # op=snapshot on conv_5995bbc1). Status and reason only: never a token, a
+                # header or a response body.
+                last = attempt >= len(delays)
+                log.warning('Coordination unavailable; %s op=%s attempt=%d channel=%s status=%s reason=%s',
+                            'giving up' if last else 'retrying', op, attempt + 1,
+                            self.binding['channel_id'], transport_status(error), transport_reason(error))
+                if last:
+                    raise
                 time.sleep(delays[attempt])
+            else:
+                if attempt:
+                    # A retry that worked is not a failed request: say so, so the turn's own
+                    # warnings cannot be read as the reason a Claude answer failed.
+                    log.info('Coordination recovered op=%s attempts=%d channel=%s',
+                             op, attempt + 1, self.binding['channel_id'])
+                return result
+
+    def _is_stopping(self):
+        try:
+            return bool(self.stopping())
+        except Exception:  # noqa: BLE001 - a broken predicate must not stop coordination
+            return False
 
     def _call_once(self, op, **data):
         body = {**data, 'op': op, 'actor_id': self.actor,
@@ -466,27 +576,41 @@ class ChannelSession:
         else:
             base = os.environ.get('SUBJECTIVE_CHAT_COORDINATION_URL',
                 'https://dashboard.subjectivetechnologies.com/api/chat-proxy').rstrip('/')
+            route = '/chat/conversations/' + self.binding['channel_id'] + '/coordination'
+            if self.delegation:
+                base = os.environ.get('COORDINATION_CALLBACK_URL', '').rstrip('/')
+                if not base:
+                    raise unavailable('Runtime callback URL is not configured', reason='callback_url_unset')
+                route = '/internal/collaboration/' + self.binding['channel_id'] + '/coordination'
             try:
-                route = '/chat/conversations/' + self.binding['channel_id'] + '/coordination'
-                if self.delegation:
-                    base = os.environ.get('COORDINATION_CALLBACK_URL', '').rstrip('/')
-                    if not base:
-                        raise ModelError('coordination_unavailable', 'Runtime callback URL is not configured')
-                    route = '/internal/collaboration/' + self.binding['channel_id'] + '/coordination'
-                with httpx.Client(timeout=12, follow_redirects=False, trust_env=False) as client:
-                    response = client.post(base + route,
-                        headers=self._headers(), json=body)
-                if response.status_code >= 500 or response.status_code == 429:
-                    # Container restarting, Worker warming up, issuer overloaded: transient.
-                    raise ModelError('coordination_unavailable', 'Channel coordination is temporarily unavailable')
+                with httpx.Client(timeout=CALL_TIMEOUT, follow_redirects=False, trust_env=False) as client:
+                    response = client.post(base + route, headers=self._headers(), json=body)
+            except httpx.HTTPError as error:
+                # The class name says timeout/connect/read without quoting a URL or a body.
+                raise unavailable('Channel coordination is unavailable',
+                                  reason='transport_' + type(error).__name__) from None
+            if response.status_code >= 500 or response.status_code == 429:
+                # Container restarting, Worker warming up, issuer overloaded: transient.
+                raise unavailable('Channel coordination is temporarily unavailable',
+                                  status=response.status_code, reason='http_status')
+            try:
                 payload = response.json()
-                if response.status_code != 200 or not payload.get('ok'):
-                    error = payload.get('error')
-                    code = error.get('code', 'coordination_unavailable') if isinstance(error, dict) else 'coordination_unavailable'
-                    raise ModelError(code, 'Channel coordination rejected operation')
-                result = payload['data']
-            except (httpx.HTTPError, ValueError, KeyError, TypeError):
-                raise ModelError('coordination_unavailable', 'Channel coordination is unavailable') from None
+                if not isinstance(payload, dict):
+                    raise TypeError('coordination payload must be an object')
+            except (ValueError, TypeError):
+                # A 2xx that is not the journal's envelope (gateway error page, redirect body)
+                # used to be indistinguishable from a dropped connection.
+                raise unavailable('Channel coordination returned an unreadable response',
+                                  status=response.status_code, reason='invalid_body') from None
+            if response.status_code != 200 or not payload.get('ok'):
+                error = payload.get('error')
+                code = error.get('code', 'coordination_unavailable') if isinstance(error, dict) else 'coordination_unavailable'
+                raise unavailable('Channel coordination rejected operation', status=response.status_code,
+                                  reason='rejected', code=code)
+            if 'data' not in payload:
+                raise unavailable('Channel coordination returned no data', status=response.status_code,
+                                  reason='missing_data')
+            result = payload['data']
         self._state = result.get('state', self._state)
         if result.get('code') in {'LEASE_CONFLICT', 'WORKFLOW_VERSION_CONFLICT', 'WORKFLOW_VERSION_MISMATCH'}:
             raise ModelError(result['code'], json.dumps({k: v for k, v in result.items() if k != 'state'}))
@@ -900,6 +1024,17 @@ class ChannelSession:
                                  + ('' if self.verification else '; this dispatch has no verify profile'))
             return
         if name == 'Bash' and shell_effect(str(arguments.get('command', ''))) == 'READ_ONLY':
+            # Reading needs no write lease. It does still need a working directory this
+            # dispatch is allowed to read: bash_workdir fails closed on a non-literal cd or
+            # an unparseable command, and a resolved directory outside the workspace (or a
+            # lease held here) is refused rather than silently read.
+            command = str(arguments.get('command', ''))
+            where = Path(bash_workdir(command, self.identity.workspace))
+            roots = [Path(self.identity.workspace).resolve()]
+            roots += [Path(scope) for scopes in self.held.values() for scope in scopes]
+            if not _inside(where, roots):
+                raise ModelError('LEASE_SCOPE_MISMATCH',
+                                 'Read-only shell runs in the workspace or a lease held here, not ' + str(where))
             return
         if self.privilege and self.privilege['privilege_level'] != 'scoped':
             self.call('privilege', **self.privilege)
@@ -1131,6 +1266,15 @@ class ChannelSession:
             return False
         except ModelError as error:
             if error.code == 'coordination_unavailable':
+                if self._is_stopping():
+                    # This process is going away, so the journal cannot be reached from here
+                    # any more. The turn stops, but as an interrupted one whose successor
+                    # resumes it — not as a lease the channel took away. UNREACHABLE_GRACE
+                    # is untouched for a healthy process.
+                    self.revocation = 'service_restarted'
+                    log.info('Coordination stopped with the runtime channel=%s lease=%s',
+                             self.binding['channel_id'], self.lease_id)
+                    return True
                 # One failed request is not a revocation. Writes stay fenced by guard();
                 # only a journal that stays unreachable stops the turn.
                 self._unreachable_since = self._unreachable_since or self.last_check
@@ -1279,7 +1423,19 @@ class ChannelSession:
             with self.completion_store.connection() as db:
                 db.execute('INSERT OR REPLACE INTO coordination_completions VALUES(?,?)',
                            (self.binding['dispatch_id'], json.dumps(payload)))
-        finished = self.call('finish', **payload['data'])
+        try:
+            finished = self.call('finish', **payload['data'])
+        except ModelError as error:
+            if not (self._is_stopping() and self.delegation and self.completion_store):
+                raise
+            # One attempt, then leave the durable receipt for the next process to replay
+            # (collaboration recovery reads coordination_completions). Retrying here is what
+            # kept the worker alive until systemd SIGKILLed it.
+            log.warning('Completion persisted locally for replay channel=%s dispatch=%s code=%s',
+                        self.binding['channel_id'], self.binding['dispatch_id'], error.code)
+            self.closed = True
+            self._authorization = ''
+            return
         self._retire_if_done(finished)
         if self.delegation and self.completion_store:
             with self.completion_store.connection() as db:

@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 
 import logging
+import queue
 import re
 import math
 import os
 import threading
+import time
 from pathlib import Path
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 
 from .contracts import MAX_ATTACHMENTS, Attachment, Identity, Message, ModelError, ModelRequest, ModelResult, ModelStrategy
 from .registry import IdentityRegistry, image_support
@@ -25,6 +27,92 @@ def _workers() -> int:
         value = 16
     return min(max(value, 1), 128)
 
+
+def _close_timeout() -> float:
+    """How long close() waits for signalled turns before letting the process exit.
+
+    The live unit gives SIGTERM 30 s (TimeoutStopSec=30) before SIGKILL, and uvicorn's
+    own shutdown runs on either side of this wait, so the default leaves clear headroom.
+    """
+    try:
+        value = float(os.environ.get("SUBJECTIVE_LANGUAGE_MODEL_CLOSE_TIMEOUT", "15"))
+    except ValueError:
+        value = 15.0
+    return min(max(value, 0.1), 300.0)
+
+
+class DaemonExecutor:
+    """A fixed thread pool whose workers are daemons and whose shutdown is bounded.
+
+    ThreadPoolExecutor cannot be used here: its workers are non-daemon, so
+    ``threading._shutdown`` joins them at interpreter exit. A turn blocked in a provider
+    HTTP call or in coordination retries therefore kept the process alive past the unit's
+    30 s stop timeout and ended in SIGKILL, which killed the turn without recording an
+    outcome. Daemon workers let the process exit once close() has signalled every turn and
+    waited out its deadline; whatever ignored the signal dies with the process instead of
+    holding it hostage.
+    """
+
+    def __init__(self, max_workers: int, thread_name_prefix: str = "language-model"):
+        if max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        self.max_workers = max_workers
+        self._prefix = thread_name_prefix
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._shutdown = False
+
+    def submit(self, fn, *args, **kwargs) -> Future:
+        future: Future = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._queue.put((future, fn, args, kwargs))
+            if len(self._threads) < self.max_workers:
+                thread = threading.Thread(target=self._work, daemon=True,
+                                          name=f"{self._prefix}-{len(self._threads)}")
+                self._threads.append(thread)
+                thread.start()
+        return future
+
+    def _work(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, fn, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as error:  # noqa: BLE001 - mirrors ThreadPoolExecutor
+                future.set_exception(error)
+
+    def shutdown(self, *, timeout: float = 0.0):
+        """Refuse new work, drop what has not started, and wait out `timeout` for the rest."""
+        with self._lock:
+            self._shutdown = True
+            threads = list(self._threads)
+        pending = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                pending.append(item[0])
+        for future in pending:
+            future.cancel()
+        for _ in threads:
+            self._queue.put(None)
+        deadline = time.monotonic() + timeout
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        return [thread for thread in threads if thread.is_alive()]
 
 
 def work_trail(trail):
@@ -80,7 +168,7 @@ class LanguageModel:
         # Turns are I/O bound (model HTTP, tool subprocesses). Four shared workers let
         # four long turns starve every later dispatch until its start watchdog fired.
         self.max_workers = max_workers or _workers()
-        self._executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="language-model")
+        self._executor = DaemonExecutor(self.max_workers, thread_name_prefix="language-model")
         self._lock = threading.RLock()
         self._futures: dict[str, Future] = {}
         # Image bytes never enter SQLite; an accepted turn's images live here until it starts.
@@ -165,6 +253,9 @@ class LanguageModel:
         try:
             if coordination:
                 coordination.completion_store = self.store
+                # Shutdown is the one case where a coordination outage is not a verdict on
+                # the task: the session stops retrying and reports service_restarted.
+                coordination.stopping = self._stopping.is_set
                 coordination.worker_started()
             identity = Identity(**turn["identity"])
             history = tuple(Message(**item) for item in self.store.conversation(turn["conversation_id"])["messages"])
@@ -198,9 +289,14 @@ class LanguageModel:
             # The strategy may have started work. Preserve uncertainty; do not retry.
             log.error("LanguageModel worker exception turn_id=%s exception_type=%s", identifier, type(error).__name__)
             result = ModelResult("interrupted", error_code="worker_exception")
-        if self._stopping.is_set() and result.status == "cancelled":
-            # Shutdown, not an operator stop: the logical task continues in a successor.
-            result = ModelResult("cancelled", result.text, result.session_id, "service_restarted")
+        if self._stopping.is_set() and result.status not in {"completed", "blocked"}:
+            # Shutdown, not an operator stop and not a verdict on the task: the logical task
+            # continues in a successor (simple_v1 and the journal both resume
+            # service_restarted). This also covers the coordination errors a stopping process
+            # produces — coordination_unavailable and coordination_lease_lost:* — which were
+            # reported as a failed task and so lost the turn and its prompt.
+            result = ModelResult("cancelled", result.text, result.session_id, "service_restarted",
+                                 result.checkpoint)
         if result.status not in TERMINAL:
             # An unlisted status used to raise out of finish() and leave the row running.
             # The sender then polled until the process was restarted.
@@ -252,7 +348,38 @@ class LanguageModel:
                 raise ModelError("busy", "This worker is still executing the turn; cancel it first.")
             return self.store.reconcile(turn_id)
 
-    def close(self):
+    def close(self, timeout: float | None = None) -> list:
+        """Stop every turn and return inside `timeout`, whatever a worker is blocked in.
+
+        Signalling is cooperative and already reaches each layer: the strategies poll
+        `_stopping` between provider polls and tool rounds, LocalProcess signals its
+        child's process group, and ChannelSession.stopping ends coordination retries. A
+        worker that is reachable records `service_restarted` on its way out. The bounded
+        wait is for the one that is not: `shutdown(wait=True)` was unbounded, so SIGTERM
+        regularly missed the unit's 30 s stop timeout and the turn died under SIGKILL with
+        no outcome written.
+        """
         with self._lock:
             self._stopping.set()
-        self._executor.shutdown(wait=True)
+            pending = list(self._coordination.values())
+            tracked = dict(self._futures)
+        for session in pending:   # accepted, not yet started: no worker has reached it
+            try:
+                session.stopping = self._stopping.is_set
+            except AttributeError:
+                pass
+        alive = self._executor.shutdown(timeout=_close_timeout() if timeout is None else timeout)
+        for identifier, future in tracked.items():
+            if not future.cancelled():
+                continue
+            # Accepted, never started: record the interruption now rather than leaving the row
+            # queued. The sender polls store.turn() for a terminal status, and a row nothing
+            # ever finishes keeps that poll (and the process) running past the stop timeout.
+            try:
+                self.store.finish(identifier, ModelResult("cancelled", error_code="service_restarted"))
+            except Exception:  # noqa: BLE001 - startup also releases orphaned turns
+                log.warning("Could not record the unstarted turn turn_id=%s", identifier)
+        if alive:
+            log.error("LanguageModel close left %d worker(s) running; the process exits without them",
+                      len(alive))
+        return alive

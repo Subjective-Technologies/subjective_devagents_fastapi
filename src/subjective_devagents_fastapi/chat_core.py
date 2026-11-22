@@ -1064,7 +1064,22 @@ class ChatCore:
         return {"ok": True, "channel": conversation["ircChannel"], "connected": self.connected}
 
     @staticmethod
+    def llm_turn_not_failed(response: dict) -> bool:
+        """The turn did not fail: the operator stopped it, or it continues elsewhere.
+
+        A Stop the backend honoured, a service restart mid-turn and a context handoff all
+        come back as `ok: false` because there is no assistant message, but none of them is
+        an error: they must not be logged at error and must never be shown as
+        "<label> error (...)". `continued` marks the codes whose logical task carries on in
+        a successor dispatch (llm_service.CONTINUED_TURN_CODES).
+        """
+        return bool(response.get("stopped") or response.get("continued")) or response.get("status") == "cancelled"
+
+    @staticmethod
     def llm_error_text(label: str, response: dict) -> str:
+        if ChatCore.llm_turn_not_failed(response):
+            # The backend already phrased this one for a person ("Stopped.").
+            return str(response.get("error") or "Stopped.")
         base = f"{label} error ({response.get('status') or 'error'}): {response.get('error') or 'Unknown error'}"
         if response.get("status") != "timeout":
             return base
@@ -1104,6 +1119,17 @@ class ChatCore:
                     })
                 if mirror_to_irc and self.connected and conversation.get("ircChannel"):
                     self.send_irc_text(conversation["ircChannel"], f"{label}: {response['assistantMessage']['text']}")
+            elif self.llm_turn_not_failed(response):
+                # Stop, a service restart or a context handoff: info, and the backend's own
+                # plain text. Never the error log, and never a "<label> error (...)" line.
+                self.log("info", "LLM answer not delivered", {
+                    "target": target, "provider": provider, "status": response.get("status") or "",
+                    "stopped": bool(response.get("stopped")), "continued": bool(response.get("continued")),
+                })
+                stop_text = self.llm_error_text(label, response)
+                self.broadcast("system", {"target": target, "text": stop_text})
+                if mirror_to_irc and self.connected and conversation.get("ircChannel"):
+                    self.send_irc_text(conversation["ircChannel"], stop_text)
             else:
                 if self.llm_service.is_auth_failure(response) and not response.get("sessions"):
                     response["sessions"] = self.llm_service.list_provider_sessions(provider)
@@ -1147,7 +1173,7 @@ class ChatCore:
                         self.send_irc_text(conversation["ircChannel"], f"{label}: {response['assistantMessage']['text']}")
                 else:
                     self.broadcast("system", {"target": target, "text": self.llm_error_text(label, response)})
-                    if self.llm_service.is_auth_failure(response):
+                    if not self.llm_turn_not_failed(response) and self.llm_service.is_auth_failure(response):
                         sessions = response.get("sessions") or {}
                         self.broadcast("llm-choose-session", {
                             "target": target, "provider": provider, "text": text,

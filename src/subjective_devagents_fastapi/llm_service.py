@@ -96,6 +96,15 @@ AGENT_TURN_WRAPPER_TIMEOUT_SECONDS = AGENT_TURN_TIMEOUT_SECONDS + 60
 # How often send_message's heartbeat tells the UI a turn is still alive while the CLI
 # subprocess call blocks. Module-level so tests can shrink it instead of actually waiting.
 HEARTBEAT_INTERVAL_SECONDS = 8.0
+# A turn can end without an assistant message and still not be a failure: the same logical
+# task continues in a successor dispatch. The prompt stays in the conversation, nothing is
+# logged at error, and the UI must not show "<label> error (...)" for either of these.
+#   service_restarted - this service stopped mid-turn (SIGTERM, deploy, drain)
+#   context_handoff   - the worker reached its context budget, checkpointed and handed off
+CONTINUED_TURN_CODES = {
+    "service_restarted": "The service restarted during this turn; the task continues in a new attempt.",
+    "context_handoff": "The agent reached its context budget and handed the task to a successor.",
+}
 CURSOR_INJECT_POLL_MS = int(os.environ.get("CURSOR_INJECT_POLL_MS") or 2000)
 CURSOR_INJECT_POLL_MAX_MS = int(os.environ.get("CURSOR_INJECT_POLL_MAX_MS") or AGENT_TURN_TIMEOUT_SECONDS * 1000)
 
@@ -1614,6 +1623,33 @@ class LlmService:
             return listed
         return sessions_for_provider(listed, provider)
 
+    def preflight_send(self, target: str) -> dict | None:
+        """A refusal to answer this send with, or None when the turn may be accepted.
+
+        Credentials are decided here, before the send is accepted, so a provider the
+        inference proxy cannot authenticate gets one explicit refusal instead of an
+        HTTP 200 followed by a failed turn seconds later.
+        """
+        conversation = self.find_conversation(target, include_messages=False)
+        if not conversation:
+            return None
+        check = getattr(self.backend, "preflight", None)
+        if not callable(check):
+            return None
+        from .language_models.contracts import ModelError
+        try:
+            check(conversation, bool((self.agent_turns.get(target) or {}).get("execution_required")))
+        except ModelError as error:
+            self.log("error", "LLM send refused before start", {
+                "target": target, "provider": conversation.get("provider") or "", "status": error.code,
+            })
+            return {"ok": False, "status": error.code, "error": str(error)}
+        except Exception as error:  # noqa: BLE001 - admission must never block a send by itself
+            self.log("warn", "LLM send preflight unavailable", {
+                "target": target, "exceptionType": type(error).__name__,
+            })
+        return None
+
     def is_auth_failure(self, result: dict | None) -> bool:
         if not result:
             return False
@@ -1782,6 +1818,12 @@ class LlmService:
                 self._cancelled_targets.discard(target)
             self.log("info", "LLM turn stopped before it started", {"target": target, "provider": source["provider"]})
             return {"ok": False, "stopped": True, "status": "cancelled", "error": "Stopped."}
+
+        # Before the user's line is recorded and before "LLM send start": a provider whose
+        # credentials cannot work must not consume a turn and then fail inside it.
+        refusal = self.preflight_send(target)
+        if refusal is not None:
+            return refusal
 
         pending = self.backend.pending(target)
         if pending:
@@ -1959,6 +2001,25 @@ class LlmService:
                 heartbeat_thread.join(timeout=1)
             result = self._pipeline_result(pipeline_response)
             if not result.get("success"):
+                continued = CONTINUED_TURN_CODES.get(str(result.get("error") or ""))
+                if continued:
+                    # Not a failed send: the prompt stays exactly where it is (hydrate must
+                    # still show it after a restart) and the journal resumes the task in a
+                    # successor. Rolling it back made a restart look like a message the user
+                    # never typed, and a handoff look like "Grok error (failed)".
+                    self.log("info", "LLM turn continues in a successor", {
+                        "target": target,
+                        "provider": source["provider"],
+                        "code": str(result.get("error") or ""),
+                        "ms": int((time.time() - started) * 1000),
+                    })
+                    return {
+                        "ok": False,
+                        "continued": True,
+                        "status": str(result.get("error") or ""),
+                        "error": continued,
+                        "userMessage": user_message,
+                    }
                 # A turn the operator stopped is not a failure. Keep the prompt they sent
                 # — rolling it back would make Stop look like the message was never typed
                 # — and mark it stopped so the UI can say so rather than "Send failed".
