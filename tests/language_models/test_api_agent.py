@@ -302,7 +302,8 @@ def test_unknown_tool_name_is_reported_back_to_the_model_not_fatal(request_data,
     assert "not permitted" in proxy.requests[1][2]["messages"][-1]["content"]
 
 
-@pytest.mark.parametrize("status,expected", [(401, "authentication_required"), (429, "rate_limited"), (500, "api_http_error")])
+@pytest.mark.parametrize("status,expected", [(401, "authentication_required"), (429, "rate_limited"),
+                                            (500, "provider_error"), (400, "api_http_error")])
 def test_http_failures_map_to_stable_codes_without_retry(request_data, monkeypatch, status, expected):
     monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
     with ScriptedProxy([(status, 0, {"error": "boom"})]) as proxy:
@@ -585,7 +586,12 @@ def test_provider_errors_say_what_the_operator_can_do(request_data, monkeypatch)
     assert http_error_code(429, "slow down") == "rate_limited"
     assert http_error_code(401, "bad key") == "authentication_required"
     assert http_error_code(503, "upstream down") == "provider_unavailable"
-    assert http_error_code(500, "boom") == "api_http_error"
+    # A broken gateway is transient and retryable; only an unclassified 4xx stays in the
+    # fallback bucket, so "the upstream is down" and "it rejected our request" are distinct.
+    assert http_error_code(500, "boom") == "provider_error"
+    assert http_error_code(502, "bad gateway") == "provider_error"
+    assert http_error_code(400, "unsupported parameter") == "api_http_error"
+    assert http_error_code(404, "no such route") == "api_http_error"
 
     monkeypatch.setenv("TEST_AGENT_KEY", "fixture-key")
     with ScriptedProxy([(403, 0, {"error": {"message": "You've reached your 5-hour usage limit.", "type": "access_terminated_error"}})]) as proxy:

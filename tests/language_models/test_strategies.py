@@ -198,7 +198,8 @@ def test_api_real_http_preserves_history_and_posts_once(http_provider, request_d
     assert [m["content"] for m in requests[0][2]["messages"]] == ["before", "answer", "hello"]
 
 
-@pytest.mark.parametrize("status,expected", [(401, "authentication_required"), (429, "rate_limited"), (500, "api_http_error")])
+@pytest.mark.parametrize("status,expected", [(401, "authentication_required"), (429, "rate_limited"),
+                                            (500, "provider_error"), (400, "api_http_error")])
 def test_api_does_not_retry_http_failures(http_provider, request_data, monkeypatch, status, expected):
     url, requests, settings = http_provider
     settings["status"] = status

@@ -506,11 +506,23 @@ COORDINATION_ERRORS = {
 }
 
 
-def coordination_refusal(error, name: str, arguments: dict) -> str:
-    """Human-readable line first (backward compatible), then a structured JSON outcome."""
+def coordination_refusal(error, name: str, arguments: dict, emit=None) -> str:
+    """Human-readable line first (backward compatible), then a structured JSON outcome.
+
+    A refusal the agent cannot retry its way out of — a publication scope conflict, a missing
+    runtime capability, another task's lease — is only actionable by a person, and it used to
+    be delivered solely as a tool result into the model's own message list. The model then
+    paraphrased it and the specifics never reached the operator: a PUBLICATION_SCOPE_CONFLICT
+    naming the foreign commit and two concrete remedies arrived in the chat as "@Name can
+    push or add ce801ce to assignment". `retryable: False` is exactly the set that needs a
+    human, so those reasons are also emitted as an activity step, which the chat already
+    renders alongside the agent's own reply.
+    """
     retryable, action = COORDINATION_ERRORS.get(error.code, (False, 'NONE'))
     target = arguments.get('file_path') or arguments.get('path') or (
         short(str(arguments.get('command') or ''), 160) if name == 'Bash' else None)
+    if emit is not None and not retryable:
+        emit("activity", {"text": short(f"{error.code}: {error}", 1200)})
     return (f"Error: {error.code}: {error}\n" + json.dumps(
         {'ok': False, 'error_code': error.code, 'retryable': retryable, 'recovery_action': action,
          'target': target, 'executed': False}, sort_keys=True))
@@ -642,6 +654,12 @@ def http_error_code(status: int, body: str = "") -> str:
         return "authentication_required"
     if status == 503:
         return "provider_unavailable"
+    if status >= 500:
+        # The gateway or its upstream broke: transient, and the journal already classifies
+        # provider_error as retryable. Sharing one bucket with a 400 meant "the upstream is
+        # down" and "we sent something it rejected" were indistinguishable in the UI and took
+        # the same recovery path.
+        return "provider_error"
     return "api_http_error"
 
 
@@ -679,6 +697,22 @@ def _text_of(content) -> str:
     if isinstance(content, list):
         return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict) and part.get("type") == "text")
     return ""
+
+
+def history_budget() -> int:
+    """Byte budget for history that keeps the assembled prompt under the handoff threshold.
+
+    HISTORY_BUDGET_BYTES is a fraction of MAX_CONTEXT_BYTES and knows nothing about
+    SUBJECTIVE_AGENT_CONTEXT_TOKENS, so with the defaults it admitted 307 KiB of prompt while
+    ContextBudget declares `handoff` at 239 KiB. A prompt that fitted here therefore started
+    the turn already over the line and handed off before making a single model call, and its
+    successor inherited the same input. Headroom is left for the system prompt (which carries
+    up to CONTEXT_STATE_LIMIT of channel state) and for this turn's own tool rounds.
+    """
+    from .task_context import CHARS_PER_TOKEN, ContextBudget
+    budget = ContextBudget()
+    handoff_bytes = int(budget.max_tokens * budget.handoff_at * CHARS_PER_TOKEN)
+    return max(8 * 1024, min(HISTORY_BUDGET_BYTES, int(handoff_bytes * 0.7)))
 
 
 def fit_history(messages: list, budget: int = HISTORY_BUDGET_BYTES) -> tuple[list, int]:
@@ -1208,8 +1242,10 @@ class ApiAgent(ModelStrategy):
             content = request.prompt
         messages.append({"role": "user", "content": content})
         # A long conversation would otherwise exceed the context on every later turn:
-        # leave out its oldest turns instead of failing.
-        messages, dropped = fit_history(messages)
+        # leave out its oldest turns instead of failing. The byte budget has to sit below the
+        # token budget's handoff line, or a prompt that fitted here starts the turn already
+        # over it: HISTORY_BUDGET_BYTES alone allowed 307 KiB while handoff fires at 239 KiB.
+        messages, dropped = fit_history(messages, history_budget())
         if dropped:
             emit("activity", {"text": f"Left out the {dropped} oldest messages to fit the context window"})
         first_of_turn = len(messages)
@@ -1309,10 +1345,23 @@ class ApiAgent(ModelStrategy):
                 self._checkpoint(progress, request, "context_" + level)
                 tools_since_checkpoint = 0
             if coordination and not direct and level == "handoff":
-                # Hand off before the provider limit: the successor starts from the checkpoint,
-                # never from this transcript.
-                emit("context_compaction", {"handoff": True, "estimated_input_tokens": tokens})
-                return ModelResult("failed", error_code="context_handoff")
+                if not progress.get("messages_sent"):
+                    # Nothing has been sent yet, so the oversized part is the input itself, not
+                    # a tool transcript this turn produced. A successor would be briefed from a
+                    # checkpoint and then arrive at the same prompt, hand off again, and keep
+                    # doing that up to COORDINATION_MAX_CHAIN_SUCCESSORS. The budget is an
+                    # internal pacing device ("never the provider maximum" - ContextBudget), so
+                    # the honest move is to make the call and say the budget was exceeded.
+                    emit("context_budget_exceeded_at_start", {"estimated_input_tokens": tokens,
+                                                              "max_context_tokens": budget.max_tokens})
+                    emit("activity", {"text": f"This turn starts at {tokens} tokens, over the "
+                                              f"{budget.max_tokens}-token budget; continuing without a handoff "
+                                              f"because a successor would start from the same input"})
+                else:
+                    # Hand off before the provider limit: the successor starts from the checkpoint,
+                    # never from this transcript.
+                    emit("context_compaction", {"handoff": True, "estimated_input_tokens": tokens})
+                    return ModelResult("failed", error_code="context_handoff")
             if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                 # Long tool loops: shorten this turn's oldest tool output, then older history.
                 if shorten_tool_results(messages, first_of_turn):
@@ -1327,6 +1376,7 @@ class ApiAgent(ModelStrategy):
                 if agent_text_bytes(messages) > MAX_CONTEXT_BYTES:
                     return ModelResult("failed", error_code="context_too_large")
             emit("runtime_status", {"phase": "model"})
+            progress["messages_sent"] = progress.get("messages_sent", 0) + 1
             # Retry inference only. Already executed tool calls stay in messages
             # and are never repeated because a later model request timed out.
             for attempt in range(3 if coordination else 1):
@@ -1429,7 +1479,10 @@ class ApiAgent(ModelStrategy):
                     refused_calls += 1
                     excluded_seconds += time.monotonic() - tool_started
                     emit("tool_blocked", {"event": "TOOL_BLOCKED_COORDINATION", "tool_call_id": str(call.get("id") or ""),
-                                          "name": name, "error_code": result_text[7:].split(":", 1)[0]})
+                                          "name": name, "error_code": result_text[7:].split(":", 1)[0],
+                                          # The reason, not just the code: the journal could say
+                                          # a tool was blocked but never why.
+                                          "reason": short(result_text.split("\n", 1)[0][7:], 1200)})
                 if isinstance(result_text, ModelResult):
                     if direct and result_text.status == "blocked":
                         self._checkpoint(progress, request, "user_input" if coordination.pending_user_decision else "blocked")
@@ -1520,7 +1573,7 @@ class ApiAgent(ModelStrategy):
                 with mutation_fence(coordination):
                     return ApiAgent._dispatch(call, tools, identity, transport, cancelled, timeout, emit, edited, coordination, True)
             except ModelError as error:
-                return coordination_refusal(error, name, arguments)
+                return coordination_refusal(error, name, arguments, emit)
         git_runner = None
         if name == 'Bash' and getattr(coordination, 'direct_execution', False):
             git_deadline = time.monotonic() + timeout
@@ -1568,9 +1621,9 @@ class ApiAgent(ModelStrategy):
                     # searching around it is not "scoping": stop with an explicit blocker.
                     emit("activity", {"text": "Stopped: another task holds the write lease for this target"})
                     return ModelResult("blocked", "BLOCKED: LEASE_CONFLICT: the write target is leased by another "
-                                       "active task.\n" + coordination_refusal(error, name, arguments),
+                                       "active task.\n" + coordination_refusal(error, name, arguments, emit),
                                        error_code="lease_conflict")
-                return coordination_refusal(error, name, arguments)
+                return coordination_refusal(error, name, arguments, emit)
         if name == "AskUser":
             question = str(arguments.get("question") or "").strip()
             if not question:

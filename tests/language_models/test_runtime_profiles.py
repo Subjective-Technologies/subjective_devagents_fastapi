@@ -331,3 +331,42 @@ def test_an_ungranted_capability_is_left_alone_rather_than_blocking_the_dispatch
                                           grants=['fs_read', 'fs_write', 'git_read', 'git_write', 'shell_exec'])
     assert chosen.git_write and not chosen.test_exec
     assert 'test_exec' not in requirements.runtime_capabilities()
+
+
+# --- limits that have to agree with each other ----------------------------------------
+#
+# Every incident below was two independently reasonable numbers that did not know about
+# each other. Each assertion here is the cheapest possible guard against the next one.
+
+
+def test_the_history_byte_budget_stays_under_the_handoff_threshold():
+    """2026-11-22: fit_history admitted 307 KiB while handoff fired at 239 KiB, so a turn
+    could hand off before making a single model call and its successor inherited the same
+    oversized input - up to COORDINATION_MAX_CHAIN_SUCCESSORS times."""
+    from subjective_devagents_fastapi.language_models.strategies import history_budget
+    from subjective_devagents_fastapi.language_models.task_context import CHARS_PER_TOKEN, ContextBudget
+
+    budget = ContextBudget()
+    handoff_bytes = budget.max_tokens * budget.handoff_at * CHARS_PER_TOKEN
+    assert history_budget() < handoff_bytes, 'a fitted prompt must not start the turn over budget'
+
+
+def test_the_coordination_backoff_fits_inside_the_close_deadline():
+    """A finish retrying 1+2+4+8 s outlasted the shutdown that was waiting for it."""
+    from subjective_devagents_fastapi import channel_coordination as cc
+    from subjective_devagents_fastapi.language_models.model import _close_timeout
+
+    assert sum(cc.CALL_BACKOFF) + cc.CALL_TIMEOUT < 30.0, 'one coordination call must fit the unit stop timeout'
+    assert _close_timeout() < 30.0, 'close() must return before systemd SIGKILLs the unit'
+
+
+def test_every_stage_contract_can_at_least_read():
+    """A dispatch that cannot read cannot do any stage's work, whatever else it was given."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'subjective_api_chat' / 'src'))
+    chat_api = pytest.importorskip('subjective_chat_api.agent_capabilities',
+                                   reason='Companion Chat API checkout is needed')
+    for stage, requirement in chat_api.STAGE_REQUIREMENTS.items():
+        capabilities = requirement['required_runtime_capabilities']
+        assert 'fs_read' in capabilities or 'git_write' in capabilities, stage

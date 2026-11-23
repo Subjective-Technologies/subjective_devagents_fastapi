@@ -296,3 +296,76 @@ def test_an_unset_callback_url_is_not_retried_for_fifteen_seconds(monkeypatch, c
     assert raised.value.code == 'coordination_unavailable'
     assert cc.transport_reason(raised.value) == 'callback_url_unset'
     assert any('callback URL is not configured' in r.getMessage() for r in caplog.records)
+
+
+# --- a refusal only a person can act on must reach that person -------------------------
+#
+# 2026-11-23: a push was refused with PUBLICATION_SCOPE_CONFLICT naming the foreign commit
+# and two concrete remedies. coordination_refusal returned that text only as a tool result
+# into the model's own message list, so the operator saw the model's paraphrase of it:
+# "@Name can push or add ce801ce to assignment. Needs input on architect prompt: (a) or (b)"
+# - no SHA list, no remedies, and a literal placeholder.
+
+
+def test_a_refusal_the_agent_cannot_retry_is_emitted_for_the_operator():
+    from subjective_devagents_fastapi.language_models.strategies import coordination_refusal
+
+    events = []
+    detail = ("Pushing to origin/main would also publish 1 commit(s) that do not belong to this "
+              "task: ce801ce01234 'unrelated work' (ai_other). Publish only this task: create a "
+              "branch from origin/main, cherry-pick this task's commits and push that, or report "
+              "PUBLICATION_SCOPE_CONFLICT to Manager, who can approve bundling by naming these "
+              "SHAs in the assignment.")
+    text = coordination_refusal(ModelError('PUBLICATION_SCOPE_CONFLICT', detail), 'Bash',
+                                {'command': 'git push origin main'},
+                                lambda kind, data: events.append((kind, data)))
+
+    assert text.startswith('Error: PUBLICATION_SCOPE_CONFLICT: ')      # still reaches the model
+    steps = [data['text'] for kind, data in events if kind == 'activity']
+    assert len(steps) == 1, events
+    assert 'ce801ce01234' in steps[0] and 'cherry-pick' in steps[0], 'the operator gets the specifics'
+
+
+def test_a_refusal_the_agent_can_retry_is_not_announced_to_the_operator():
+    """WRITE_LEASE_REQUIRED is the runtime's own business: it acquires and carries on."""
+    from subjective_devagents_fastapi.language_models.strategies import coordination_refusal
+
+    events = []
+    coordination_refusal(ModelError('WRITE_LEASE_REQUIRED', 'Acquire a covering lease'), 'Write',
+                         {'file_path': 'a.py'}, lambda kind, data: events.append((kind, data)))
+    assert [kind for kind, _ in events] == []
+
+
+def test_a_handoff_before_any_model_call_would_only_repeat_itself(tmp_path, monkeypatch):
+    """The budget is internal pacing, not the provider limit: handing off from an oversized
+    input produces a successor with the same oversized input, up to the chain cap."""
+    import asyncio
+    from dataclasses import replace as replace_fields
+    from subjective_devagents_fastapi.language_models import ApiAgent, ModelRequest
+    from subjective_devagents_fastapi.language_models.strategies import history_budget
+
+    monkeypatch.setenv('SUBJECTIVE_AGENT_CONTEXT_TOKENS', '2000')      # everything is over budget
+    monkeypatch.setenv('TEST_KEY', 'fixture')
+    identity = Identity('runtime', 'claude', model='claude-opus-5-5', strategy='api_agent',
+                        workspace=str(tmp_path), home=str(tmp_path), sandbox='workspace-write',
+                        api_base_url='http://127.0.0.1:1/v1', api_key_env='TEST_KEY')
+    bound = session(client=lambda body: {'state': journal_state()})
+    bound.start(identity, 'published', 'coder_agent')
+
+    agent, events = ApiAgent(), []
+    calls = []
+
+    async def answer(_identity, _token, messages, _tools, _timeout, _cancelled):
+        calls.append(len(messages))
+        return {'content': 'Answered despite the oversized input.'}, 'stop', {}
+
+    monkeypatch.setattr(agent, '_call', answer)
+    request = ModelRequest('turn', identity, 'x' * 40_000, timeout=30, coordination=bound)
+    result = asyncio.run(agent._run(request, lambda kind, data: events.append((kind, data)),
+                                    lambda: False, {}))
+
+    assert result.status == 'completed', result
+    assert calls, 'the model was called instead of handing off from a cold start'
+    assert any(kind == 'context_budget_exceeded_at_start' for kind, _ in events)
+    assert not any(data.get('handoff') for kind, data in events if kind == 'context_compaction')
+    assert history_budget() > 0
