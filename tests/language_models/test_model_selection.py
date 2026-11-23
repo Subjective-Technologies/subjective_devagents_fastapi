@@ -50,11 +50,18 @@ def test_discovery_groups_by_family_and_owner_and_excludes_media(monkeypatch):
     catalog.validate_model('deepseek', 'custom-chat')
     catalog.validate_model('deepseek', 'chat-latest')
     catalog.validate_model('deepseek', 'deepseek-chat')
-    with pytest.raises(ModelError, match='not available'):
+    # The refusal names the pinned model and what the proxy does serve, so a stale pin is
+    # distinguishable from a provider whose upstream stopped listing anything.
+    with pytest.raises(ModelError, match='does not serve deepseek model gpt-unrelated') as refused:
         catalog.validate_model('deepseek', 'gpt-unrelated')
+    assert refused.value.code == 'model_unavailable'
+    assert 'deepseek-chat' in str(refused.value)
     catalog.validate_model('claude', 'claude-other')
-    with pytest.raises(ModelError, match='not available'):
+    with pytest.raises(ModelError, match='does not serve claude model gemini-test'):
         catalog.validate_model('claude', 'gemini-test')
+    # Nothing served for a provider at all says so, instead of looking like a bad choice.
+    with pytest.raises(ModelError, match='lists no kimi model at all'):
+        catalog.validate_model('kimi', 'kimi-anything')
 
 
 def test_wrong_provider_and_unknown_model_rejected(proxy):

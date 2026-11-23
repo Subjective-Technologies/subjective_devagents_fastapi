@@ -94,5 +94,15 @@ def _load_proxy_models(url: str, key: str) -> dict[str, list[str]]:
 def validate_model(provider: str, model: str) -> None:
     if not isinstance(model, str) or not MODEL_ID.fullmatch(model):
         raise ModelError("invalid_model", "Invalid model ID.")
-    if model not in proxy_models().get(provider, []):
-        raise ModelError("model_unavailable", "Selected model is not available for this provider.")
+    available = proxy_models().get(provider, [])
+    if model not in available:
+        # Name the pinned model and what the proxy actually serves. "Selected model is not
+        # available for this provider" could not tell a stale pin (the chat keeps a model id
+        # the proxy has stopped serving) from an upstream that went away entirely — the
+        # grouping below keys on owned_by, so a changed owner empties a provider silently.
+        # Model ids are not secrets; the key and the proxy URL stay out of this.
+        raise ModelError("model_unavailable",
+                         f"The inference proxy does not serve {provider} model {model}. "
+                         + (f"It currently serves: {', '.join(available[:8])}." if available
+                            else f"It currently lists no {provider} model at all, "
+                                 f"so that provider's upstream is unavailable."))
