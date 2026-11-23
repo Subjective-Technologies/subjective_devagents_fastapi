@@ -1634,6 +1634,13 @@ class ApiAgent(ModelStrategy):
                                              headers={"Authorization": f"Bearer {token}"}, json=payload)
                 if response.status_code != 200:
                     code = http_error_code(response.status_code, response.text[:2000])
+                    # The status is the only thing that says which failure this was, and it was
+                    # read for classification and then dropped: an operator seeing
+                    # "Codex error (failed): api_http_error" had no way to tell a request the
+                    # upstream rejected from a dead gateway. Status and code only — never the
+                    # body (it quotes the prompt) and never the key.
+                    log.warning("Provider HTTP error provider=%s model=%s status=%d code=%s",
+                                identity.provider, identity.model, response.status_code, code)
                     return ModelResult("timed_out" if code == "timed_out" else "failed", error_code=code)
                 try:
                     data = response.json()
