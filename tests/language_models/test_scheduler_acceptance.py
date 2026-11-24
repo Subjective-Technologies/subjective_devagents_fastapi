@@ -85,7 +85,7 @@ def test_two_channels_use_same_executor_and_distinct_worktrees(tmp_path, monkeyp
         {'path': 'agents/roles/coder_agent.md', 'content': 'Implement and test.'},
     ]}
     monkeypatch.setattr(agent_workflow, 'fetch_export_as_service', lambda *_args, **_kwargs: export)
-    monkeypatch.setattr(scheduler_transport, '_request', lambda _route, body, *, authorization:
+    monkeypatch.setattr(scheduler_transport, '_request', lambda _route, body, *, authorization, **_options:
                         json.loads(json.dumps(plan(PlanRequest(**body)))))
 
     def callback(session, operation, **data):

@@ -1,7 +1,10 @@
 """Planning for Chat using existing company authorization."""
 from dataclasses import asdict
+import hashlib
 import hmac
 import os
+import threading
+import time
 from typing import Annotated
 from urllib.request import HTTPRedirectHandler, build_opener
 
@@ -40,6 +43,15 @@ class _NoRedirect(HTTPRedirectHandler):
 
 _workflow_opener = build_opener(_NoRedirect())
 
+# Chat calls /plan for every Direct LLM message and has already checked the same login.
+# Re-reading the whole published workflow each time put a WorkTwins round trip (up to the
+# 20 s export timeout) inside Chat's 10 s gateway window (2026-11-24, HTTP 504). A login
+# that passed is remembered briefly; a refusal or outage is never remembered.
+AUTHORIZATION_CACHE_SECONDS = 600
+AUTHORIZATION_TIMEOUT_SECONDS = 6
+_authorized: dict[tuple[str, str], float] = {}
+_authorized_lock = threading.Lock()
+
 
 def authorized(token: str, authorization: str = '') -> bool:
     # Installed service tokens keep working during rollout and background recovery.
@@ -51,11 +63,20 @@ def authorized(token: str, authorization: str = '') -> bool:
         return False
     from ..agent_workflow import WorkflowUnavailable, fetch_export
 
+    key = (company, hashlib.sha256(authorization.encode()).hexdigest())
+    now = time.monotonic()
+    with _authorized_lock:
+        if _authorized.get(key, 0) > now:
+            return True
     try:
         # WorkTwins verifies the existing login and access to this runtime's company.
-        fetch_export(company, authorization, opener=_workflow_opener.open)
+        fetch_export(company, authorization, opener=_workflow_opener.open, timeout=AUTHORIZATION_TIMEOUT_SECONDS)
     except WorkflowUnavailable:
         return False
+    with _authorized_lock:
+        for stale in [entry for entry, until in _authorized.items() if until <= now]:
+            del _authorized[stale]
+        _authorized[key] = now + AUTHORIZATION_CACHE_SECONDS
     return True
 
 

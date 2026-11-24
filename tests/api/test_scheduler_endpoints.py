@@ -77,7 +77,10 @@ def test_catalog_and_plan_use_existing_company_login(owner_client, monkeypatch):
     monkeypatch.delenv("COLLABORATION_DISABLED_SCHEDULERS", raising=False)
     calls = []
 
-    def fetch_export(company, authorization, *, opener):
+    from subjective_devagents_fastapi.schedulers import api as scheduler_api
+    monkeypatch.setattr(scheduler_api, "_authorized", {})
+
+    def fetch_export(company, authorization, *, opener, **_options):
         calls.append(company)
         if authorization != "Bearer member-fixture":
             raise agent_workflow.WorkflowUnavailable("Caller lacks company workflow access")
@@ -94,4 +97,33 @@ def test_catalog_and_plan_use_existing_company_login(owner_client, monkeypatch):
                                  json={"agents": ["ai_worker"], "preference": "simple_v1"})
     assert response.status_code == 200
     assert response.json()["decision"]["agents"] == ["ai_worker"]
+    # The login proven by the catalog call is not re-proven for the plan.
+    assert calls == ["fixture-company"] * 2
+    assert owner_client.post(path + "/catalog", headers={"Authorization": "Bearer other-company-fixture"}).status_code == 401
     assert calls == ["fixture-company"] * 3
+
+
+def test_plan_authorization_is_bounded_and_refusals_are_not_remembered(owner_client, monkeypatch):
+    from subjective_devagents_fastapi import agent_workflow
+    from subjective_devagents_fastapi.schedulers import api as scheduler_api
+
+    monkeypatch.delenv("COORDINATION_SCHEDULER_TOKEN", raising=False)
+    monkeypatch.setenv("COORDINATION_COMPANY_ID", "fixture-company")
+    monkeypatch.setattr(scheduler_api, "_authorized", {})
+    seen = []
+    outage = [True]
+
+    def fetch_export(company, authorization, *, opener, timeout=20, **_options):
+        seen.append(timeout)
+        if outage[0]:
+            raise agent_workflow.WorkflowUnavailable("The workflow service could not be reached.")
+        return {"version": {"version": "20261114000000"}, "files": []}
+
+    monkeypatch.setattr(agent_workflow, "fetch_export", fetch_export)
+    headers = {"Authorization": "Bearer member-fixture"}
+    plan = {"agents": ["ai_worker"], "preference": "simple_v1"}
+    path = "/api/collaboration/schedulers/plan"
+    assert owner_client.post(path, headers=headers, json=plan).status_code == 401
+    outage[0] = False
+    assert owner_client.post(path, headers=headers, json=plan).status_code == 200
+    assert seen == [scheduler_api.AUTHORIZATION_TIMEOUT_SECONDS] * 2

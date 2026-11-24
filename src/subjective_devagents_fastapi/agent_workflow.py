@@ -144,7 +144,7 @@ def _cached_service_export(company_id: str) -> dict | None:
     return max(hits, key=lambda hit: hit[1]["version"]["version"])[1]
 
 
-def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "", version: str = '', force: bool = False) -> dict:
+def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.urlopen, service_token: str = "", version: str = '', force: bool = False, timeout: float = 20) -> dict:
     """The company's current published workflow, as the caller (or the service) sees it."""
     if not _COMPANY.match(company_id or ""):
         raise WorkflowUnavailable("This agent names no valid workflow company.")
@@ -169,7 +169,7 @@ def fetch_export(company_id: str, authorization: str, *, opener=urllib.request.u
         },
     )
     try:
-        with opener(request, timeout=20) as response:
+        with opener(request, timeout=timeout) as response:
             export = json.loads(response.read() or b"{}")
     except urllib.error.HTTPError as error:
         if error.code == 404:
